@@ -1,12 +1,16 @@
+// src/inference.rs
+
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
-use safetensors::SafeTensors;
+use safetensors::{SafeTensors, tensor::Dtype};
+use half::f16;
 use ndarray::Array2;
 use std::fs::read;
+use std::path::Path;
 use anyhow::{Result, Context, anyhow};
 use serde_json::Value;
 
-/// Static embedding model loader and encoder for Model2Vec 
+/// Static embedding model for Model2Vec
 pub struct StaticModel {
     tokenizer: Tokenizer,
     embeddings: Array2<f32>,
@@ -14,57 +18,87 @@ pub struct StaticModel {
 }
 
 impl StaticModel {
-    /// Load a Model2Vec model from the Hugging Face Hub
-    pub fn from_pretrained(repo_id: &str) -> Result<Self> {
-        // Initialize HF Hub API
-        let api = Api::new().context("Failed to create HF Hub API")?;
-        let repo = api.model(repo_id.to_string());
+    /// Load a Model2Vec model from a local folder or the HF Hub.
+    ///
+    /// # Arguments
+    /// * `repo_or_path` - HF repo ID or local filesystem path
+    /// * `subfolder` - optional subdirectory inside the repo or folder
+    pub fn from_pretrained(repo_or_path: &str, subfolder: Option<&str>) -> Result<Self> {
+        // Determine file paths
+        let (tok_path, mdl_path, cfg_path) = {
+            let base = Path::new(repo_or_path);
+            if base.exists() {
+                // Local path
+                let folder = subfolder.map(|s| base.join(s)).unwrap_or_else(|| base.to_path_buf());
+                let t = folder.join("tokenizer.json");
+                let m = folder.join("model.safetensors");
+                let c = folder.join("config.json");
+                if !t.exists() || !m.exists() || !c.exists() {
+                    return Err(anyhow!("Local path {:?} missing tokenizer/model/config files", folder));
+                }
+                (t, m, c)
+            } else {
+                // HF Hub path
+                let api = Api::new().context("Failed to initialize HF Hub API")?;
+                let repo = api.model(repo_or_path.to_string());
+                let prefix = subfolder.map(|s| format!("{}/", s)).unwrap_or_default();
+                let t = repo.get(&format!("{}tokenizer.json", prefix)).context("Failed to download tokenizer.json")?;
+                let m = repo.get(&format!("{}model.safetensors", prefix)).context("Failed to download model.safetensors")?;
+                let c = repo.get(&format!("{}config.json", prefix)).context("Failed to download config.json")?;
+                (t.into(), m.into(), c.into())
+            }
+        };
 
-        // Download and load tokenizer
-        let tok_path = repo.get("tokenizer.json")
-            .context("Failed to download tokenizer.json")?;
+        // Load tokenizer
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
 
-        // Download embeddings
-        let model_path = repo.get("model.safetensors")
-            .context("Failed to download model.safetensors")?;
-        let bytes = read(&model_path)
-            .context("Failed to read model.safetensors")?;
-        let safet = SafeTensors::deserialize(&bytes)
-            .context("Failed to parse safetensors")?;
-        let tensor = safet.tensor("embeddings")
-            .or_else(|_| safet.tensor("0"))
-            .context("Embedding tensor not found")?;
+        // Read safetensors file
+        let bytes = read(&mdl_path).context("Failed to read model.safetensors")?;
+        let safet = SafeTensors::deserialize(&bytes).context("Failed to parse safetensors")?;
+        let tensor = safet.tensor("embeddings").or_else(|_| safet.tensor("0")).context("Embedding tensor not found")?;
         let shape = (tensor.shape()[0] as usize, tensor.shape()[1] as usize);
         let raw = tensor.data();
-        // Interpret bytes as little-endian f32
-        let floats: Vec<f32> = raw.chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-        let embeddings = Array2::from_shape_vec(shape, floats)
-            .context("Failed to create embeddings array")?;
+        let dtype = tensor.dtype();
 
-        // Download and parse config
-        let cfg_bytes = read(&repo.get("config.json")
-            .context("Failed to download config.json")?)
-            .context("Failed to read config.json")?;
-        let cfg: Value = serde_json::from_slice(&cfg_bytes)
-            .context("Failed to parse config.json")?;
+        // Read config.json for normalization flag
+        let cfg_bytes = read(&cfg_path).context("Failed to read config.json")?;
+        let cfg: Value = serde_json::from_slice(&cfg_bytes).context("Failed to parse config.json")?;
         let normalize = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
+
+        // Decode raw bytes into Vec<f32> based on dtype
+        let floats: Vec<f32> = match dtype {
+            Dtype::F32 => raw.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+            Dtype::F16 => raw.chunks_exact(2)
+                .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
+                .collect(),
+            Dtype::I8  => raw.iter()
+                .map(|&b| (b as i8) as f32)
+                .collect(),
+            other => return Err(anyhow!("Unsupported tensor dtype: {:?}", other)),
+        };
+
+        // Construct ndarray
+        let embeddings = Array2::from_shape_vec(shape, floats).context("Failed to create embeddings array")?;
 
         Ok(Self { tokenizer, embeddings, normalize })
     }
 
-    /// Encode input texts into embeddings via mean-pooling and optional L2-normalization
+    /// Tokenize input texts into token ID sequences
+    pub fn tokenize(&self, texts: &[String]) -> Vec<Vec<u32>> {
+        texts.iter().map(|text| {
+            let enc = self.tokenizer.encode(text.as_str(), false).expect("Tokenization failed");
+            enc.get_ids().to_vec()
+        }).collect()
+    }
+
+    /// Encode texts into embeddings via mean-pooling and optional L2-normalization
     pub fn encode(&self, texts: &[String]) -> Vec<Vec<f32>> {
         texts.iter().map(|text| {
-            // Tokenize without special tokens
-            let encoding = self.tokenizer.encode(text.as_str(), false)
-                .expect("Tokenization failed");
-            let ids = encoding.get_ids();
-
-            // Mean-pool token embeddings
+            let enc = self.tokenizer.encode(text.as_str(), false).expect("Tokenization failed");
+            let ids = enc.get_ids();
             let mut sum = vec![0.0f32; self.embeddings.ncols()];
             for &id in ids {
                 let row = self.embeddings.row(id as usize);
@@ -73,16 +107,10 @@ impl StaticModel {
                 }
             }
             let count = ids.len().max(1) as f32;
-            for v in &mut sum {
-                *v /= count;
-            }
-
-            // Optional L2-normalize
+            sum.iter_mut().for_each(|v| *v /= count);
             if self.normalize {
                 let norm = sum.iter().map(|&x| x * x).sum::<f32>().sqrt().max(1e-12);
-                for v in &mut sum {
-                    *v /= norm;
-                }
+                sum.iter_mut().for_each(|v| *v /= norm);
             }
             sum
         }).collect()
