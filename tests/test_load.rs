@@ -2,6 +2,7 @@ use approx::assert_relative_eq;
 use model2vec_rust::model::StaticModel;
 
 fn encode_hello(path: &str) -> Vec<f32> {
+    // Helper function to load the model and encode "hello world"
     let model = StaticModel::from_pretrained(path, None)
         .expect(&format!("Failed to load model at {}", path));
     let out = model.encode(&["hello world".to_string()]);
@@ -11,6 +12,7 @@ fn encode_hello(path: &str) -> Vec<f32> {
 
 #[test]
 fn quantized_models_match_float32() {
+    // Compare quantized models against the float32 model
     let base = "tests/fixtures/test-model-float32";
     let ref_emb = encode_hello(base);
 
