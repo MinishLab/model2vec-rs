@@ -1,4 +1,4 @@
-// src/inference.rs
+// Model2Vec inference functionality
 
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
