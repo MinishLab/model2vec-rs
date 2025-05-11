@@ -22,7 +22,7 @@ use model2vec_rust::inference::StaticModel;
 
 fn main() -> Result<()> {
     // Load a model from the Hugging Face Hub or a local path
-    let model = StaticModel::from_pretrained("minishlab/potion-base-8M", None)?;
+    let model = StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?;
 
     // Prepare a list of sentences
     let texts = vec![
