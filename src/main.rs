@@ -46,7 +46,7 @@ fn main() -> Result<()> {
                 vec![input]
             };
 
-            let m = StaticModel::from_pretrained(&model, None)?;
+            let m = StaticModel::from_pretrained(&model, None, None, None)?;
             let embs = m.encode(&texts);
 
             if let Some(path) = output {
@@ -67,8 +67,9 @@ fn main() -> Result<()> {
                 vec![input]
             };
 
-            let m = StaticModel::from_pretrained(&model, None)?;
-            let ids = m.tokenize(&texts);
+            let m = StaticModel::from_pretrained(&model, None, None, None)?;
+            // Provide default None for max_tokens to include all tokens
+            let ids = m.tokenize(&texts, None);
             println!("Token ID sequences: {:#?}", ids);
         }
     }
