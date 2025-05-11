@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 use anyhow::Result;
 use std::path::Path;
 
-mod inference;
-use inference::StaticModel;
+mod model;
+use model::StaticModel;
 
 #[derive(Parser)]
 #[command(author, version, about = "Model2Vec Rust CLI")]

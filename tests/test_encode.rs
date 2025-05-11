@@ -1,7 +1,7 @@
 use approx::assert_relative_eq;
 use std::fs;
 use serde_json::Value;
-use model2vec_rust::inference::StaticModel;
+use model2vec_rust::model::StaticModel;
 
 #[test]
 fn test_encode_hello_against_fixture() {
