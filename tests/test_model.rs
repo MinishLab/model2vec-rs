@@ -4,6 +4,22 @@ use approx::assert_relative_eq;
 use std::fs;
 use model2vec_rs::model::StaticModel;
 
+/// Test that encoding "hello world" matches the Python-generated fixture
+#[test]
+fn test_encode_matches_python_model2vec() {
+    let fixture = fs::read_to_string("tests/fixtures/embeddings.json")
+        .expect("Fixture not found");
+    let expected: Vec<Vec<f32>> = serde_json::from_str(&fixture)
+        .expect("Failed to parse fixture");
+    let model = load_test_model();
+    let output = model.encode(&["hello world".to_string()]);
+    assert_eq!(output.len(), expected.len());
+    assert_eq!(output[0].len(), expected[0].len());
+    for (o, e) in output[0].iter().zip(expected[0].iter()) {
+        assert_relative_eq!(o, e, max_relative = 1e-5);
+    }
+}
+
 /// Test that encoding an empty input slice yields an empty Vec
 #[test]
 fn test_encode_empty_input() {
@@ -32,22 +48,6 @@ fn test_encode_parallel_vs_sequential() {
     assert_eq!(seq.len(), par.len());
     for (s, p) in seq.iter().zip(par.iter()) {
         assert_relative_eq!(s.as_slice(), p.as_slice(), max_relative = 1e-6);
-    }
-}
-
-/// Test that encoding "hello world" matches the Python-generated fixture
-#[test]
-fn test_encode_against_fixture() {
-    let fixture = fs::read_to_string("tests/fixtures/embeddings.json")
-        .expect("Fixture not found");
-    let expected: Vec<Vec<f32>> = serde_json::from_str(&fixture)
-        .expect("Failed to parse fixture");
-    let model = load_test_model();
-    let output = model.encode(&["hello world".to_string()]);
-    assert_eq!(output.len(), expected.len());
-    assert_eq!(output[0].len(), expected[0].len());
-    for (o, e) in output[0].iter().zip(expected[0].iter()) {
-        assert_relative_eq!(o, e, max_relative = 1e-5);
     }
 }
 
