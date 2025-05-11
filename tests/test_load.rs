@@ -1,8 +1,4 @@
-mod common;            // this pulls in tests/common.rs
-use common::load_test_model;
 use approx::assert_relative_eq;
-use std::fs;
-use serde_json;
 use model2vec_rs::model::StaticModel;
 
 fn encode_hello(path: &str) -> Vec<f32> {

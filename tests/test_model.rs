@@ -37,7 +37,7 @@ fn test_encode_parallel_vs_sequential() {
 
 /// Test that encoding "hello world" matches the Python-generated fixture
 #[test]
-fn test_encode_hello_against_fixture() {
+fn test_encode_against_fixture() {
     let fixture = fs::read_to_string("tests/fixtures/embeddings.json")
         .expect("Fixture not found");
     let expected: Vec<Vec<f32>> = serde_json::from_str(&fixture)

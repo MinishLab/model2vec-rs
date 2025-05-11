@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 description = "Fast State-of-the-Art Static Embeddings in Rust"
 readme = "README.md"
-license = "MIT"
 license-file = "LICENSE"
 authors = ["Thomas van Dongen <thomas123@live.nl>", "Stéphan Tulkens <stephantul@gmail.com>"]
 homepage = "https://github.com/MinishLab/model2vec-rs"
