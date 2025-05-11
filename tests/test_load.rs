@@ -1,5 +1,5 @@
 use approx::assert_relative_eq;
-use model2vec_rust::model::StaticModel;
+use model2vec_rs::model::StaticModel;
 
 fn encode_hello(path: &str) -> Vec<f32> {
     // Helper function to load the model and encode "hello world"

@@ -1218,7 +1218,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "model2vec-rust"
+name = "model2vec-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
