@@ -12,7 +12,7 @@ fn test_encode_hello_against_fixture() {
         .expect("Failed to parse fixture");
 
     // Initialize the model (no subfolder)
-    let model = StaticModel::from_pretrained("minishlab/potion-base-2M", None)
+    let model = StaticModel::from_pretrained("tests/fixtures/test-model-float32", None)
         .expect("Failed to load model");
 
     // Encode the same input used to generate the fixture
