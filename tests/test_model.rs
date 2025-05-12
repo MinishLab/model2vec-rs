@@ -4,21 +4,55 @@ use approx::assert_relative_eq;
 use std::fs;
 use model2vec_rs::model::StaticModel;
 
-/// Test that encoding "hello world" matches the Python-generated fixture
 #[test]
 fn test_encode_matches_python_model2vec() {
-    let fixture = fs::read_to_string("tests/fixtures/embeddings.json")
-        .expect("Fixture not found");
-    let expected: Vec<Vec<f32>> = serde_json::from_str(&fixture)
-        .expect("Failed to parse fixture");
+    // Load your test model once
     let model = load_test_model();
-    let output = model.encode(&["hello world".to_string()]);
-    assert_eq!(output.len(), expected.len());
-    assert_eq!(output[0].len(), expected[0].len());
-    for (o, e) in output[0].iter().zip(expected[0].iter()) {
-        assert_relative_eq!(o, e, max_relative = 1e-5);
+
+    // Define (fixture path, inputs) for both short and long cases
+    let long_text = vec!["hello"; 1000].join(" ");  // 1 000 “hello”s
+    let cases = vec![
+        (
+            "tests/fixtures/embeddings_short.json",
+            vec!["hello world".to_string()],
+        ),
+        (
+            "tests/fixtures/embeddings_long.json",
+            vec![long_text],
+        ),
+    ];
+
+    for (fixture_path, inputs) in cases {
+        // Read and parse the Python‐generated embedding fixture
+        let fixture = fs::read_to_string(fixture_path)
+            .unwrap_or_else(|_| panic!("Fixture not found: {}", fixture_path));
+        let expected: Vec<Vec<f32>> = serde_json::from_str(&fixture)
+            .expect("Failed to parse fixture");
+
+        // Encode with your Rust model
+        let output = model.encode(&inputs);
+
+        // Sanity checks
+        assert_eq!(
+            output.len(),
+            expected.len(),
+            "number of sentences mismatch for {}",
+            fixture_path
+        );
+        assert_eq!(
+            output[0].len(),
+            expected[0].len(),
+            "vector dimensionality mismatch for {}",
+            fixture_path
+        );
+
+        // Element‐wise comparison
+        for (o, e) in output[0].iter().zip(&expected[0]) {
+            assert_relative_eq!(o, e, max_relative = 1e-5);
+        }
     }
 }
+
 
 /// Test that encoding an empty input slice yields an empty Vec
 #[test]
