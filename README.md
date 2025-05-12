@@ -57,11 +57,8 @@ Make embeddings with custom encode args:
 ```rust
 let embeddings = model.encode_with_args(
     &texts,     // input texts
-    false,      // show progress
     Some(512),  // max length
-    1204,       // batch size
-    true,       // use multiprocessing
-    10_000,     // multiprocessing threshold
+    1024,       // batch size
 );
 ```
 

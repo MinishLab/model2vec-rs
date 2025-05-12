@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
+use std::fs::File;
+use std::io::BufWriter;
 
 mod model;
 use model::StaticModel;
@@ -24,13 +26,6 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
-    /// Show token ID sequences for input texts
-    Tokens {
-        /// Input text or path to file
-        input: String,
-        /// Hugging Face repo ID or local path
-        model: String,
-    },
 }
 
 fn main() -> Result<()> {
@@ -48,29 +43,14 @@ fn main() -> Result<()> {
 
             let m = StaticModel::from_pretrained(&model, None, None, None)?;
             let embs = m.encode(&texts);
-
-            if let Some(path) = output {
-                let json = serde_json::to_string(&embs)?;
-                std::fs::write(path, json)?;
+            
+            if let Some(output) = output {
+                let file = File::create(&output).context("Failed to create output file")?;
+                let writer = BufWriter::new(file);
+                serde_json::to_writer(writer, &embs).context("Failed to write embeddings to JSON")?;
             } else {
-                println!("{:#?}", embs);
+                println!("Embeddings: {:#?}", embs);
             }
-        }
-
-        Commands::Tokens { input, model } => {
-            let texts = if Path::new(&input).exists() {
-                std::fs::read_to_string(&input)?
-                    .lines()
-                    .map(str::to_string)
-                    .collect()
-            } else {
-                vec![input]
-            };
-
-            let m = StaticModel::from_pretrained(&model, None, None, None)?;
-            // Provide default None for max_tokens to include all tokens
-            let ids = m.tokenize(&texts, None);
-            println!("Token ID sequences: {:#?}", ids);
         }
     }
     Ok(())

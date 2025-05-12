@@ -38,19 +38,6 @@ fn test_encode_empty_sentence() {
     assert!(vec.iter().all(|&x| x == 0.0), "All entries should be zero");
 }
 
-/// Test parallel vs sequential encoding consistency using encode_with_args
-#[test]
-fn test_encode_parallel_vs_sequential() {
-    let model = load_test_model();
-    let texts: Vec<String> = (0..1000).map(|_| "hello world".to_string()).collect();
-    let seq = model.encode_with_args(&texts, false, Some(512), 100, false, 500);
-    let par = model.encode_with_args(&texts, false, Some(512), 100, true, 500);
-    assert_eq!(seq.len(), par.len());
-    for (s, p) in seq.iter().zip(par.iter()) {
-        assert_relative_eq!(s.as_slice(), p.as_slice(), max_relative = 1e-6);
-    }
-}
-
 /// Test override of `normalize` flag in from_pretrained
 #[test]
 fn test_normalization_flag_override() {

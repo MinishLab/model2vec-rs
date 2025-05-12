@@ -1227,7 +1227,6 @@ dependencies = [
  "half",
  "hf-hub",
  "ndarray",
- "rayon",
  "safetensors",
  "serde_json",
  "tokenizers",
