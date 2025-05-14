@@ -124,54 +124,57 @@ impl StaticModel {
     /// Encode texts into embeddings.
     ///
     /// # Arguments
-    /// * `texts` - slice of input strings
-    /// * `max_length` - max tokens per text (truncation)
-    /// * `batch_size` - number of texts per batch
+    /// * `sentences` - the list of sentences to encode.
+    /// * `max_length` - max tokens per text.
+    /// * `batch_size` - number of texts per batch.
     pub fn encode_with_args(
         &self,
-        texts: &[String],
+        sentences: &[String],
         max_length: Option<usize>,
         batch_size: usize,
     ) -> Vec<Vec<f32>> {
-        let mut out = Vec::with_capacity(texts.len());
-
-        for chunk in texts.chunks(batch_size) {
-            // Truncate the input strings to max_length * median_token_length
-            let slices: Vec<&str> = chunk.iter()
-                .map(|t| {
-                    if let Some(mx) = max_length {
-                        Self::truncate_str(t, mx, self.median_token_length)
+        let mut embeddings = Vec::with_capacity(sentences.len());
+    
+        // Process in batches
+        for batch in sentences.chunks(batch_size) {
+            // Truncate each sentence to max_length * median_token_length chars
+            let truncated: Vec<&str> = batch
+                .iter()
+                .map(|text| {
+                    if let Some(max_tok) = max_length {
+                        Self::truncate_str(text, max_tok, self.median_token_length)
                     } else {
-                        t.as_str()
+                        text.as_str()
                     }
                 })
                 .collect();
-
+    
             // Tokenize the batch
-            let encs = self
+            let encodings = self
                 .tokenizer
                 .encode_batch_fast::<String>(
-                    slices.into_iter().map(|s| s.into()).collect(),
-                    false,
+                    // Into<EncodeInput>
+                    truncated.into_iter().map(Into::into).collect(),
+                    /* add_special_tokens = */ false,
                 )
                 .expect("Tokenization failed");
-
-            // Encode the token IDs into embeddings
-            for enc in encs {
-                let mut ids = enc.get_ids().to_vec();
-                if let Some(mx) = max_length {
-                    ids.truncate(mx);
+    
+            // Pool each token-ID list into a single mean vector
+            for encoding in encodings {
+                let mut token_ids = encoding.get_ids().to_vec();
+                if let Some(max_tok) = max_length {
+                    token_ids.truncate(max_tok);
                 }
-                out.push(self.pool_ids(ids));
+                embeddings.push(self.pool_ids(token_ids));
             }
         }
-
-        out
+    
+        embeddings
     }
 
     /// Default encode: `max_length=512`, `batch_size=1024`
-    pub fn encode(&self, texts: &[String]) -> Vec<Vec<f32>> {
-        self.encode_with_args(texts, Some(512), 1024)
+    pub fn encode(&self, sentences: &[String]) -> Vec<Vec<f32>> {
+        self.encode_with_args(sentences, Some(512), 1024)
     }
 
     /// Mean-pool a single token-ID list into a vector

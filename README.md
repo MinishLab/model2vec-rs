@@ -26,13 +26,13 @@ fn main() -> Result<()> {
     let model = StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?;
 
     // Prepare a list of sentences
-    let texts = vec![
+    let sentences = vec![
         "Hello world".to_string(),
         "Rust is awesome".to_string(),
     ];
 
     // Create embeddings
-    let embeddings = model.encode(&texts);
+    let embeddings = model.encode(&sentences);
     println!("Embeddings: {:?}", embeddings);
 
     Ok(())
@@ -56,7 +56,7 @@ Make embeddings with custom encode args:
 
 ```rust
 let embeddings = model.encode_with_args(
-    &texts,     // input texts
+    &sentences,     // input texts
     Some(512),  // max length
     1024,       // batch size
 );
