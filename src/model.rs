@@ -150,7 +150,10 @@ impl StaticModel {
             // Tokenize the batch
             let encs = self
                 .tokenizer
-                .encode_batch(slices, false)
+                .encode_batch_fast::<String>(
+                    slices.into_iter().map(|s| s.into()).collect(),
+                    false,
+                )
                 .expect("Tokenization failed");
 
             // Encode the token IDs into embeddings

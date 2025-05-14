@@ -12,7 +12,7 @@ keywords = ["embeddings", "model2vec", "nlp", "rust"]
 categories = ["natural-language-processing", "artificial-intelligence"]
 
 [dependencies]
-tokenizers = "0.13"
+tokenizers = "0.21"
 safetensors = "0.5"
 ndarray = "0.15"
 hf-hub = "0.3"
