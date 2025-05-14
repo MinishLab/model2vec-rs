@@ -13,6 +13,7 @@ pub struct StaticModel {
     embeddings: Array2<f32>,
     normalize: bool,
     median_token_length: usize,
+    unk_token_id: Option<usize>,
 }
 
 impl StaticModel {
@@ -76,6 +77,26 @@ impl StaticModel {
         let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
         let normalize = normalize.unwrap_or(cfg_norm);
 
+        // Serialize the tokenizer to JSON, then parse it and get the unk_token
+        let spec_json = tokenizer
+            .to_string(false)
+            .map_err(|e| anyhow!("Failed to serialize tokenizer to JSON: {}", e))?;
+
+        // parse it and pull out model.unk_token
+        let spec: Value = serde_json::from_str(&spec_json)
+            .context("Failed to parse tokenizer JSON spec")?;
+        let unk_token = spec
+            .get("model")
+            .and_then(|m| m.get("unk_token"))
+            .and_then(Value::as_str)
+            .unwrap_or("<unk>");
+
+        let unk_token_id_val = tokenizer
+            .token_to_id(unk_token)
+            .ok_or_else(|| anyhow!("Tokenizer JSON declared unk_token=\"{}\" but it’s not in the vocab", unk_token))?
+            as usize;
+        let unk_token_id = Some(unk_token_id_val);
+
         // Load the safetensors
         let model_bytes = fs::read(&mdl_path).context("Failed to read model.safetensors")?;
         let safet  = SafeTensors::deserialize(&model_bytes).context("Failed to parse safetensors")?;
@@ -104,6 +125,7 @@ impl StaticModel {
             embeddings,
             normalize,
             median_token_length,
+            unk_token_id,
         })
     }
 
@@ -162,6 +184,11 @@ impl StaticModel {
             // Pool each token-ID list into a single mean vector
             for encoding in encodings {
                 let mut token_ids = encoding.get_ids().to_vec();
+                // Remove unk tokens if specified
+                if let Some(unk_id) = self.unk_token_id {
+                    token_ids.retain(|&id| id as usize != unk_id);
+                }
+                // Truncate to max_length if specified
                 if let Some(max_tok) = max_length {
                     token_ids.truncate(max_tok);
                 }
