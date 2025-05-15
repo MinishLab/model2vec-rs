@@ -12,14 +12,10 @@ This crate provides a lightweight Rust implementation for loading and running in
 
 ## Quick Start
 
-Install the crate:
+Add the crate:
 
 ```bash
-git clone https://github.com/minishlab/model2vec-rust.git
-cd model2vec-rs
-
-# Build
-cargo build --release
+cargo add model2vec-rs
 ```
 
 Make embeddings:
