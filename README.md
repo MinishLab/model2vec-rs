@@ -13,7 +13,7 @@
 [Performance](#performance)
 </div>
 
-This crate provides a lightweight Rust implementation for loading and inference of [Model2Vec](https://github.com/MinishLab/model2vec) static embedding models.
+This crate provides a lightweight Rust implementation for loading and inference of [Model2Vec](https://github.com/MinishLab/model2vec) static embedding models. For distillation and training, the [Python Model2Vec package](https://github.com/MinishLab/model2vec) can be used.
 
 
 
@@ -91,20 +91,14 @@ We provide a number of models that can be used out of the box. These models are 
 
 ## Performance
 
-Here’s a little **Performance** snippet you can drop into your README:
-
----
-
-### Performance
-
-We compared the performance of the Rust implementation with the Python version of Model2Vec. The benchmark was run single-threaded on CPU.
+We compared the performance of the Rust implementation with the Python version of Model2Vec. The benchmark was run single-threaded on a CPU.
 
 | Implementation | Throughput                                         |
 | -------------- | -------------------------------------------------- |
 | **Rust**       | 8000 sentences |
 | **Python**     | 4650 sentences |
 
-The Rust version is roughly **1.7×** faster the Python version.
+The Rust version is roughly **1.7×** faster than the Python version.
 
 
 ## License
