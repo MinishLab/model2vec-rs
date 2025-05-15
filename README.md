@@ -3,7 +3,6 @@
     <picture>
       <img width="35%" alt="Model2Vec logo" src="assets/images/model2vec_rs_logo.png">
     </picture>
-  </a>
 </div>
 
 <div align="center">
