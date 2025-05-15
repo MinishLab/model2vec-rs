@@ -94,8 +94,8 @@ We compared the performance of the Rust implementation with the Python version o
 
 | Implementation | Throughput                                         |
 | -------------- | -------------------------------------------------- |
-| **Rust**       | 8000 sentences |
-| **Python**     | 4650 sentences |
+| **Rust**       | 8000 samples/second |
+| **Python**     | 4650 samples/second |
 
 The Rust version is roughly **1.7×** faster than the Python version.
 
