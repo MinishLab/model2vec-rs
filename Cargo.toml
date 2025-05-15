@@ -2,7 +2,7 @@
 name = "model2vec-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Official Rust Implementation for Model2Vec"
+description = "Official Rust Implementation of Model2Vec"
 readme = "README.md"
 license-file = "LICENSE"
 authors = ["Thomas van Dongen <thomas123@live.nl>", "Stéphan Tulkens <stephantul@gmail.com>"]

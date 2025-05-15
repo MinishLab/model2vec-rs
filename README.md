@@ -1,4 +1,12 @@
-# model2vec-rs
+
+<div align="center">
+    <picture>
+      <img width="35%" alt="Model2Vec logo" src="assets/images/model2vec_rs_logo.png">
+    </picture>
+  </a>
+</div>
+
+
 
 This crate provides a lightweight Rust implementation for loading and running inference on [Model2Vec](https://github.com/MinishLab/model2vec) static embedding models from either local folders or the Hugging Face Hub.
 
