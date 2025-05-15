@@ -9,7 +9,7 @@ authors = ["Thomas van Dongen <thomas123@live.nl>", "Stéphan Tulkens <stephantu
 homepage = "https://github.com/MinishLab/model2vec-rs"
 repository = "https://github.com/MinishLab/model2vec-rs"
 keywords = ["embeddings", "model2vec", "nlp", "rust"]
-categories = ["natural-language-processing", "artificial-intelligence"]
+categories = ["science", "text-processing"]
 
 exclude = ["tests/*"]
 
