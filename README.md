@@ -8,7 +8,7 @@
 <div align="center">
 
 [Quickstart](#quickstart) •
-[Models](#models) •
+[Models](#model list) •
 [Performance](#performance)
 </div>
 
