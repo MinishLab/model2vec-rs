@@ -49,18 +49,40 @@ fn main() -> Result<()> {
 }
 ```
 
+Make embeddings with the CLI (without compilation, slightly slower):
 
-Make embeddings with the CLI:
+```shell
+# Clone the repository
+git clone https://github.com/MinishLab/model2vec-rs.git
+cd model2vec-rs
 
-```rust
-# Single sentence
+# Encode a single sentence (<1s)
 cargo run -- encode "Hello world" minishlab/potion-base-8M
 
-# Multiple lines from a file
+# Encode multiple lines from a file
 echo -e "Hello world\nRust is awesome" > input.txt
 cargo run -- encode input.txt minishlab/potion-base-8M --output embeds.json
 ```
 
+Compiling and using the optimized executable (~10x faster):
+
+```shell
+# Clone the repository
+git clone https://github.com/MinishLab/model2vec-rs.git
+cd model2vec-rs
+
+# Compile
+cargo build --release
+
+# Test (optional)
+target/release/model2vec-rs encode "Hello world" "minishlab/potion-base-8M"
+
+# Copy executable to bin (Mac/Linux) for global availability
+sudo cp target/release/model2vec-rs /usr/local/bin/
+
+# Encode a single sentence e.g. in home directory (<0.1s)
+model2vec-rs encode "Hello world" "minishlab/potion-base-8M"
+```
 
 Make embeddings with custom encode args:
 
@@ -71,6 +93,8 @@ let embeddings = model.encode_with_args(
     1024,       // batch size
 );
 ```
+
+Build 
 
 ## Models
 
