@@ -72,6 +72,34 @@ fn test_encode_empty_sentence() {
     assert!(vec.iter().all(|&x| x == 0.0), "All entries should be zero");
 }
 
+/// Test that encoding a single sentence returns the correct shape
+fn test_encode_single() {
+    let model = load_test_model();
+    let sentence = "hello world";
+
+    // Single-sentence helper → 1-D
+    let one_d = model.encode_single(sentence);
+
+    // Batch call with a 1-element slice → 2-D wrapper
+    let two_d = model.encode(&[sentence.to_string()]);
+
+    // Shape assertions
+    assert!(
+        !one_d.is_empty(),
+        "encode_single must return a non-empty 1-D vector"
+    );
+    assert_eq!(
+        two_d.len(),
+        1,
+        "encode(&[..]) should wrap the result in a Vec with length 1"
+    );
+    assert_eq!(
+        two_d[0].len(),
+        one_d.len(),
+        "inner vector dimensionality should match encode_single output"
+    );
+}
+
 /// Test override of `normalize` flag in from_pretrained
 #[test]
 fn test_normalization_flag_override() {
