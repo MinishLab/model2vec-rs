@@ -1,8 +1,8 @@
-use clap::{Parser, Subcommand};
 use anyhow::{Context, Result};
-use std::path::Path;
+use clap::{Parser, Subcommand};
 use std::fs::File;
 use std::io::BufWriter;
+use std::path::Path;
 
 mod model;
 use model::StaticModel;
@@ -43,17 +43,14 @@ fn main() -> Result<()> {
         // Encode multiple sentences from a file or input string
         Commands::Encode { input, model, output } => {
             let texts = if Path::new(&input).exists() {
-                std::fs::read_to_string(&input)?
-                    .lines()
-                    .map(str::to_string)
-                    .collect()
+                std::fs::read_to_string(&input)?.lines().map(str::to_string).collect()
             } else {
                 vec![input]
             };
 
             let m = StaticModel::from_pretrained(&model, None, None, None)?;
             let embs = m.encode(&texts);
-            
+
             if let Some(output) = output {
                 let file = File::create(&output).context("failed to create output file")?;
                 let writer = BufWriter::new(file);
@@ -63,14 +60,17 @@ fn main() -> Result<()> {
             }
         }
         // Encode a single sentence
-        Commands::EncodeSingle { sentence, model, output } => {
+        Commands::EncodeSingle {
+            sentence,
+            model,
+            output,
+        } => {
             let m = StaticModel::from_pretrained(&model, None, None, None)?;
             let embedding = m.encode_single(&sentence);
 
             if let Some(path) = output {
                 let file = File::create(path).context("creating output file failed")?;
-                serde_json::to_writer(BufWriter::new(file), &embedding)
-                    .context("writing JSON failed")?;
+                serde_json::to_writer(BufWriter::new(file), &embedding).context("writing JSON failed")?;
             } else {
                 println!("{embedding:#?}");
             }

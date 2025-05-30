@@ -1,8 +1,8 @@
 mod common;
-use common::load_test_model;
 use approx::assert_relative_eq;
-use std::fs;
+use common::load_test_model;
 use model2vec_rs::model::StaticModel;
+use std::fs;
 
 #[test]
 fn test_encode_matches_python_model2vec() {
@@ -13,22 +13,15 @@ fn test_encode_matches_python_model2vec() {
     let long_text = vec!["hello"; 1000].join(" ");
     let short_text = "hello world".to_string();
     let cases = vec![
-        (
-            "tests/fixtures/embeddings_short.json",
-            vec![short_text],
-        ),
-        (
-            "tests/fixtures/embeddings_long.json",
-            vec![long_text],
-        ),
+        ("tests/fixtures/embeddings_short.json", vec![short_text]),
+        ("tests/fixtures/embeddings_long.json", vec![long_text]),
     ];
 
     for (fixture_path, inputs) in cases {
         // Read and parse the Python‐generated embedding fixture
-        let fixture = fs::read_to_string(fixture_path)
-            .unwrap_or_else(|_| panic!("Fixture not found: {}", fixture_path));
-        let expected: Vec<Vec<f32>> = serde_json::from_str(&fixture)
-            .expect("Failed to parse fixture");
+        let fixture =
+            fs::read_to_string(fixture_path).unwrap_or_else(|_| panic!("Fixture not found: {}", fixture_path));
+        let expected: Vec<Vec<f32>> = serde_json::from_str(&fixture).expect("Failed to parse fixture");
 
         // Encode with the Rust model
         let output = model.encode(&inputs);
@@ -85,10 +78,7 @@ fn test_encode_single() {
     let two_d = model.encode(&[sentence.to_string()]);
 
     // Shape assertions
-    assert!(
-        !one_d.is_empty(),
-        "encode_single must return a non-empty 1-D vector"
-    );
+    assert!(!one_d.is_empty(), "encode_single must return a non-empty 1-D vector");
     assert_eq!(
         two_d.len(),
         1,
@@ -105,20 +95,23 @@ fn test_encode_single() {
 #[test]
 fn test_normalization_flag_override() {
     // Load with normalize = true (default in config)
-    let model_norm = StaticModel::from_pretrained(
-        "tests/fixtures/test-model-float32", None, None, None
-    ).unwrap();
+    let model_norm = StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, None, None).unwrap();
     let emb_norm = model_norm.encode(&["test sentence".to_string()])[0].clone();
-    let norm_norm = emb_norm.iter().map(|&x| x*x).sum::<f32>().sqrt();
+    let norm_norm = emb_norm.iter().map(|&x| x * x).sum::<f32>().sqrt();
 
     // Load with normalize = false override
-    let model_no_norm = StaticModel::from_pretrained(
-        "tests/fixtures/test-model-float32", None, Some(false), None
-    ).unwrap();
+    let model_no_norm =
+        StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, Some(false), None).unwrap();
     let emb_no = model_no_norm.encode(&["test sentence".to_string()])[0].clone();
-    let norm_no = emb_no.iter().map(|&x| x*x).sum::<f32>().sqrt();
+    let norm_no = emb_no.iter().map(|&x| x * x).sum::<f32>().sqrt();
 
     // Normalized version should have unit length, override should give larger norm
-    assert!((norm_norm - 1.0).abs() < 1e-5, "Normalized vector should have unit norm");
-    assert!(norm_no > norm_norm, "Without normalization override, norm should be larger");
+    assert!(
+        (norm_norm - 1.0).abs() < 1e-5,
+        "Normalized vector should have unit norm"
+    );
+    assert!(
+        norm_no > norm_norm,
+        "Without normalization override, norm should be larger"
+    );
 }

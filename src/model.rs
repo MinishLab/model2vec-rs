@@ -1,11 +1,11 @@
-use hf_hub::api::sync::Api;
-use tokenizers::Tokenizer;
-use safetensors::{SafeTensors, tensor::Dtype};
+use anyhow::{anyhow, Context, Result};
 use half::f16;
+use hf_hub::api::sync::Api;
 use ndarray::Array2;
-use std::{env, fs, path::Path};
-use anyhow::{Context, Result, anyhow};
+use safetensors::{tensor::Dtype, SafeTensors};
 use serde_json::Value;
+use std::{env, fs, path::Path};
+use tokenizers::Tokenizer;
 
 /// Static embedding model for Model2Vec
 pub struct StaticModel {
@@ -18,7 +18,7 @@ pub struct StaticModel {
 
 impl StaticModel {
     /// Load a Model2Vec model from a local folder or the HuggingFace Hub.
-    /// 
+    ///
     /// # Arguments
     /// * `repo_or_path` - HuggingFace repo ID or local path to the model folder.
     /// * `token` - Optional HuggingFace token for authenticated downloads.
@@ -49,7 +49,7 @@ impl StaticModel {
                 (t, m, c)
             } else {
                 let api = Api::new().context("hf-hub API init failed")?;
-                let repo = api.model(repo_or_path.as_ref().to_string_lossy().into_owned()); 
+                let repo = api.model(repo_or_path.as_ref().to_string_lossy().into_owned());
                 let prefix = subfolder.map(|s| format!("{}/", s)).unwrap_or_default();
                 let t = repo.get(&format!("{prefix}tokenizer.json"))?;
                 let m = repo.get(&format!("{prefix}model.safetensors"))?;
@@ -62,11 +62,7 @@ impl StaticModel {
         let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
 
         // Median-token-length hack for pre-truncation
-        let mut lens: Vec<usize> = tokenizer
-            .get_vocab(false)
-            .keys()
-            .map(|tk| tk.len())
-            .collect();
+        let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
@@ -77,7 +73,9 @@ impl StaticModel {
         let normalize = normalize.unwrap_or(cfg_norm);
 
         // Serialize the tokenizer to JSON, then parse it and get the unk_token
-        let spec_json = tokenizer.to_string(false).map_err(|e| anyhow!("tokenizer -> JSON failed: {e}"))?;
+        let spec_json = tokenizer
+            .to_string(false)
+            .map_err(|e| anyhow!("tokenizer -> JSON failed: {e}"))?;
         let spec: Value = serde_json::from_str(&spec_json)?;
         let unk_token = spec
             .get("model")
@@ -91,16 +89,13 @@ impl StaticModel {
 
         // Load the safetensors
         let model_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
-        let safet  = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
+        let safet = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
         let tensor = safet
             .tensor("embeddings")
             .or_else(|_| safet.tensor("0"))
             .context("embeddings tensor not found")?;
 
-        let [rows, cols]: [usize; 2] = tensor
-            .shape()
-            .try_into()
-            .context("embedding tensor is not 2‑D")?;
+        let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2‑D")?;
         let raw = tensor.data();
         let dtype = tensor.dtype();
 
@@ -117,8 +112,7 @@ impl StaticModel {
             Dtype::I8 => raw.iter().map(|&b| f32::from(b as i8)).collect(),
             other => return Err(anyhow!("unsupported tensor dtype: {other:?}")),
         };
-        let embeddings = Array2::from_shape_vec((rows, cols), floats)
-            .context("failed to build embeddings array")?;
+        let embeddings = Array2::from_shape_vec((rows, cols), floats).context("failed to build embeddings array")?;
 
         Ok(Self {
             tokenizer,
@@ -151,7 +145,7 @@ impl StaticModel {
         batch_size: usize,
     ) -> Vec<Vec<f32>> {
         let mut embeddings = Vec::with_capacity(sentences.len());
-    
+
         // Process in batches
         for batch in sentences.chunks(batch_size) {
             // Truncate each sentence to max_length * median_token_length chars
@@ -163,7 +157,7 @@ impl StaticModel {
                         .unwrap_or(text.as_str())
                 })
                 .collect();
-    
+
             // Tokenize the batch
             let encodings = self
                 .tokenizer
@@ -173,7 +167,7 @@ impl StaticModel {
                     /* add_special_tokens = */ false,
                 )
                 .expect("tokenization failed");
-    
+
             // Pool each token-ID list into a single mean vector
             for encoding in encodings {
                 let mut token_ids = encoding.get_ids().to_vec();
@@ -188,7 +182,7 @@ impl StaticModel {
                 embeddings.push(self.pool_ids(token_ids));
             }
         }
-    
+
         embeddings
     }
 
@@ -199,7 +193,10 @@ impl StaticModel {
 
     // / Encode a single sentence into a vector
     pub fn encode_single(&self, sentence: &str) -> Vec<f32> {
-        self.encode(&[sentence.to_string()]).into_iter().next().unwrap_or_default()
+        self.encode(&[sentence.to_string()])
+            .into_iter()
+            .next()
+            .unwrap_or_default()
     }
 
     /// Mean-pool a single token-ID list into a vector
@@ -214,7 +211,7 @@ impl StaticModel {
         let cnt = ids.len().max(1) as f32;
         sum.iter_mut().for_each(|x| *x /= cnt);
         if self.normalize {
-            let norm = sum.iter().map(|&v| v*v).sum::<f32>().sqrt().max(1e-12);
+            let norm = sum.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
             sum.iter_mut().for_each(|x| *x /= norm);
         }
         sum
