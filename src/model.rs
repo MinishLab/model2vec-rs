@@ -197,6 +197,11 @@ impl StaticModel {
         self.encode_with_args(sentences, Some(512), 1024)
     }
 
+    // / Encode a single sentence into a vector
+    pub fn encode_single(&self, sentence: &str) -> Vec<f32> {
+        self.encode(&[sentence.to_string()]).into_iter().next().unwrap_or_default()
+    }
+
     /// Mean-pool a single token-ID list into a vector
     fn pool_ids(&self, ids: Vec<u32>) -> Vec<f32> {
         let mut sum = vec![0.0; self.embeddings.ncols()];
