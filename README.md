@@ -107,7 +107,7 @@ The compiled binary installed via `cargo install` is significantly faster (often
 
 *   **Encode a single sentence:**
     ```shell
-    model2vec-rs encode "Hello world" "minishlab/potion-base-8M"
+    model2vec-rs encode-single "Hello world" "minishlab/potion-base-8M"
     ```
     Embeddings will be printed to the console in JSON format. This command should take less than 0.1s to execute.
 
