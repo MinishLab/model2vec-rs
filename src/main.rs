@@ -45,11 +45,11 @@ fn main() -> Result<()> {
             let embs = m.encode(&texts);
             
             if let Some(output) = output {
-                let file = File::create(&output).context("Failed to create output file")?;
+                let file = File::create(&output).context("failed to create output file")?;
                 let writer = BufWriter::new(file);
-                serde_json::to_writer(writer, &embs).context("Failed to write embeddings to JSON")?;
+                serde_json::to_writer(writer, &embs).context("failed to write embeddings to JSON")?;
             } else {
-                println!("Embeddings: {:#?}", embs);
+                println!("{:?}", embs);
             }
         }
     }
