@@ -54,7 +54,7 @@ impl StaticModel {
                 let t = repo.get(&format!("{prefix}tokenizer.json"))?;
                 let m = repo.get(&format!("{prefix}model.safetensors"))?;
                 let c = repo.get(&format!("{prefix}config.json"))?;
-                (t.into(), m.into(), c.into())
+                (t, m, c)
             }
         };
 

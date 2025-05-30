@@ -3,12 +3,8 @@ use model2vec_rs::model::StaticModel;
 
 fn encode_with_model(path: &str) -> Vec<f32> {
     // Helper function to load the model and encode "hello world"
-    let model = StaticModel::from_pretrained(
-        path,
-        None,
-        None,
-        None,
-    ).expect(&format!("Failed to load model at {}", path));
+    let model = StaticModel::from_pretrained(path, None, None, None)
+        .unwrap_or_else(|e| panic!("Failed to load model at {path}: {e}"));
 
     let out = model.encode(&["hello world".to_string()]);
     assert_eq!(out.len(), 1);
