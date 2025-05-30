@@ -73,6 +73,7 @@ fn test_encode_empty_sentence() {
 }
 
 /// Test that encoding a single sentence returns the correct shape
+#[test]
 fn test_encode_single() {
     let model = load_test_model();
     let sentence = "hello world";
