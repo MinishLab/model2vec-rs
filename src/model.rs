@@ -87,7 +87,7 @@ impl StaticModel {
             .get("model")
             .and_then(|m| m.get("unk_token"))
             .and_then(Value::as_str)
-            .unwrap_or("<unk>");
+            .unwrap_or("[UNK]");
         let unk_token_id_val = tokenizer
             .token_to_id(unk_token)
             .ok_or_else(|| anyhow!("Tokenizer JSON declared unk_token=\"{}\" but it’s not in the vocab", unk_token))?
