@@ -26,11 +26,21 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Encode a single sentence  
+    EncodeSingle {
+        /// The sentence to embed
+        sentence: String,
+        /// HF repo ID or local dir
+        model: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        // Encode multiple sentences from a file or input string
         Commands::Encode { input, model, output } => {
             let texts = if Path::new(&input).exists() {
                 std::fs::read_to_string(&input)?
@@ -50,6 +60,19 @@ fn main() -> Result<()> {
                 serde_json::to_writer(writer, &embs).context("failed to write embeddings to JSON")?;
             } else {
                 println!("{:?}", embs);
+            }
+        }
+        // Encode a single sentence
+        Commands::EncodeSingle { sentence, model, output } => {
+            let m = StaticModel::from_pretrained(&model, None, None, None)?;
+            let embedding = m.encode_single(&sentence);
+
+            if let Some(path) = output {
+                let file = File::create(path).context("creating output file failed")?;
+                serde_json::to_writer(BufWriter::new(file), &embedding)
+                    .context("writing JSON failed")?;
+            } else {
+                println!("{embedding:#?}");
             }
         }
     }
