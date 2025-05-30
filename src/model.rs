@@ -172,7 +172,7 @@ impl StaticModel {
                     truncated.into_iter().map(Into::into).collect(),
                     /* add_special_tokens = */ false,
                 )
-                .expect("Tokenization failed");
+                .expect("tokenization failed");
     
             // Pool each token-ID list into a single mean vector
             for encoding in encodings {
