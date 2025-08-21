@@ -13,8 +13,20 @@ categories = ["science", "text-processing"]
 
 exclude = ["tests/*"]
 
+[features]
+default      = ["onig"]
+onig         = ["tokenizers/onig",
+                "tokenizers/progressbar",
+                "tokenizers/esaxx_fast",
+                "tokenizers/http"]
+
+fancy-regex  = ["tokenizers/fancy-regex",
+                "tokenizers/progressbar",
+                "tokenizers/esaxx_fast",
+                "tokenizers/http"]
+
 [dependencies]
-tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex", "http"] }
+tokenizers = { version = "0.21", default-features = false }
 safetensors = "0.5"
 ndarray = "0.15"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
