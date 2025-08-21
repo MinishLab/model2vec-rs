@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: # Different backends for Tokenizers
+          - default  
+          - fancy-regex     
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.backend }}" = "default" ]; then
+            cargo build --verbose
+          else
+            cargo build --no-default-features --features fancy-regex --verbose
+          fi
+
+      - name: Test
+        run: |
+          if [ "${{ matrix.backend }}" = "default" ]; then
+            cargo test --verbose
+          else
+            cargo test --no-default-features --features fancy-regex --verbose
+          fi
+
+      - name: Lint (clippy)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Format check
+        run: cargo fmt -- --check
