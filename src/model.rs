@@ -11,6 +11,8 @@ use tokenizers::Tokenizer;
 pub struct StaticModel {
     tokenizer: Tokenizer,
     embeddings: Array2<f32>,
+    weights: Option<Vec<f32>>,
+    token_mapping: Option<Vec<usize>>,
     normalize: bool,
     median_token_length: usize,
     unk_token_id: Option<usize>,
@@ -114,9 +116,69 @@ impl StaticModel {
         };
         let embeddings = Array2::from_shape_vec((rows, cols), floats).context("failed to build embeddings array")?;
 
+        // Load optional weights
+        let weights = match safet.tensor("weights") {
+            Ok(t) => {
+                if t.shape().len() != 1 {
+                    return Err(anyhow!("weights tensor is not 1-D"));
+                }
+                let raw = t.data();
+                let v = match t.dtype() {
+                    Dtype::F32 => raw
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                        .collect(),
+                    Dtype::F64 => raw
+                        .chunks_exact(8)
+                        .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
+                        .collect(),
+                    Dtype::F16 => raw
+                        .chunks_exact(2)
+                        .map(|b| f16::from_le_bytes(b.try_into().unwrap()).to_f32())
+                        .collect(),
+                    other => return Err(anyhow!("unsupported weights dtype: {other:?}")),
+                };
+                Some(v)
+            }
+            Err(_) => None,
+        };
+
+        // Load optional token_mapping
+        let token_mapping = match safet.tensor("mapping") {
+            Ok(t) => {
+                if t.shape().len() != 1 {
+                    return Err(anyhow!("mapping tensor is not 1-D"));
+                }
+                let raw = t.data();
+                let v = match t.dtype() {
+                    Dtype::I64 => raw
+                        .chunks_exact(8)
+                        .map(|b| i64::from_le_bytes(b.try_into().unwrap()) as usize)
+                        .collect(),
+                    Dtype::I32 => raw
+                        .chunks_exact(4)
+                        .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as usize)
+                        .collect(),
+                    Dtype::U64 => raw
+                        .chunks_exact(8)
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize)
+                        .collect(),
+                    Dtype::U32 => raw
+                        .chunks_exact(4)
+                        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+                        .collect(),
+                    other => return Err(anyhow!("unsupported mapping dtype: {other:?}")),
+                };
+                Some(v)
+            }
+            Err(_) => None,
+        };
+
         Ok(Self {
             tokenizer,
             embeddings,
+            weights,
+            token_mapping,
             normalize,
             median_token_length,
             unk_token_id: Some(unk_token_id),
@@ -201,19 +263,46 @@ impl StaticModel {
 
     /// Mean-pool a single token-ID list into a vector
     fn pool_ids(&self, ids: Vec<u32>) -> Vec<f32> {
-        let mut sum = vec![0.0; self.embeddings.ncols()];
+        let dim = self.embeddings.ncols();
+        let mut sum = vec![0.0; dim];
+        let mut cnt = 0usize;
+
         for &id in &ids {
-            let row = self.embeddings.row(id as usize);
+            let tok = id as usize;
+
+            // Remap: row = token_mapping[id] or id
+            let row_idx = if let Some(m) = &self.token_mapping {
+                *m.get(tok).unwrap_or(&0usize)
+            } else {
+                tok
+            };
+
+            // Scale by per-token weight if present
+            let scale = if let Some(w) = &self.weights {
+                *w.get(tok).unwrap_or(&1.0)
+            } else {
+                1.0
+            };
+
+            let row = self.embeddings.row(row_idx);
             for (i, &v) in row.iter().enumerate() {
-                sum[i] += v;
+                sum[i] += v * scale;
             }
+            cnt += 1;
         }
-        let cnt = ids.len().max(1) as f32;
-        sum.iter_mut().for_each(|x| *x /= cnt);
+
+        let denom = (cnt.max(1)) as f32;
+        for x in &mut sum {
+            *x /= denom;
+        }
+
         if self.normalize {
             let norm = sum.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
-            sum.iter_mut().for_each(|x| *x /= norm);
+            for x in &mut sum {
+                *x /= norm;
+            }
         }
         sum
     }
+
 }
