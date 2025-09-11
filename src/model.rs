@@ -265,11 +265,13 @@ impl StaticModel {
             cnt += 1;
         }
 
+        // Mean pool the embeddings
         let denom = (cnt.max(1)) as f32;
         for x in &mut sum {
             *x /= denom;
         }
 
+        // Normalize the embeddings if required
         if self.normalize {
             let norm = sum.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
             for x in &mut sum {
