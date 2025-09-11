@@ -116,59 +116,33 @@ impl StaticModel {
         };
         let embeddings = Array2::from_shape_vec((rows, cols), floats).context("failed to build embeddings array")?;
 
-        // Load optional weights
+        // Load optional weights for vocabulary quantization
         let weights = match safet.tensor("weights") {
             Ok(t) => {
-                if t.shape().len() != 1 {
-                    return Err(anyhow!("weights tensor is not 1-D"));
+                if t.shape().len() != 1 || t.dtype() != Dtype::F64 {
+                    return Err(anyhow!("weights must be 1-D F64"));
                 }
                 let raw = t.data();
-                let v = match t.dtype() {
-                    Dtype::F32 => raw
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                        .collect(),
-                    Dtype::F64 => raw
-                        .chunks_exact(8)
-                        .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
-                        .collect(),
-                    Dtype::F16 => raw
-                        .chunks_exact(2)
-                        .map(|b| f16::from_le_bytes(b.try_into().unwrap()).to_f32())
-                        .collect(),
-                    other => return Err(anyhow!("unsupported weights dtype: {other:?}")),
-                };
+                let v: Vec<f32> = raw
+                    .chunks_exact(8)
+                    .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
+                    .collect();
                 Some(v)
             }
             Err(_) => None,
         };
 
-        // Load optional token_mapping
+        // Load optional token mapping for vocabulary quantization
         let token_mapping = match safet.tensor("mapping") {
             Ok(t) => {
-                if t.shape().len() != 1 {
-                    return Err(anyhow!("mapping tensor is not 1-D"));
+                if t.shape().len() != 1 || t.dtype() != Dtype::I32 {
+                    return Err(anyhow!("mapping must be 1-D I32"));
                 }
                 let raw = t.data();
-                let v = match t.dtype() {
-                    Dtype::I64 => raw
-                        .chunks_exact(8)
-                        .map(|b| i64::from_le_bytes(b.try_into().unwrap()) as usize)
-                        .collect(),
-                    Dtype::I32 => raw
-                        .chunks_exact(4)
-                        .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as usize)
-                        .collect(),
-                    Dtype::U64 => raw
-                        .chunks_exact(8)
-                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize)
-                        .collect(),
-                    Dtype::U32 => raw
-                        .chunks_exact(4)
-                        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
-                        .collect(),
-                    other => return Err(anyhow!("unsupported mapping dtype: {other:?}")),
-                };
+                let v: Vec<usize> = raw
+                    .chunks_exact(4)
+                    .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as usize)
+                    .collect();
                 Some(v)
             }
             Err(_) => None,
