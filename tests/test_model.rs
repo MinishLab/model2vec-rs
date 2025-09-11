@@ -2,9 +2,6 @@ mod common;
 use common::load_test_model;
 use model2vec_rs::model::StaticModel;
 
-
-
-
 /// Test that encoding an empty input slice yields an empty output
 #[test]
 fn test_encode_empty_input() {

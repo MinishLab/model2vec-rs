@@ -47,8 +47,6 @@ fn test_encode_matches_python_model2vec() {
     }
 }
 
-
-
 #[test]
 fn test_encode_matches_python_model2vec_vocab_quantized() {
     // Load the test model
@@ -56,9 +54,7 @@ fn test_encode_matches_python_model2vec_vocab_quantized() {
 
     // Define the short and long text inputs
     let long_text = vec!["hello"; 1000].join(" ");
-    let cases = vec![
-        ("tests/fixtures/embeddings_vocab_quantized.json", vec![long_text]),
-    ];
+    let cases = vec![("tests/fixtures/embeddings_vocab_quantized.json", vec![long_text])];
 
     for (fixture_path, inputs) in cases {
         // Read and parse the Python‐generated embedding fixture

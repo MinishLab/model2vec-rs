@@ -280,5 +280,4 @@ impl StaticModel {
         }
         sum
     }
-
 }

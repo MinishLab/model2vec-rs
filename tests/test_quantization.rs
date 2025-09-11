@@ -2,8 +2,6 @@ mod common;
 use approx::assert_relative_eq;
 use common::encode_with_model;
 
-
-
 #[test]
 fn quantized_models_match_float32() {
     // Compare quantized models against the float32 model
@@ -21,5 +19,3 @@ fn quantized_models_match_float32() {
         }
     }
 }
-
-
