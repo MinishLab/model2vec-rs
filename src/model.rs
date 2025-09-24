@@ -8,6 +8,7 @@ use std::{env, fs, path::Path};
 use tokenizers::Tokenizer;
 
 /// Static embedding model for Model2Vec
+#[derive(Debug, Clone)]
 pub struct StaticModel {
     tokenizer: Tokenizer,
     embeddings: Array2<f32>,
