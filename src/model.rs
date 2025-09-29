@@ -121,13 +121,16 @@ impl StaticModel {
             Ok(t) => {
                 let raw = t.data();
                 let v: Vec<f32> = match t.dtype() {
-                    Dtype::F64 => raw.chunks_exact(8)
+                    Dtype::F64 => raw
+                        .chunks_exact(8)
                         .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
                         .collect(),
-                    Dtype::F32 => raw.chunks_exact(4)
+                    Dtype::F32 => raw
+                        .chunks_exact(4)
                         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                         .collect(),
-                    Dtype::F16 => raw.chunks_exact(2)
+                    Dtype::F16 => raw
+                        .chunks_exact(2)
                         .map(|b| half::f16::from_le_bytes(b.try_into().unwrap()).to_f32())
                         .collect(),
                     other => return Err(anyhow!("unsupported weights dtype: {:?}", other)),
@@ -141,7 +144,8 @@ impl StaticModel {
         let token_mapping = match safet.tensor("mapping") {
             Ok(t) => {
                 let raw = t.data();
-                let v: Vec<usize> = raw.chunks_exact(4)
+                let v: Vec<usize> = raw
+                    .chunks_exact(4)
                     .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as usize)
                     .collect();
                 Some(v)
