@@ -89,7 +89,7 @@ fn test_from_raw_parts() {
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();
 
-    let model = StaticModel::from_raw_parts(tokenizer, &floats, rows, cols, true).unwrap();
+    let model = StaticModel::from_raw_parts(tokenizer, &floats, rows, cols, true, None, None).unwrap();
     let emb = model.encode_single("hello");
     assert!(!emb.is_empty());
 }
