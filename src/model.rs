@@ -171,6 +171,7 @@ impl StaticModel {
     /// * `rows` - Number of vocabulary entries
     /// * `cols` - Embedding dimension
     /// * `normalize` - Whether to L2-normalize output embeddings
+    #[allow(dead_code)]
     pub fn from_raw_parts(
         tokenizer: Tokenizer,
         embeddings: &[f32],
