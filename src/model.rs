@@ -33,12 +33,10 @@ impl StaticModel {
         normalize: Option<bool>,
         subfolder: Option<&str>,
     ) -> Result<Self> {
-        // If provided, set HF token for authenticated downloads
         if let Some(tok) = token {
             env::set_var("HF_HUB_TOKEN", tok);
         }
 
-        // Locate tokenizer.json, model.safetensors, config.json
         let (tok_path, mdl_path, cfg_path) = {
             let base = repo_or_path.as_ref();
             if base.exists() {
@@ -61,38 +59,38 @@ impl StaticModel {
             }
         };
 
-        // Load the tokenizer
-        let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+        let tokenizer_bytes = fs::read(&tok_path).context("failed to read tokenizer.json")?;
+        let safetensors_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
+        let config_bytes = fs::read(&cfg_path).context("failed to read config.json")?;
 
-        // Median-token-length hack for pre-truncation
-        let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
-        lens.sort_unstable();
-        let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
+        Self::from_bytes(&tokenizer_bytes, &safetensors_bytes, &config_bytes, normalize)
+    }
 
-        // Read normalize default from config.json
-        let cfg_file = std::fs::File::open(&cfg_path).context("failed to read config.json")?;
-        let cfg: Value = serde_json::from_reader(&cfg_file).context("failed to parse config.json")?;
+    /// Load a Model2Vec model from raw bytes.
+    ///
+    /// # Arguments
+    /// * `tokenizer_bytes` - Contents of tokenizer.json
+    /// * `safetensors_bytes` - Contents of model.safetensors
+    /// * `config_bytes` - Contents of config.json
+    /// * `normalize` - Optional flag to override normalization (default from config)
+    pub fn from_bytes(
+        tokenizer_bytes: &[u8],
+        safetensors_bytes: &[u8],
+        config_bytes: &[u8],
+        normalize: Option<bool>,
+    ) -> Result<Self> {
+        let tokenizer =
+            Tokenizer::from_bytes(tokenizer_bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+
+        let median_token_length = Self::median_token_length(&tokenizer);
+        let unk_token_id = Self::unk_token_id(&tokenizer)?;
+
+        let cfg: Value = serde_json::from_slice(config_bytes).context("failed to parse config.json")?;
         let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
         let normalize = normalize.unwrap_or(cfg_norm);
 
-        // Serialize the tokenizer to JSON, then parse it and get the unk_token
-        let spec_json = tokenizer
-            .to_string(false)
-            .map_err(|e| anyhow!("tokenizer -> JSON failed: {e}"))?;
-        let spec: Value = serde_json::from_str(&spec_json)?;
-        let unk_token = spec
-            .get("model")
-            .and_then(|m| m.get("unk_token"))
-            .and_then(Value::as_str)
-            .unwrap_or("[UNK]");
-        let unk_token_id = tokenizer
-            .token_to_id(unk_token)
-            .ok_or_else(|| anyhow!("tokenizer claims unk_token='{unk_token}' but it isn't in the vocab"))?
-            as usize;
-
         // Load the safetensors
-        let model_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
-        let safet = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
+        let safet = SafeTensors::deserialize(safetensors_bytes).context("failed to parse safetensors")?;
         let tensor = safet
             .tensor("embeddings")
             .or_else(|_| safet.tensor("0"))
@@ -161,8 +159,67 @@ impl StaticModel {
             token_mapping,
             normalize,
             median_token_length,
-            unk_token_id: Some(unk_token_id),
+            unk_token_id,
         })
+    }
+
+    /// Construct from pre-parsed parts.
+    ///
+    /// # Arguments
+    /// * `tokenizer` - Pre-deserialized tokenizer
+    /// * `embeddings` - Raw f32 embedding data
+    /// * `rows` - Number of vocabulary entries
+    /// * `cols` - Embedding dimension
+    /// * `normalize` - Whether to L2-normalize output embeddings
+    pub fn from_raw_parts(
+        tokenizer: Tokenizer,
+        embeddings: &[f32],
+        rows: usize,
+        cols: usize,
+        normalize: bool,
+    ) -> Result<Self> {
+        if embeddings.len() != rows * cols {
+            return Err(anyhow!(
+                "embeddings length {} != rows {} * cols {}",
+                embeddings.len(),
+                rows,
+                cols
+            ));
+        }
+
+        let median_token_length = Self::median_token_length(&tokenizer);
+        let unk_token_id = Self::unk_token_id(&tokenizer)?;
+
+        let embeddings = Array2::from_shape_vec((rows, cols), embeddings.to_vec())
+            .context("failed to build embeddings array")?;
+
+        Ok(Self {
+            tokenizer,
+            embeddings,
+            weights: None,
+            token_mapping: None,
+            normalize,
+            median_token_length,
+            unk_token_id,
+        })
+    }
+
+    fn median_token_length(tokenizer: &Tokenizer) -> usize {
+        let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
+        lens.sort_unstable();
+        lens.get(lens.len() / 2).copied().unwrap_or(1)
+    }
+
+    fn unk_token_id(tokenizer: &Tokenizer) -> Result<Option<usize>> {
+        let spec_json = tokenizer
+            .to_string(false)
+            .map_err(|e| anyhow!("tokenizer -> JSON failed: {e}"))?;
+        let spec: Value = serde_json::from_str(&spec_json)?;
+        let unk_token = spec
+            .get("model")
+            .and_then(|m| m.get("unk_token"))
+            .and_then(Value::as_str);
+        Ok(unk_token.and_then(|tok| tokenizer.token_to_id(tok)).map(|id| id as usize))
     }
 
     /// Char-level truncation to max_tokens * median_token_length
