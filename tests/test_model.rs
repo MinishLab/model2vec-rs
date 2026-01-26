@@ -74,9 +74,9 @@ fn test_normalization_flag_override() {
 /// Test from_raw_parts constructor
 #[test]
 fn test_from_raw_parts() {
+    use safetensors::SafeTensors;
     use std::fs;
     use tokenizers::Tokenizer;
-    use safetensors::SafeTensors;
 
     let path = "tests/fixtures/test-model-float32";
     let tokenizer = Tokenizer::from_file(format!("{path}/tokenizer.json")).unwrap();
@@ -84,7 +84,8 @@ fn test_from_raw_parts() {
     let tensors = SafeTensors::deserialize(&bytes).unwrap();
     let tensor = tensors.tensor("embeddings").unwrap();
     let [rows, cols]: [usize; 2] = tensor.shape().try_into().unwrap();
-    let floats: Vec<f32> = tensor.data()
+    let floats: Vec<f32> = tensor
+        .data()
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();

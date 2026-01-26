@@ -178,10 +178,12 @@ impl StaticModel {
             .get("model")
             .and_then(|m| m.get("unk_token"))
             .and_then(Value::as_str);
-        let unk_token_id = unk_token.and_then(|tok| tokenizer.token_to_id(tok)).map(|id| id as usize);
+        let unk_token_id = unk_token
+            .and_then(|tok| tokenizer.token_to_id(tok))
+            .map(|id| id as usize);
 
-        let embeddings = Array2::from_shape_vec((rows, cols), embeddings.to_vec())
-            .context("failed to build embeddings array")?;
+        let embeddings =
+            Array2::from_shape_vec((rows, cols), embeddings.to_vec()).context("failed to build embeddings array")?;
 
         Ok(Self {
             tokenizer,
