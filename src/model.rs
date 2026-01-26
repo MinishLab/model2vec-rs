@@ -133,14 +133,14 @@ impl StaticModel {
             Err(_) => None,
         };
 
-        Self::from_raw_parts(tokenizer, &floats, rows, cols, normalize, weights, token_mapping)
+        Self::from_raw_parts(tokenizer, floats, rows, cols, normalize, weights, token_mapping)
     }
 
     /// Construct from pre-parsed parts.
     ///
     /// # Arguments
     /// * `tokenizer` - Pre-deserialized tokenizer
-    /// * `embeddings` - Raw f32 embedding data
+    /// * `embeddings` - Raw f32 embedding data (takes ownership to avoid copy)
     /// * `rows` - Number of vocabulary entries
     /// * `cols` - Embedding dimension
     /// * `normalize` - Whether to L2-normalize output embeddings
@@ -148,7 +148,7 @@ impl StaticModel {
     /// * `token_mapping` - Optional token ID mapping for quantized models
     pub fn from_raw_parts(
         tokenizer: Tokenizer,
-        embeddings: &[f32],
+        embeddings: Vec<f32>,
         rows: usize,
         cols: usize,
         normalize: bool,
@@ -188,7 +188,7 @@ impl StaticModel {
         };
 
         let embeddings =
-            Array2::from_shape_vec((rows, cols), embeddings.to_vec()).context("failed to build embeddings array")?;
+            Array2::from_shape_vec((rows, cols), embeddings).context("failed to build embeddings array")?;
 
         Ok(Self {
             tokenizer,
