@@ -178,9 +178,14 @@ impl StaticModel {
             .get("model")
             .and_then(|m| m.get("unk_token"))
             .and_then(Value::as_str);
-        let unk_token_id = unk_token
-            .and_then(|tok| tokenizer.token_to_id(tok))
-            .map(|id| id as usize);
+        let unk_token_id = if let Some(tok) = unk_token {
+            let id = tokenizer
+                .token_to_id(tok)
+                .ok_or_else(|| anyhow!("tokenizer declares unk_token='{tok}' but it isn't in the vocab"))?;
+            Some(id as usize)
+        } else {
+            None
+        };
 
         let embeddings =
             Array2::from_shape_vec((rows, cols), embeddings.to_vec()).context("failed to build embeddings array")?;
