@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use half::f16;
 use hf_hub::api::sync::Api;
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView2, CowArray, Ix2};
 use safetensors::{tensor::Dtype, SafeTensors};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::{env, fs, path::Path};
 use tokenizers::Tokenizer;
 
@@ -11,9 +12,9 @@ use tokenizers::Tokenizer;
 #[derive(Debug, Clone)]
 pub struct StaticModel {
     tokenizer: Tokenizer,
-    embeddings: Array2<f32>,
-    weights: Option<Vec<f32>>,
-    token_mapping: Option<Vec<usize>>,
+    embeddings: CowArray<'static, f32, Ix2>,
+    weights: Option<Cow<'static, [f32]>>,
+    token_mapping: Option<Cow<'static, [usize]>>,
     normalize: bool,
     median_token_length: usize,
     unk_token_id: Option<usize>,
@@ -133,20 +134,20 @@ impl StaticModel {
             Err(_) => None,
         };
 
-        Self::from_raw_parts(tokenizer, floats, rows, cols, normalize, weights, token_mapping)
+        Self::from_owned(tokenizer, floats, rows, cols, normalize, weights, token_mapping)
     }
 
-    /// Construct from pre-parsed parts.
+    /// Construct from owned data.
     ///
     /// # Arguments
     /// * `tokenizer` - Pre-deserialized tokenizer
-    /// * `embeddings` - Raw f32 embedding data (takes ownership to avoid copy)
+    /// * `embeddings` - Owned f32 embedding data
     /// * `rows` - Number of vocabulary entries
     /// * `cols` - Embedding dimension
     /// * `normalize` - Whether to L2-normalize output embeddings
     /// * `weights` - Optional per-token weights for quantized models
     /// * `token_mapping` - Optional token ID mapping for quantized models
-    pub fn from_raw_parts(
+    pub fn from_owned(
         tokenizer: Tokenizer,
         embeddings: Vec<f32>,
         rows: usize,
@@ -164,6 +165,68 @@ impl StaticModel {
             ));
         }
 
+        let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
+
+        let embeddings =
+            Array2::from_shape_vec((rows, cols), embeddings).context("failed to build embeddings array")?;
+
+        Ok(Self {
+            tokenizer,
+            embeddings: CowArray::from(embeddings),
+            weights: weights.map(Cow::Owned),
+            token_mapping: token_mapping.map(Cow::Owned),
+            normalize,
+            median_token_length,
+            unk_token_id,
+        })
+    }
+
+    /// Construct from static slices (zero-copy for embedded binary data).
+    ///
+    /// # Arguments
+    /// * `tokenizer` - Pre-deserialized tokenizer
+    /// * `embeddings` - Static f32 embedding data (borrowed, no copy)
+    /// * `rows` - Number of vocabulary entries
+    /// * `cols` - Embedding dimension
+    /// * `normalize` - Whether to L2-normalize output embeddings
+    /// * `weights` - Optional static per-token weights for quantized models
+    /// * `token_mapping` - Optional static token ID mapping for quantized models
+    #[allow(dead_code)] // Public API for external crates
+    pub fn from_borrowed(
+        tokenizer: Tokenizer,
+        embeddings: &'static [f32],
+        rows: usize,
+        cols: usize,
+        normalize: bool,
+        weights: Option<&'static [f32]>,
+        token_mapping: Option<&'static [usize]>,
+    ) -> Result<Self> {
+        if embeddings.len() != rows * cols {
+            return Err(anyhow!(
+                "embeddings length {} != rows {} * cols {}",
+                embeddings.len(),
+                rows,
+                cols
+            ));
+        }
+
+        let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
+
+        let embeddings = ArrayView2::from_shape((rows, cols), embeddings).context("failed to build embeddings view")?;
+
+        Ok(Self {
+            tokenizer,
+            embeddings: CowArray::from(embeddings),
+            weights: weights.map(Cow::Borrowed),
+            token_mapping: token_mapping.map(Cow::Borrowed),
+            normalize,
+            median_token_length,
+            unk_token_id,
+        })
+    }
+
+    /// Compute median token length and unk_token_id from tokenizer.
+    fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
         // Median-token-length hack for pre-truncation
         let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
         lens.sort_unstable();
@@ -187,18 +250,7 @@ impl StaticModel {
             None
         };
 
-        let embeddings =
-            Array2::from_shape_vec((rows, cols), embeddings).context("failed to build embeddings array")?;
-
-        Ok(Self {
-            tokenizer,
-            embeddings,
-            weights,
-            token_mapping,
-            normalize,
-            median_token_length,
-            unk_token_id,
-        })
+        Ok((median_token_length, unk_token_id))
     }
 
     /// Char-level truncation to max_tokens * median_token_length

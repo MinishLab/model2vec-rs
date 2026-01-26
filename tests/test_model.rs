@@ -71,9 +71,9 @@ fn test_normalization_flag_override() {
     );
 }
 
-/// Test from_raw_parts constructor
+/// Test from_borrowed constructor (zero-copy path)
 #[test]
-fn test_from_raw_parts() {
+fn test_from_borrowed() {
     use safetensors::SafeTensors;
     use std::fs;
     use tokenizers::Tokenizer;
@@ -90,7 +90,10 @@ fn test_from_raw_parts() {
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();
 
-    let model = StaticModel::from_raw_parts(tokenizer, floats, rows, cols, true, None, None).unwrap();
+    // Leak to get 'static lifetime (fine for tests)
+    let floats: &'static [f32] = Box::leak(floats.into_boxed_slice());
+
+    let model = StaticModel::from_borrowed(tokenizer, floats, rows, cols, true, None, None).unwrap();
     let emb = model.encode_single("hello");
     assert!(!emb.is_empty());
 }
