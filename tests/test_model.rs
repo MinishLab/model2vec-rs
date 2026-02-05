@@ -70,3 +70,30 @@ fn test_normalization_flag_override() {
         "Without normalization override, norm should be larger"
     );
 }
+
+/// Test from_borrowed constructor (zero-copy path)
+#[test]
+fn test_from_borrowed() {
+    use safetensors::SafeTensors;
+    use std::fs;
+    use tokenizers::Tokenizer;
+
+    let path = "tests/fixtures/test-model-float32";
+    let tokenizer = Tokenizer::from_file(format!("{path}/tokenizer.json")).unwrap();
+    let bytes = fs::read(format!("{path}/model.safetensors")).unwrap();
+    let tensors = SafeTensors::deserialize(&bytes).unwrap();
+    let tensor = tensors.tensor("embeddings").unwrap();
+    let [rows, cols]: [usize; 2] = tensor.shape().try_into().unwrap();
+    let floats: Vec<f32> = tensor
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+
+    // Leak to get 'static lifetime (fine for tests)
+    let floats: &'static [f32] = Box::leak(floats.into_boxed_slice());
+
+    let model = StaticModel::from_borrowed(tokenizer, floats, rows, cols, true, None, None).unwrap();
+    let emb = model.encode_single("hello");
+    assert!(!emb.is_empty());
+}
