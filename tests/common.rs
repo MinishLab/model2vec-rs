@@ -52,43 +52,31 @@ fn copy_st_blobs(dir: &std::path::Path) {
     }
 }
 
-/// Build a temp dir that looks like a sentence-transformers root layout,
-/// using `modules_json` as the content of `modules.json` (pass `None` to omit).
 pub fn temp_st_dir(modules_json: Option<&str>) -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     copy_st_blobs(dir.path());
-    fs::write(dir.path().join("config_sentence_transformers.json"), ST_CONFIG)
-        .expect("write ST config");
+    fs::write(dir.path().join("config_sentence_transformers.json"), ST_CONFIG).expect("write ST config");
     if let Some(content) = modules_json {
         fs::write(dir.path().join("modules.json"), content).expect("write modules.json");
     }
     dir
 }
 
-/// Build a temp dir that has BOTH `config.json` and `config_sentence_transformers.json`
-/// with **conflicting** normalize values:
-/// - `config.json` → `normalize: false`  (native layout would give unnormalized output)
-/// - `config_sentence_transformers.json` → `normalize: true`  (ST layout gives unit norm)
-///
-/// This lets callers prove which config was actually used.
+/// Temp dir with both configs present. `config.json` has `normalize: false`,
+/// `config_sentence_transformers.json` has `normalize: true`, so tests can detect which won.
 pub fn temp_both_configs_dir() -> TempDir {
-    let dir = temp_st_dir(None); // writes config_sentence_transformers.json with normalize=true
-    // Intentionally different normalize value so a test can detect which config won.
+    let dir = temp_st_dir(None);
     let native_config = r#"{"model_type":"model2vec","normalize":false,"hidden_dim":64}"#;
     fs::write(dir.path().join("config.json"), native_config).expect("write config.json");
     dir
 }
 
-/// Build a temp dir with a nested `some/path/0_StaticEmbedding/` layout:
-/// - `some/path/config_sentence_transformers.json`
-/// - `some/path/0_StaticEmbedding/{model.safetensors,tokenizer.json}`
 pub fn temp_nested_st_dir() -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let base = dir.path().join("some/path");
     let emb_dir = base.join("0_StaticEmbedding");
     fs::create_dir_all(&emb_dir).expect("create nested dir");
     copy_st_blobs(&emb_dir);
-    fs::write(base.join("config_sentence_transformers.json"), ST_CONFIG)
-        .expect("write nested ST config");
+    fs::write(base.join("config_sentence_transformers.json"), ST_CONFIG).expect("write nested ST config");
     dir
 }

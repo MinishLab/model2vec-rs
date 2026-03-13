@@ -1,6 +1,5 @@
 mod common;
-use common::{assert_loads, embedding_norm, load_test_model, temp_both_configs_dir,
-             temp_nested_st_dir, temp_st_dir};
+use common::{assert_loads, embedding_norm, load_test_model, temp_both_configs_dir, temp_nested_st_dir, temp_st_dir};
 use model2vec_rs::model::StaticModel;
 
 /// Test that encoding an empty input slice yields an empty output
@@ -63,13 +62,14 @@ fn test_all_layouts_load() {
     for &(path, subfolder) in cases {
         let model = assert_loads(path, subfolder);
         let emb = model.encode(&["hello".to_string()]);
-        assert!(!emb[0].is_empty(), "empty embedding for path={path:?} subfolder={subfolder:?}");
+        assert!(
+            !emb[0].is_empty(),
+            "empty embedding for path={path:?} subfolder={subfolder:?}"
+        );
     }
 }
 
-/// When both config.json (normalize=false) and config_sentence_transformers.json (normalize=true)
-/// are present, the sentence-transformers layout must win.
-/// A regression back to "native wins" would produce an unnormalized embedding and fail here.
+/// config_sentence_transformers.json (normalize=true) must win over config.json (normalize=false).
 #[test]
 fn test_both_configs_prefers_sentence_transformers() {
     let dir = temp_both_configs_dir();
@@ -77,26 +77,22 @@ fn test_both_configs_prefers_sentence_transformers() {
     let norm = embedding_norm(&model, "hello world");
     assert!(
         (norm - 1.0).abs() < 1e-5,
-        "expected unit norm (ST config wins), got {norm} — \
-         loader may be preferring config.json (native) over config_sentence_transformers.json"
+        "expected unit norm (ST config wins), got {norm}"
     );
 }
 
 /// ST and native model2vec layouts with the same weights should give identical embeddings
 #[test]
 fn test_sentence_transformers_matches_model2vec() {
-    let model_m2v =
-        StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, None, None)
-            .unwrap();
-    let model_st = StaticModel::from_pretrained(
-        "tests/fixtures/test-model-sentence-transformers",
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let model_m2v = StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, None, None).unwrap();
+    let model_st =
+        StaticModel::from_pretrained("tests/fixtures/test-model-sentence-transformers", None, None, None).unwrap();
     let sentences = vec!["hello".to_string(), "world test sentence".to_string()];
-    for (a, b) in model_m2v.encode(&sentences).iter().zip(model_st.encode(&sentences).iter()) {
+    for (a, b) in model_m2v
+        .encode(&sentences)
+        .iter()
+        .zip(model_st.encode(&sentences).iter())
+    {
         for (&x, &y) in a.iter().zip(b.iter()) {
             assert!((x - y).abs() < 1e-5, "embeddings should match: {x} vs {y}");
         }
@@ -114,19 +110,12 @@ fn test_normalize_from_modules_json() {
         {"idx":0,"name":"0","path":".","type":"sentence_transformers.models.StaticEmbedding"}
     ]"#;
 
-    // config_sentence_transformers.json has no "normalize" key here — use a bare ST dir
-    // and inject modules.json manually.
     let dir_norm = temp_st_dir(Some(WITH_NORMALIZE));
     let dir_no_norm = temp_st_dir(Some(WITHOUT_NORMALIZE));
 
-    // For a model whose config_sentence_transformers.json has normalize=true already,
-    // we need configs without a normalize key. Write a fresh one.
+    // Overwrite with a config that has no "normalize" key so modules.json is the source of truth.
     let no_key_config = r#"{"model_type":"model2vec"}"#;
-    std::fs::write(
-        dir_norm.path().join("config_sentence_transformers.json"),
-        no_key_config,
-    )
-    .unwrap();
+    std::fs::write(dir_norm.path().join("config_sentence_transformers.json"), no_key_config).unwrap();
     std::fs::write(
         dir_no_norm.path().join("config_sentence_transformers.json"),
         no_key_config,
@@ -152,18 +141,21 @@ fn test_normalize_from_modules_json() {
 /// Override of the `normalize` flag in from_pretrained works correctly
 #[test]
 fn test_normalization_flag_override() {
-    let model_norm =
-        StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, None, None)
-            .unwrap();
+    let model_norm = StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, None, None).unwrap();
     let model_no_norm =
-        StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, Some(false), None)
-            .unwrap();
+        StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, Some(false), None).unwrap();
 
     let norm_norm = embedding_norm(&model_norm, "test sentence");
     let norm_no = embedding_norm(&model_no_norm, "test sentence");
 
-    assert!((norm_norm - 1.0).abs() < 1e-5, "normalized vector should have unit norm");
-    assert!(norm_no > norm_norm, "without normalization override, norm should be larger");
+    assert!(
+        (norm_norm - 1.0).abs() < 1e-5,
+        "normalized vector should have unit norm"
+    );
+    assert!(
+        norm_no > norm_norm,
+        "without normalization override, norm should be larger"
+    );
 }
 
 /// A path that matches no known layout returns a helpful error
@@ -172,5 +164,8 @@ fn test_load_invalid_path_error() {
     let result = StaticModel::from_pretrained("tests/fixtures", None, None, None);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("no valid model layout"), "error should mention layout: {msg}");
+    assert!(
+        msg.contains("no valid model layout"),
+        "error should mention layout: {msg}"
+    );
 }

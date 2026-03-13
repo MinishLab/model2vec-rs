@@ -4,19 +4,16 @@ use hf_hub::api::sync::{Api, ApiRepo};
 use ndarray::Array2;
 use safetensors::{tensor::Dtype, SafeTensors};
 use serde_json::Value;
-use std::{env, fs, path::{Path, PathBuf}};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 use tokenizers::Tokenizer;
-
-// ---------------------------------------------------------------------------
-// Layout detection
-// ---------------------------------------------------------------------------
 
 /// Which embedding-tensor naming convention a model uses.
 #[derive(Debug, Clone, Copy)]
 enum ModelLayout {
-    /// Native model2vec export: tensor key `"embeddings"`.
     Native,
-    /// Sentence Transformers export: tensor key `"embedding.weight"`.
     SentenceTransformers,
 }
 
@@ -29,35 +26,28 @@ impl ModelLayout {
     }
 }
 
-/// Resolved file paths and layout for a detected model.
 struct ResolvedPaths {
     tokenizer_path: PathBuf,
     model_path: PathBuf,
     config_path: PathBuf,
-    /// Explicitly located `modules.json`; `None` for local paths (derived at read time).
     modules_path: Option<PathBuf>,
     layout: ModelLayout,
 }
 
-/// Static description of one supported model layout.
-struct LayoutSpec {
-    /// Config file name, relative to the config base directory.
+struct Layout {
     config_file: &'static str,
-    /// Tokenizer path, relative to the model base directory.
     tokenizer_file: &'static str,
-    /// Model weights path, relative to the model base directory.
     model_file: &'static str,
-    /// `true` if the config lives in the *parent* of the model directory (layout 4).
+    /// Config lives one level above the model files (layout 4: caller pointed at model dir).
     config_in_parent: bool,
-    /// Skip this layout when `config_sentence_transformers.json` coexists with the config
-    /// (prevents misidentifying an ST-exported model2vec model as native).
+    /// Skip when `config_sentence_transformers.json` is present alongside `config.json`.
     skip_if_st_config: bool,
     layout: ModelLayout,
 }
 
-static LAYOUTS: &[LayoutSpec] = &[
+static LAYOUTS: &[Layout] = &[
     // 1. Native model2vec
-    LayoutSpec {
+    Layout {
         config_file: "config.json",
         tokenizer_file: "tokenizer.json",
         model_file: "model.safetensors",
@@ -66,7 +56,7 @@ static LAYOUTS: &[LayoutSpec] = &[
         layout: ModelLayout::Native,
     },
     // 2. Sentence Transformers root layout
-    LayoutSpec {
+    Layout {
         config_file: "config_sentence_transformers.json",
         tokenizer_file: "tokenizer.json",
         model_file: "model.safetensors",
@@ -75,7 +65,7 @@ static LAYOUTS: &[LayoutSpec] = &[
         layout: ModelLayout::SentenceTransformers,
     },
     // 3. Sentence Transformers 0_StaticEmbedding subfolder
-    LayoutSpec {
+    Layout {
         config_file: "config_sentence_transformers.json",
         tokenizer_file: "0_StaticEmbedding/tokenizer.json",
         model_file: "0_StaticEmbedding/model.safetensors",
@@ -84,7 +74,7 @@ static LAYOUTS: &[LayoutSpec] = &[
         layout: ModelLayout::SentenceTransformers,
     },
     // 4. Config-in-parent (caller passed subfolder pointing directly at model files)
-    LayoutSpec {
+    Layout {
         config_file: "config_sentence_transformers.json",
         tokenizer_file: "tokenizer.json",
         model_file: "model.safetensors",
@@ -94,10 +84,13 @@ static LAYOUTS: &[LayoutSpec] = &[
     },
 ];
 
-/// Try each `LAYOUTS` entry against a local folder.
 fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
     for spec in LAYOUTS {
-        let config_base = if spec.config_in_parent { folder.parent()? } else { folder };
+        let config_base = if spec.config_in_parent {
+            folder.parent()?
+        } else {
+            folder
+        };
         let config_path = config_base.join(spec.config_file);
         if !config_path.exists() {
             continue;
@@ -121,11 +114,6 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
     None
 }
 
-/// Try each `LAYOUTS` entry against a HuggingFace Hub repo.
-///
-/// Config files are fetched first; absent ones skip the layout. Model/tokenizer fetches
-/// also silently skip on failure so that layouts 2 and 3 (which share the same config
-/// file) can be tried independently without a second config download.
 fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
     for spec in LAYOUTS {
         let config_prefix: String = if spec.config_in_parent {
@@ -160,18 +148,10 @@ fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
     }
     Err(anyhow!(
         "no valid model layout found. Tried config files: {}",
-        LAYOUTS
-            .iter()
-            .map(|s| s.config_file)
-            .collect::<Vec<_>>()
-            .join(", ")
+        LAYOUTS.iter().map(|s| s.config_file).collect::<Vec<_>>().join(", ")
     ))
 }
 
-/// Strip the last path component from a Hub prefix (which always ends with `/`).
-///
-/// * `"0_StaticEmbedding/"` → `""`
-/// * `"some/path/0_StaticEmbedding/"` → `"some/path/"`
 fn parent_of_prefix(prefix: &str) -> String {
     let trimmed = prefix.trim_end_matches('/');
     match Path::new(trimmed).parent() {
@@ -180,19 +160,12 @@ fn parent_of_prefix(prefix: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Normalisation helpers
-// ---------------------------------------------------------------------------
-
-/// Read the `normalize` boolean from a JSON config file, `None` if absent or unreadable.
 fn read_config_normalize(config_path: &Path) -> Option<bool> {
     let f = std::fs::File::open(config_path).ok()?;
     let cfg: Value = serde_json::from_reader(f).ok()?;
     cfg.get("normalize").and_then(Value::as_bool)
 }
 
-/// Return whether `modules.json` contains a `Normalize` pipeline stage.
-/// Returns `None` if the file cannot be read or parsed.
 fn has_normalize_module(modules_path: &Path) -> Option<bool> {
     let f = std::fs::File::open(modules_path).ok()?;
     let Value::Array(modules) = serde_json::from_reader::<_, Value>(f).ok()? else {
@@ -207,11 +180,6 @@ fn has_normalize_module(modules_path: &Path) -> Option<bool> {
     }))
 }
 
-/// Resolve the normalize flag:
-/// 1. `normalize` key in the config file.
-/// 2. Presence of a `Normalize` module in `modules.json` (sibling of config for local;
-///    explicitly passed for Hub downloads so the already-fetched path is reused).
-/// 3. Default `true`.
 fn read_normalize(config_path: &Path, explicit_modules: Option<&Path>) -> bool {
     if let Some(v) = read_config_normalize(config_path) {
         return v;
@@ -288,11 +256,9 @@ impl StaticModel {
                 .with_context(|| format!("could not load '{}' from HuggingFace Hub", base.display()))?
         };
 
-        let tokenizer =
-            Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+        let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
 
-        let mut lens: Vec<usize> =
-            tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
+        let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
@@ -311,9 +277,7 @@ impl StaticModel {
             .map(|unk| tokenizer.token_to_id(unk).map(|id| id as usize).unwrap_or(0));
 
         let model_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
-        let safet =
-            SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
-        // Try the layout-specific key first, then all known fallback keys.
+        let safet = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
         let emb_key = layout.embedding_key();
         let tensor = safet
             .tensor(emb_key)
@@ -321,13 +285,10 @@ impl StaticModel {
             .or_else(|_| safet.tensor("embedding.weight"))
             .or_else(|_| safet.tensor("0"))
             .with_context(|| {
-                format!(
-                    "embedding tensor not found (tried '{emb_key}', 'embeddings', 'embedding.weight', '0')"
-                )
+                format!("embedding tensor not found (tried '{emb_key}', 'embeddings', 'embedding.weight', '0')")
             })?;
 
-        let [rows, cols]: [usize; 2] =
-            tensor.shape().try_into().context("embedding tensor is not 2‑D")?;
+        let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2-D")?;
         let raw = tensor.data();
         let floats: Vec<f32> = match tensor.dtype() {
             Dtype::F32 => raw
@@ -341,8 +302,7 @@ impl StaticModel {
             Dtype::I8 => raw.iter().map(|&b| f32::from(b as i8)).collect(),
             other => return Err(anyhow!("unsupported tensor dtype: {other:?}")),
         };
-        let embeddings =
-            Array2::from_shape_vec((rows, cols), floats).context("failed to build embeddings array")?;
+        let embeddings = Array2::from_shape_vec((rows, cols), floats).context("failed to build embeddings array")?;
 
         let weights = match safet.tensor("weights") {
             Ok(t) => {
@@ -468,12 +428,7 @@ impl StaticModel {
                 .and_then(|m| m.get(tok))
                 .copied()
                 .unwrap_or(tok);
-            let scale = self
-                .weights
-                .as_ref()
-                .and_then(|w| w.get(tok))
-                .copied()
-                .unwrap_or(1.0);
+            let scale = self.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
             let row = self.embeddings.row(row_idx);
             for (s, &v) in sum.iter_mut().zip(row.iter()) {
                 *s += v * scale;
