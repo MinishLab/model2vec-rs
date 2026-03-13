@@ -34,7 +34,7 @@ struct ResolvedPaths {
     layout: ModelLayout,
 }
 
-struct Layout {
+struct LayoutSpec {
     config_file: &'static str,
     tokenizer_file: &'static str,
     model_file: &'static str,
@@ -45,9 +45,9 @@ struct Layout {
     layout: ModelLayout,
 }
 
-static LAYOUTS: &[Layout] = &[
+static LAYOUTS: &[LayoutSpec] = &[
     // 1. Native model2vec
-    Layout {
+    LayoutSpec {
         config_file: "config.json",
         tokenizer_file: "tokenizer.json",
         model_file: "model.safetensors",
@@ -56,7 +56,7 @@ static LAYOUTS: &[Layout] = &[
         layout: ModelLayout::Native,
     },
     // 2. Sentence Transformers root layout
-    Layout {
+    LayoutSpec {
         config_file: "config_sentence_transformers.json",
         tokenizer_file: "tokenizer.json",
         model_file: "model.safetensors",
@@ -65,7 +65,7 @@ static LAYOUTS: &[Layout] = &[
         layout: ModelLayout::SentenceTransformers,
     },
     // 3. Sentence Transformers 0_StaticEmbedding subfolder
-    Layout {
+    LayoutSpec {
         config_file: "config_sentence_transformers.json",
         tokenizer_file: "0_StaticEmbedding/tokenizer.json",
         model_file: "0_StaticEmbedding/model.safetensors",
@@ -74,7 +74,7 @@ static LAYOUTS: &[Layout] = &[
         layout: ModelLayout::SentenceTransformers,
     },
     // 4. Config-in-parent (caller passed subfolder pointing directly at model files)
-    Layout {
+    LayoutSpec {
         config_file: "config_sentence_transformers.json",
         tokenizer_file: "tokenizer.json",
         model_file: "model.safetensors",
