@@ -302,13 +302,13 @@ impl StaticModel {
             .to_string(false)
             .map_err(|e| anyhow!("tokenizer -> JSON failed: {e}"))?;
         let spec: Value = serde_json::from_str(&spec_json)?;
-        let unk_token = spec
+        // If no unk token is defined, don't filter anything.
+        // If one is defined but absent from the vocab, fall back to id 0.
+        let unk_token_id = spec
             .get("model")
             .and_then(|m| m.get("unk_token"))
             .and_then(Value::as_str)
-            .unwrap_or("[UNK]");
-        // If the unk token isn't in the vocabulary, treat it as absent rather than erroring.
-        let unk_token_id = tokenizer.token_to_id(unk_token).map(|id| id as usize);
+            .map(|unk| tokenizer.token_to_id(unk).map(|id| id as usize).unwrap_or(0));
 
         let model_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
         let safet =
