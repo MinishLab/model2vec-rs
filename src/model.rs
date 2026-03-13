@@ -34,162 +34,121 @@ struct ResolvedPaths {
     layout: ModelLayout,
 }
 
-struct LayoutSpec {
-    config_file: &'static str,
-    tokenizer_file: &'static str,
-    model_file: &'static str,
-    /// Config lives one level above the model files (layout 4: caller pointed at model dir).
-    config_in_parent: bool,
-    /// Skip when `config_sentence_transformers.json` is present alongside `config.json`.
-    skip_if_st_config: bool,
-    layout: ModelLayout,
+/// Check whether `config_base/config_file`, `model_base/tokenizer.json`, and
+/// `model_base/model.safetensors` all exist, and if so return a `ResolvedPaths`.
+fn local_probe(config_base: &Path, model_base: &Path, config_file: &str, layout: ModelLayout) -> Option<ResolvedPaths> {
+    let config_path = config_base.join(config_file);
+    let tokenizer_path = model_base.join("tokenizer.json");
+    let model_path = model_base.join("model.safetensors");
+    (config_path.exists() && tokenizer_path.exists() && model_path.exists()).then_some(ResolvedPaths {
+        config_path,
+        tokenizer_path,
+        model_path,
+        modules_path: None,
+        layout,
+    })
 }
 
-static LAYOUTS: &[LayoutSpec] = &[
-    // 1. Native model2vec
-    LayoutSpec {
-        config_file: "config.json",
-        tokenizer_file: "tokenizer.json",
-        model_file: "model.safetensors",
-        config_in_parent: false,
-        skip_if_st_config: true,
-        layout: ModelLayout::Native,
-    },
-    // 2. Sentence Transformers root layout
-    LayoutSpec {
-        config_file: "config_sentence_transformers.json",
-        tokenizer_file: "tokenizer.json",
-        model_file: "model.safetensors",
-        config_in_parent: false,
-        skip_if_st_config: false,
-        layout: ModelLayout::SentenceTransformers,
-    },
-    // 3. Sentence Transformers 0_StaticEmbedding subfolder
-    LayoutSpec {
-        config_file: "config_sentence_transformers.json",
-        tokenizer_file: "0_StaticEmbedding/tokenizer.json",
-        model_file: "0_StaticEmbedding/model.safetensors",
-        config_in_parent: false,
-        skip_if_st_config: false,
-        layout: ModelLayout::SentenceTransformers,
-    },
-    // 4. Config-in-parent (caller passed subfolder pointing directly at model files)
-    LayoutSpec {
-        config_file: "config_sentence_transformers.json",
-        tokenizer_file: "tokenizer.json",
-        model_file: "model.safetensors",
-        config_in_parent: true,
-        skip_if_st_config: false,
-        layout: ModelLayout::SentenceTransformers,
-    },
-];
+/// Fetch `config_prefix/config_file`, `model_prefix/tokenizer.json`, and
+/// `model_prefix/model.safetensors` from the Hub; return `None` if any is missing.
+fn hub_probe(
+    repo: &ApiRepo,
+    config_prefix: &str,
+    model_prefix: &str,
+    config_file: &str,
+    layout: ModelLayout,
+) -> Option<ResolvedPaths> {
+    let config_path = repo.get(&format!("{config_prefix}{config_file}")).ok()?;
+    let tokenizer_path = repo.get(&format!("{model_prefix}tokenizer.json")).ok()?;
+    let model_path = repo.get(&format!("{model_prefix}model.safetensors")).ok()?;
+    let modules_path = repo.get(&format!("{config_prefix}modules.json")).ok();
+    Some(ResolvedPaths {
+        config_path,
+        tokenizer_path,
+        model_path,
+        modules_path,
+        layout,
+    })
+}
 
 fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
-    for spec in LAYOUTS {
-        let config_base = if spec.config_in_parent {
-            folder.parent()?
-        } else {
-            folder
-        };
-        let config_path = config_base.join(spec.config_file);
-        if !config_path.exists() {
-            continue;
+    // Native model2vec — skip when a sentence-transformers config is also present.
+    if !folder.join("config_sentence_transformers.json").exists() {
+        if let r @ Some(_) = local_probe(folder, folder, "config.json", ModelLayout::Native) {
+            return r;
         }
-        if spec.skip_if_st_config && folder.join("config_sentence_transformers.json").exists() {
-            continue;
-        }
-        let tokenizer_path = folder.join(spec.tokenizer_file);
-        let model_path = folder.join(spec.model_file);
-        if !tokenizer_path.exists() || !model_path.exists() {
-            continue;
-        }
-        return Some(ResolvedPaths {
-            tokenizer_path,
-            model_path,
-            config_path,
-            modules_path: None,
-            layout: spec.layout,
-        });
     }
-    None
+    // Sentence Transformers root layout.
+    if let r @ Some(_) = local_probe(
+        folder,
+        folder,
+        "config_sentence_transformers.json",
+        ModelLayout::SentenceTransformers,
+    ) {
+        return r;
+    }
+    // Sentence Transformers with model files in 0_StaticEmbedding/.
+    let sub = folder.join("0_StaticEmbedding");
+    if let r @ Some(_) = local_probe(
+        folder,
+        &sub,
+        "config_sentence_transformers.json",
+        ModelLayout::SentenceTransformers,
+    ) {
+        return r;
+    }
+    // Config lives one level up (caller pointed directly at the model-files directory).
+    let parent = folder.parent()?;
+    local_probe(
+        parent,
+        folder,
+        "config_sentence_transformers.json",
+        ModelLayout::SentenceTransformers,
+    )
 }
 
 fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
-    for spec in LAYOUTS {
-        let config_prefix: String = if spec.config_in_parent {
-            parent_of_prefix(prefix)
-        } else {
-            prefix.to_string()
-        };
-        let Ok(config_path) = repo.get(&format!("{config_prefix}{}", spec.config_file)) else {
-            continue;
-        };
-        if spec.skip_if_st_config
-            && repo
-                .get(&format!("{config_prefix}config_sentence_transformers.json"))
-                .is_ok()
-        {
-            continue;
+    // Native model2vec — skip when a sentence-transformers config is also present.
+    if repo.get(&format!("{prefix}config_sentence_transformers.json")).is_err() {
+        if let Some(r) = hub_probe(repo, prefix, prefix, "config.json", ModelLayout::Native) {
+            return Ok(r);
         }
-        let Ok(tokenizer_path) = repo.get(&format!("{prefix}{}", spec.tokenizer_file)) else {
-            continue;
-        };
-        let Ok(model_path) = repo.get(&format!("{prefix}{}", spec.model_file)) else {
-            continue;
-        };
-        let modules_path = repo.get(&format!("{config_prefix}modules.json")).ok();
-        return Ok(ResolvedPaths {
-            tokenizer_path,
-            model_path,
-            config_path,
-            modules_path,
-            layout: spec.layout,
-        });
     }
-    Err(anyhow!(
-        "no valid model layout found. Tried config files: {}",
-        LAYOUTS.iter().map(|s| s.config_file).collect::<Vec<_>>().join(", ")
-    ))
-}
-
-fn parent_of_prefix(prefix: &str) -> String {
+    // Sentence Transformers root layout.
+    if let Some(r) = hub_probe(
+        repo,
+        prefix,
+        prefix,
+        "config_sentence_transformers.json",
+        ModelLayout::SentenceTransformers,
+    ) {
+        return Ok(r);
+    }
+    // Sentence Transformers with model files in 0_StaticEmbedding/.
+    let sub_prefix = format!("{prefix}0_StaticEmbedding/");
+    if let Some(r) = hub_probe(
+        repo,
+        prefix,
+        &sub_prefix,
+        "config_sentence_transformers.json",
+        ModelLayout::SentenceTransformers,
+    ) {
+        return Ok(r);
+    }
+    // Config lives one level up.
     let trimmed = prefix.trim_end_matches('/');
-    match Path::new(trimmed).parent() {
+    let parent = match Path::new(trimmed).parent() {
         Some(p) if !p.as_os_str().is_empty() => format!("{}/", p.display()),
         _ => String::new(),
-    }
-}
-
-fn read_config_normalize(config_path: &Path) -> Option<bool> {
-    let f = std::fs::File::open(config_path).ok()?;
-    let cfg: Value = serde_json::from_reader(f).ok()?;
-    cfg.get("normalize").and_then(Value::as_bool)
-}
-
-fn has_normalize_module(modules_path: &Path) -> Option<bool> {
-    let f = std::fs::File::open(modules_path).ok()?;
-    let Value::Array(modules) = serde_json::from_reader::<_, Value>(f).ok()? else {
-        return None;
     };
-    Some(modules.iter().any(|module| {
-        module
-            .get("type")
-            .and_then(Value::as_str)
-            .map(|t| t.contains("Normalize"))
-            .unwrap_or(false)
-    }))
-}
-
-fn read_normalize(config_path: &Path, explicit_modules: Option<&Path>) -> bool {
-    if let Some(v) = read_config_normalize(config_path) {
-        return v;
-    }
-    let derived = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join("modules.json");
-    let modules_path = explicit_modules.unwrap_or(&derived);
-    has_normalize_module(modules_path).unwrap_or(true)
+    hub_probe(
+        repo,
+        &parent,
+        prefix,
+        "config_sentence_transformers.json",
+        ModelLayout::SentenceTransformers,
+    )
+    .ok_or_else(|| anyhow!("no valid model layout found in '{prefix}'"))
 }
 
 /// Static embedding model for Model2Vec
@@ -252,7 +211,30 @@ impl StaticModel {
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
-        let normalize = normalize.unwrap_or_else(|| read_normalize(&cfg_path, mod_path.as_deref()));
+        let normalize = normalize.unwrap_or_else(|| {
+            // 1. explicit key in config file
+            if let Some(v) = std::fs::File::open(&cfg_path)
+                .ok()
+                .and_then(|f| serde_json::from_reader::<_, Value>(f).ok())
+                .and_then(|cfg| cfg.get("normalize").and_then(Value::as_bool))
+            {
+                return v;
+            }
+            // 2. Normalize stage in modules.json; default true
+            let derived = cfg_path.parent().unwrap_or_else(|| Path::new("")).join("modules.json");
+            let modules_path = mod_path.as_deref().unwrap_or(&derived);
+            let Ok(f) = std::fs::File::open(modules_path) else {
+                return true;
+            };
+            let Ok(Value::Array(modules)) = serde_json::from_reader::<_, Value>(f) else {
+                return true;
+            };
+            modules.iter().any(|m| {
+                m.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.contains("Normalize"))
+            })
+        });
 
         let spec_json = tokenizer
             .to_string(false)
@@ -436,23 +418,5 @@ impl StaticModel {
             }
         }
         sum
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parent_of_prefix;
-
-    #[test]
-    fn test_parent_of_prefix() {
-        let cases = [
-            ("0_StaticEmbedding/", ""),
-            ("some/path/0_StaticEmbedding/", "some/path/"),
-            ("models/", ""),
-            ("a/b/", "a/"),
-        ];
-        for (prefix, expected) in cases {
-            assert_eq!(parent_of_prefix(prefix), expected, "parent_of_prefix({prefix:?})");
-        }
     }
 }
