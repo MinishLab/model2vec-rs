@@ -76,6 +76,87 @@ fn test_load_static_embedding_layout() {
     assert!(!emb[0].is_empty());
 }
 
+/// Fix 1: subfolder pointing directly at the 0_StaticEmbedding directory
+/// Config lives one level up; loader should still succeed.
+#[test]
+fn test_load_static_embedding_via_subfolder() {
+    // repo_or_path = parent, subfolder = "0_StaticEmbedding"
+    let model = StaticModel::from_pretrained(
+        "tests/fixtures/test-model-static-embedding",
+        None,
+        None,
+        Some("0_StaticEmbedding"),
+    )
+    .expect("should load when subfolder='0_StaticEmbedding'");
+    assert!(!model.encode(&["hello".to_string()])[0].is_empty());
+
+    // repo_or_path points directly at the subfolder
+    let model2 = StaticModel::from_pretrained(
+        "tests/fixtures/test-model-static-embedding/0_StaticEmbedding",
+        None,
+        None,
+        None,
+    )
+    .expect("should load when path points directly at 0_StaticEmbedding");
+    assert!(!model2.encode(&["hello".to_string()])[0].is_empty());
+}
+
+/// Fix 2: both config.json and config_sentence_transformers.json present — ST wins
+/// (embedding.weight key must be found even though config.json is also on disk).
+#[test]
+fn test_load_both_configs_prefers_sentence_transformers() {
+    let model = StaticModel::from_pretrained(
+        "tests/fixtures/test-model-both-configs",
+        None,
+        None,
+        None,
+    )
+    .expect("should load when both config files are present");
+    assert!(!model.encode(&["hello".to_string()])[0].is_empty());
+}
+
+/// Fix 3a: no normalize key in config, but modules.json has a Normalize stage → normalize=true
+#[test]
+fn test_normalize_from_modules_json_true() {
+    let model = StaticModel::from_pretrained(
+        "tests/fixtures/test-model-modules-normalize",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let emb = model.encode(&["hello world".to_string()])[0].clone();
+    let norm: f32 = emb.iter().map(|&x| x * x).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-5, "expected unit norm, got {norm}");
+}
+
+/// Fix 3b: no normalize key in config, modules.json has NO Normalize stage → normalize=false
+#[test]
+fn test_normalize_from_modules_json_false() {
+    let model_no_norm = StaticModel::from_pretrained(
+        "tests/fixtures/test-model-modules-no-normalize",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let emb_no = model_no_norm.encode(&["hello world".to_string()])[0].clone();
+    let norm_no: f32 = emb_no.iter().map(|&x| x * x).sum::<f32>().sqrt();
+
+    let model_norm = StaticModel::from_pretrained(
+        "tests/fixtures/test-model-modules-normalize",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let emb_norm = model_norm.encode(&["hello world".to_string()])[0].clone();
+    let norm_norm: f32 = emb_norm.iter().map(|&x| x * x).sum::<f32>().sqrt();
+
+    assert!((norm_norm - 1.0).abs() < 1e-5, "normalized model should have unit norm");
+    assert!(norm_no > norm_norm, "un-normalized model should have larger norm");
+}
+
 /// Sentence-transformers and model2vec layouts with the same weights should give identical embeddings
 #[test]
 fn test_sentence_transformers_matches_model2vec() {

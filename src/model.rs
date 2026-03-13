@@ -18,20 +18,26 @@ struct ResolvedPaths {
 
 /// Try to detect a valid model layout in a local folder.
 ///
-/// Tries layouts in order: model2vec → sentence-transformers → 0_StaticEmbedding.
+/// Tries layouts in order:
+/// 1. model2vec: `config.json` + `model.safetensors` + `tokenizer.json`
+/// 2. Sentence Transformers root: `config_sentence_transformers.json` + `model.safetensors` + `tokenizer.json`
+/// 3. 0_StaticEmbedding subfolder: `config_sentence_transformers.json` at root, model files under `0_StaticEmbedding/`
+/// 4. Config-in-parent fallback: model files at `folder`, `config_sentence_transformers.json` one level up
+///    (handles `subfolder = "0_StaticEmbedding"` or direct paths into the embedding subfolder).
 fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
     let t = folder.join("tokenizer.json");
     let m = folder.join("model.safetensors");
 
     // 1. Native model2vec: config.json + model.safetensors + tokenizer.json
+    //    (config_sentence_transformers.json must NOT coexist to avoid misidentifying ST exports)
     let c = folder.join("config.json");
-    if t.exists() && m.exists() && c.exists() {
+    let c_st = folder.join("config_sentence_transformers.json");
+    if t.exists() && m.exists() && c.exists() && !c_st.exists() {
         return Some(ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embeddings" });
     }
 
-    let c_st = folder.join("config_sentence_transformers.json");
-
     // 2. Sentence Transformers root: config_sentence_transformers.json + model.safetensors + tokenizer.json
+    //    This also covers model2vec models re-exported via sentence-transformers (both configs present).
     if c_st.exists() && t.exists() && m.exists() {
         return Some(ResolvedPaths {
             tokenizer_path: t,
@@ -54,7 +60,62 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
         });
     }
 
+    // 4. Config-in-parent fallback: the caller pointed directly at the embedding subfolder
+    //    (e.g. subfolder="0_StaticEmbedding" or repo_or_path = ".../0_StaticEmbedding").
+    //    The config lives one level up in the actual ST model root.
+    if t.exists() && m.exists() {
+        if let Some(parent) = folder.parent() {
+            let c_parent = parent.join("config_sentence_transformers.json");
+            if c_parent.exists() {
+                return Some(ResolvedPaths {
+                    tokenizer_path: t,
+                    model_path: m,
+                    config_path: c_parent,
+                    embedding_key: "embedding.weight",
+                });
+            }
+        }
+    }
+
     None
+}
+
+/// Read the normalize flag from a model's config and optional `modules.json`.
+///
+/// Resolution order:
+/// 1. `normalize` key in the config file.
+/// 2. Presence of a `sentence_transformers.models.Normalize` entry in `modules.json`
+///    (located next to the config file).
+/// 3. Default: `true`.
+fn read_normalize(config_path: &Path) -> bool {
+    // 1. Check config file
+    if let Ok(f) = std::fs::File::open(config_path) {
+        if let Ok(cfg) = serde_json::from_reader::<_, Value>(f) {
+            if let Some(v) = cfg.get("normalize").and_then(Value::as_bool) {
+                return v;
+            }
+        }
+    }
+
+    // 2. Check modules.json for a Normalize pipeline stage
+    let modules_path = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("modules.json");
+    if let Ok(f) = std::fs::File::open(&modules_path) {
+        if let Ok(Value::Array(modules)) = serde_json::from_reader::<_, Value>(f) {
+            return modules.iter().any(|module| {
+                module
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|t| t.contains("Normalize"))
+                    .unwrap_or(false)
+            });
+        }
+    }
+
+    // 3. Default
+    true
 }
 
 /// Static embedding model for Model2Vec
@@ -130,6 +191,25 @@ impl StaticModel {
                             .context("model.safetensors not found (tried root and 0_StaticEmbedding/)")?;
                         ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embedding.weight" }
                     }
+                }
+                // 3. Config-in-parent fallback: subfolder points directly at the model files,
+                //    config_sentence_transformers.json lives at the repo root (no prefix).
+                else if !prefix.is_empty() {
+                    if let Ok(c) = repo.get("config_sentence_transformers.json") {
+                        let t = repo.get(&format!("{prefix}tokenizer.json"))
+                            .context("tokenizer.json not found in subfolder")?;
+                        let m = repo.get(&format!("{prefix}model.safetensors"))
+                            .context("model.safetensors not found in subfolder")?;
+                        ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embedding.weight" }
+                    } else {
+                        return Err(anyhow!(
+                            "no valid model layout found on HuggingFace Hub for '{}'. \
+                             Tried: model2vec (config.json), sentence-transformers \
+                             (config_sentence_transformers.json), 0_StaticEmbedding subfolder, \
+                             and config-in-parent fallback.",
+                            repo_or_path.as_ref().display()
+                        ));
+                    }
                 } else {
                     return Err(anyhow!(
                         "no valid model layout found on HuggingFace Hub for '{}'. \
@@ -149,11 +229,8 @@ impl StaticModel {
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
-        // Read normalize default from config file
-        let cfg_file = std::fs::File::open(&cfg_path).context("failed to read config")?;
-        let cfg: Value = serde_json::from_reader(&cfg_file).context("failed to parse config")?;
-        let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
-        let normalize = normalize.unwrap_or(cfg_norm);
+        // Read normalize default: config file first, then modules.json, then true
+        let normalize = normalize.unwrap_or_else(|| read_normalize(&cfg_path));
 
         // Serialize the tokenizer to JSON, then parse it and get the unk_token
         let spec_json = tokenizer
@@ -171,12 +248,15 @@ impl StaticModel {
         // Load the safetensors
         let model_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
         let safet = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
-        // Try the layout-specific key first, then legacy fallbacks.
+        // Try the layout-specific key first, then all known fallback keys.
         let tensor = safet
             .tensor(embedding_key)
             .or_else(|_| safet.tensor("embeddings"))
+            .or_else(|_| safet.tensor("embedding.weight"))
             .or_else(|_| safet.tensor("0"))
-            .with_context(|| format!("embedding tensor not found (tried '{embedding_key}', 'embeddings', '0')"))?;
+            .with_context(|| {
+                format!("embedding tensor not found (tried '{embedding_key}', 'embeddings', 'embedding.weight', '0')")
+            })?;
 
         let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2‑D")?;
         let raw = tensor.data();
