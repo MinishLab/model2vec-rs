@@ -46,6 +46,67 @@ fn test_encode_single() {
     );
 }
 
+/// Test loading a model in sentence-transformers root layout (config_sentence_transformers.json)
+#[test]
+fn test_load_sentence_transformers_layout() {
+    let model = StaticModel::from_pretrained(
+        "tests/fixtures/test-model-sentence-transformers",
+        None,
+        None,
+        None,
+    )
+    .expect("should load sentence-transformers layout");
+    let emb = model.encode(&["hello world".to_string()]);
+    assert_eq!(emb.len(), 1);
+    assert!(!emb[0].is_empty());
+}
+
+/// Test loading a model in 0_StaticEmbedding subfolder layout
+#[test]
+fn test_load_static_embedding_layout() {
+    let model = StaticModel::from_pretrained(
+        "tests/fixtures/test-model-static-embedding",
+        None,
+        None,
+        None,
+    )
+    .expect("should load 0_StaticEmbedding layout");
+    let emb = model.encode(&["hello world".to_string()]);
+    assert_eq!(emb.len(), 1);
+    assert!(!emb[0].is_empty());
+}
+
+/// Sentence-transformers and model2vec layouts with the same weights should give identical embeddings
+#[test]
+fn test_sentence_transformers_matches_model2vec() {
+    let model_m2v =
+        StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, None, None).unwrap();
+    let model_st = StaticModel::from_pretrained(
+        "tests/fixtures/test-model-sentence-transformers",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let sentences = vec!["hello".to_string(), "world test sentence".to_string()];
+    let emb_m2v = model_m2v.encode(&sentences);
+    let emb_st = model_st.encode(&sentences);
+    for (a, b) in emb_m2v.iter().zip(emb_st.iter()) {
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-5, "embeddings should match: {x} vs {y}");
+        }
+    }
+}
+
+/// Test that a path missing all known layouts gives a helpful error
+#[test]
+fn test_load_invalid_path_error() {
+    let result = StaticModel::from_pretrained("tests/fixtures", None, None, None);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("no valid model layout"), "error should mention layout: {msg}");
+}
+
 /// Test override of `normalize` flag in from_pretrained
 #[test]
 fn test_normalization_flag_override() {

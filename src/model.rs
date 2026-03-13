@@ -4,8 +4,58 @@ use hf_hub::api::sync::Api;
 use ndarray::Array2;
 use safetensors::{tensor::Dtype, SafeTensors};
 use serde_json::Value;
-use std::{env, fs, path::Path};
+use std::{env, fs, path::{Path, PathBuf}};
 use tokenizers::Tokenizer;
+
+/// Resolved file paths and embedding tensor key for a detected model layout.
+struct ResolvedPaths {
+    tokenizer_path: PathBuf,
+    model_path: PathBuf,
+    config_path: PathBuf,
+    /// Safetensors key for the embedding matrix.
+    embedding_key: &'static str,
+}
+
+/// Try to detect a valid model layout in a local folder.
+///
+/// Tries layouts in order: model2vec → sentence-transformers → 0_StaticEmbedding.
+fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
+    let t = folder.join("tokenizer.json");
+    let m = folder.join("model.safetensors");
+
+    // 1. Native model2vec: config.json + model.safetensors + tokenizer.json
+    let c = folder.join("config.json");
+    if t.exists() && m.exists() && c.exists() {
+        return Some(ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embeddings" });
+    }
+
+    let c_st = folder.join("config_sentence_transformers.json");
+
+    // 2. Sentence Transformers root: config_sentence_transformers.json + model.safetensors + tokenizer.json
+    if c_st.exists() && t.exists() && m.exists() {
+        return Some(ResolvedPaths {
+            tokenizer_path: t,
+            model_path: m,
+            config_path: c_st,
+            embedding_key: "embedding.weight",
+        });
+    }
+
+    // 3. 0_StaticEmbedding subfolder: config_sentence_transformers.json at root, model files in subfolder
+    let sub = folder.join("0_StaticEmbedding");
+    let t_sub = sub.join("tokenizer.json");
+    let m_sub = sub.join("model.safetensors");
+    if c_st.exists() && t_sub.exists() && m_sub.exists() {
+        return Some(ResolvedPaths {
+            tokenizer_path: t_sub,
+            model_path: m_sub,
+            config_path: c_st,
+            embedding_key: "embedding.weight",
+        });
+    }
+
+    None
+}
 
 /// Static embedding model for Model2Vec
 #[derive(Debug, Clone)]
@@ -22,10 +72,15 @@ pub struct StaticModel {
 impl StaticModel {
     /// Load a Model2Vec model from a local folder or the HuggingFace Hub.
     ///
+    /// Supports three layouts (tried in order):
+    /// - **model2vec**: `config.json` + `model.safetensors` + `tokenizer.json`
+    /// - **sentence-transformers**: `config_sentence_transformers.json` + `model.safetensors` + `tokenizer.json`
+    /// - **0_StaticEmbedding**: `config_sentence_transformers.json` at root, model files under `0_StaticEmbedding/`
+    ///
     /// # Arguments
     /// * `repo_or_path` - HuggingFace repo ID or local path to the model folder.
     /// * `token` - Optional HuggingFace token for authenticated downloads.
-    /// * `normalize` - Optional flag to normalize embeddings (default from config.json).
+    /// * `normalize` - Optional flag to normalize embeddings (default from config file).
     /// * `subfolder` - Optional subfolder within the repo or path to look for model files.
     pub fn from_pretrained<P: AsRef<Path>>(
         repo_or_path: P,
@@ -38,26 +93,51 @@ impl StaticModel {
             env::set_var("HF_HUB_TOKEN", tok);
         }
 
-        // Locate tokenizer.json, model.safetensors, config.json
-        let (tok_path, mdl_path, cfg_path) = {
+        // Locate model files by trying layouts in priority order
+        let ResolvedPaths { tokenizer_path: tok_path, model_path: mdl_path, config_path: cfg_path, embedding_key } = {
             let base = repo_or_path.as_ref();
             if base.exists() {
                 let folder = subfolder.map(|s| base.join(s)).unwrap_or_else(|| base.to_path_buf());
-                let t = folder.join("tokenizer.json");
-                let m = folder.join("model.safetensors");
-                let c = folder.join("config.json");
-                if !t.exists() || !m.exists() || !c.exists() {
-                    return Err(anyhow!("local path {folder:?} missing tokenizer / model / config"));
-                }
-                (t, m, c)
+                resolve_local(&folder).ok_or_else(|| anyhow!(
+                    "no valid model layout found in {folder:?}. \
+                     Tried: model2vec (config.json), sentence-transformers \
+                     (config_sentence_transformers.json), and 0_StaticEmbedding subfolder."
+                ))?
             } else {
                 let api = Api::new().context("hf-hub API init failed")?;
                 let repo = api.model(repo_or_path.as_ref().to_string_lossy().into_owned());
-                let prefix = subfolder.map(|s| format!("{}/", s)).unwrap_or_default();
-                let t = repo.get(&format!("{prefix}tokenizer.json"))?;
-                let m = repo.get(&format!("{prefix}model.safetensors"))?;
-                let c = repo.get(&format!("{prefix}config.json"))?;
-                (t, m, c)
+                let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
+
+                // 1. Native model2vec
+                if let Ok(c) = repo.get(&format!("{prefix}config.json")) {
+                    let t = repo.get(&format!("{prefix}tokenizer.json")).context("tokenizer.json missing")?;
+                    let m = repo.get(&format!("{prefix}model.safetensors")).context("model.safetensors missing")?;
+                    ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embeddings" }
+                }
+                // 2. Sentence Transformers (root or 0_StaticEmbedding subfolder)
+                else if let Ok(c) = repo.get(&format!("{prefix}config_sentence_transformers.json")) {
+                    // Try root layout first
+                    if let (Ok(t), Ok(m)) = (
+                        repo.get(&format!("{prefix}tokenizer.json")),
+                        repo.get(&format!("{prefix}model.safetensors")),
+                    ) {
+                        ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embedding.weight" }
+                    } else {
+                        // Fall back to 0_StaticEmbedding subfolder
+                        let t = repo.get(&format!("{prefix}0_StaticEmbedding/tokenizer.json"))
+                            .context("tokenizer.json not found (tried root and 0_StaticEmbedding/)")?;
+                        let m = repo.get(&format!("{prefix}0_StaticEmbedding/model.safetensors"))
+                            .context("model.safetensors not found (tried root and 0_StaticEmbedding/)")?;
+                        ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embedding.weight" }
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "no valid model layout found on HuggingFace Hub for '{}'. \
+                         Tried: model2vec (config.json), sentence-transformers \
+                         (config_sentence_transformers.json), and 0_StaticEmbedding subfolder.",
+                        repo_or_path.as_ref().display()
+                    ));
+                }
             }
         };
 
@@ -69,9 +149,9 @@ impl StaticModel {
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
-        // Read normalize default from config.json
-        let cfg_file = std::fs::File::open(&cfg_path).context("failed to read config.json")?;
-        let cfg: Value = serde_json::from_reader(&cfg_file).context("failed to parse config.json")?;
+        // Read normalize default from config file
+        let cfg_file = std::fs::File::open(&cfg_path).context("failed to read config")?;
+        let cfg: Value = serde_json::from_reader(&cfg_file).context("failed to parse config")?;
         let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
         let normalize = normalize.unwrap_or(cfg_norm);
 
@@ -85,18 +165,18 @@ impl StaticModel {
             .and_then(|m| m.get("unk_token"))
             .and_then(Value::as_str)
             .unwrap_or("[UNK]");
-        let unk_token_id = tokenizer
-            .token_to_id(unk_token)
-            .ok_or_else(|| anyhow!("tokenizer claims unk_token='{unk_token}' but it isn't in the vocab"))?
-            as usize;
+        // If the unk token isn't in the vocabulary, treat it as absent rather than erroring.
+        let unk_token_id = tokenizer.token_to_id(unk_token).map(|id| id as usize);
 
         // Load the safetensors
         let model_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
         let safet = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
+        // Try the layout-specific key first, then legacy fallbacks.
         let tensor = safet
-            .tensor("embeddings")
+            .tensor(embedding_key)
+            .or_else(|_| safet.tensor("embeddings"))
             .or_else(|_| safet.tensor("0"))
-            .context("embeddings tensor not found")?;
+            .with_context(|| format!("embedding tensor not found (tried '{embedding_key}', 'embeddings', '0')"))?;
 
         let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2‑D")?;
         let raw = tensor.data();
@@ -161,7 +241,7 @@ impl StaticModel {
             token_mapping,
             normalize,
             median_token_length,
-            unk_token_id: Some(unk_token_id),
+            unk_token_id,
         })
     }
 
