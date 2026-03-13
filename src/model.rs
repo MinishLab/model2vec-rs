@@ -192,10 +192,6 @@ fn read_normalize(config_path: &Path, explicit_modules: Option<&Path>) -> bool {
     has_normalize_module(modules_path).unwrap_or(true)
 }
 
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
-
 /// Static embedding model for Model2Vec
 #[derive(Debug, Clone)]
 pub struct StaticModel {
@@ -210,12 +206,6 @@ pub struct StaticModel {
 
 impl StaticModel {
     /// Load a Model2Vec model from a local folder or the HuggingFace Hub.
-    ///
-    /// Supports four layouts (tried in order):
-    /// - **model2vec**: `config.json` + `model.safetensors` + `tokenizer.json`
-    /// - **sentence-transformers root**: `config_sentence_transformers.json` + model files at same level
-    /// - **0_StaticEmbedding**: `config_sentence_transformers.json` at root, model files under `0_StaticEmbedding/`
-    /// - **config-in-parent**: model files in current dir, `config_sentence_transformers.json` one level up
     ///
     /// # Arguments
     /// * `repo_or_path` - HuggingFace repo ID or local path to the model folder.
