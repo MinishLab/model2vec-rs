@@ -179,6 +179,32 @@ fn test_sentence_transformers_matches_model2vec() {
     }
 }
 
+/// Fix: nested subfolder — config lives in `some/path/`, model files in `some/path/0_StaticEmbedding/`.
+/// Both `subfolder = "some/path/0_StaticEmbedding"` and a direct path into the embedding dir
+/// must load successfully, mirroring what the Hub branch now does via parent_of_prefix().
+#[test]
+fn test_load_nested_static_embedding_subfolder() {
+    // repo_or_path = root, subfolder points to the nested embedding dir
+    let model = StaticModel::from_pretrained(
+        "tests/fixtures/test-nested-static-embedding",
+        None,
+        None,
+        Some("some/path/0_StaticEmbedding"),
+    )
+    .expect("should load with nested subfolder='some/path/0_StaticEmbedding'");
+    assert!(!model.encode(&["hello".to_string()])[0].is_empty());
+
+    // Direct path into the nested embedding dir (no subfolder arg)
+    let model2 = StaticModel::from_pretrained(
+        "tests/fixtures/test-nested-static-embedding/some/path/0_StaticEmbedding",
+        None,
+        None,
+        None,
+    )
+    .expect("should load when path points directly at nested 0_StaticEmbedding");
+    assert!(!model2.encode(&["hello".to_string()])[0].is_empty());
+}
+
 /// Test that a path missing all known layouts gives a helpful error
 #[test]
 fn test_load_invalid_path_error() {

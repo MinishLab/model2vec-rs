@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use half::f16;
-use hf_hub::api::sync::Api;
+use hf_hub::api::sync::{Api, ApiRepo};
 use ndarray::Array2;
 use safetensors::{tensor::Dtype, SafeTensors};
 use serde_json::Value;
@@ -12,6 +12,8 @@ struct ResolvedPaths {
     tokenizer_path: PathBuf,
     model_path: PathBuf,
     config_path: PathBuf,
+    /// Explicitly downloaded/located `modules.json`; `None` for local paths (derived at read time).
+    modules_path: Option<PathBuf>,
     /// Safetensors key for the embedding matrix.
     embedding_key: &'static str,
 }
@@ -33,7 +35,7 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
     let c = folder.join("config.json");
     let c_st = folder.join("config_sentence_transformers.json");
     if t.exists() && m.exists() && c.exists() && !c_st.exists() {
-        return Some(ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embeddings" });
+        return Some(ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, modules_path: None, embedding_key: "embeddings" });
     }
 
     // 2. Sentence Transformers root: config_sentence_transformers.json + model.safetensors + tokenizer.json
@@ -43,6 +45,7 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
             tokenizer_path: t,
             model_path: m,
             config_path: c_st,
+            modules_path: None,
             embedding_key: "embedding.weight",
         });
     }
@@ -56,6 +59,7 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
             tokenizer_path: t_sub,
             model_path: m_sub,
             config_path: c_st,
+            modules_path: None,
             embedding_key: "embedding.weight",
         });
     }
@@ -71,6 +75,7 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
                     tokenizer_path: t,
                     model_path: m,
                     config_path: c_parent,
+                    modules_path: None,
                     embedding_key: "embedding.weight",
                 });
             }
@@ -80,14 +85,49 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
     None
 }
 
+/// Strip the last path component from a Hub prefix (which always ends with `/`).
+///
+/// Returns the parent prefix, also ending with `/`, or an empty string for the repo root.
+///
+/// * `"0_StaticEmbedding/"` → `""`
+/// * `"some/path/0_StaticEmbedding/"` → `"some/path/"`
+fn parent_of_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim_end_matches('/');
+    match Path::new(trimmed).parent() {
+        Some(p) if !p.as_os_str().is_empty() => format!("{}/", p.display()),
+        _ => String::new(),
+    }
+}
+
+/// Download the tokenizer and model files for a sentence-transformers Hub repo.
+///
+/// Tries the root layout first (`{prefix}tokenizer.json` + `{prefix}model.safetensors`),
+/// then falls back to the `0_StaticEmbedding` subfolder.
+fn hub_st_files(repo: &ApiRepo, prefix: &str) -> Result<(PathBuf, PathBuf)> {
+    if let (Ok(t), Ok(m)) = (
+        repo.get(&format!("{prefix}tokenizer.json")),
+        repo.get(&format!("{prefix}model.safetensors")),
+    ) {
+        return Ok((t, m));
+    }
+    let t = repo
+        .get(&format!("{prefix}0_StaticEmbedding/tokenizer.json"))
+        .context("tokenizer.json not found (tried root and 0_StaticEmbedding/)")?;
+    let m = repo
+        .get(&format!("{prefix}0_StaticEmbedding/model.safetensors"))
+        .context("model.safetensors not found (tried root and 0_StaticEmbedding/)")?;
+    Ok((t, m))
+}
+
 /// Read the normalize flag from a model's config and optional `modules.json`.
 ///
 /// Resolution order:
 /// 1. `normalize` key in the config file.
-/// 2. Presence of a `sentence_transformers.models.Normalize` entry in `modules.json`
-///    (located next to the config file).
+/// 2. Presence of a `sentence_transformers.models.Normalize` entry in `modules.json`.
+///    For local paths `explicit_modules` is `None` and the file is looked up next to
+///    the config; for Hub downloads the already-fetched path is passed explicitly.
 /// 3. Default: `true`.
-fn read_normalize(config_path: &Path) -> bool {
+fn read_normalize(config_path: &Path, explicit_modules: Option<&Path>) -> bool {
     // 1. Check config file
     if let Ok(f) = std::fs::File::open(config_path) {
         if let Ok(cfg) = serde_json::from_reader::<_, Value>(f) {
@@ -97,20 +137,30 @@ fn read_normalize(config_path: &Path) -> bool {
         }
     }
 
-    // 2. Check modules.json for a Normalize pipeline stage
-    let modules_path = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join("modules.json");
-    if let Ok(f) = std::fs::File::open(&modules_path) {
-        if let Ok(Value::Array(modules)) = serde_json::from_reader::<_, Value>(f) {
-            return modules.iter().any(|module| {
-                module
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(|t| t.contains("Normalize"))
-                    .unwrap_or(false)
-            });
+    // 2. Check modules.json for a Normalize pipeline stage.
+    //    Use explicit path when provided (Hub), otherwise derive from config's directory (local).
+    let derived;
+    let modules_path: Option<&Path> = match explicit_modules {
+        Some(p) => Some(p),
+        None => {
+            derived = config_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join("modules.json");
+            if derived.exists() { Some(&derived) } else { None }
+        }
+    };
+    if let Some(mp) = modules_path {
+        if let Ok(f) = std::fs::File::open(mp) {
+            if let Ok(Value::Array(modules)) = serde_json::from_reader::<_, Value>(f) {
+                return modules.iter().any(|module| {
+                    module
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .map(|t| t.contains("Normalize"))
+                        .unwrap_or(false)
+                });
+            }
         }
     }
 
@@ -155,7 +205,7 @@ impl StaticModel {
         }
 
         // Locate model files by trying layouts in priority order
-        let ResolvedPaths { tokenizer_path: tok_path, model_path: mdl_path, config_path: cfg_path, embedding_key } = {
+        let ResolvedPaths { tokenizer_path: tok_path, model_path: mdl_path, config_path: cfg_path, modules_path: mod_path, embedding_key } = {
             let base = repo_or_path.as_ref();
             if base.exists() {
                 let folder = subfolder.map(|s| base.join(s)).unwrap_or_else(|| base.to_path_buf());
@@ -169,38 +219,41 @@ impl StaticModel {
                 let repo = api.model(repo_or_path.as_ref().to_string_lossy().into_owned());
                 let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
 
-                // 1. Native model2vec
-                if let Ok(c) = repo.get(&format!("{prefix}config.json")) {
-                    let t = repo.get(&format!("{prefix}tokenizer.json")).context("tokenizer.json missing")?;
-                    let m = repo.get(&format!("{prefix}model.safetensors")).context("model.safetensors missing")?;
-                    ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embeddings" }
-                }
-                // 2. Sentence Transformers (root or 0_StaticEmbedding subfolder)
-                else if let Ok(c) = repo.get(&format!("{prefix}config_sentence_transformers.json")) {
-                    // Try root layout first
-                    if let (Ok(t), Ok(m)) = (
-                        repo.get(&format!("{prefix}tokenizer.json")),
-                        repo.get(&format!("{prefix}model.safetensors")),
-                    ) {
-                        ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embedding.weight" }
+                // modules.json is optional; download it now so read_normalize can inspect it.
+                let modules = repo.get(&format!("{prefix}modules.json")).ok();
+
+                // 1. config.json exists — check whether config_sentence_transformers.json also
+                //    exists. If both are present, ST wins (mirrors the local resolver's guard).
+                if let Ok(c_m2v) = repo.get(&format!("{prefix}config.json")) {
+                    if let Ok(c_st) = repo.get(&format!("{prefix}config_sentence_transformers.json")) {
+                        // Both configs → sentence-transformers layout takes precedence
+                        let (t, m) = hub_st_files(&repo, &prefix)?;
+                        ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c_st, modules_path: modules, embedding_key: "embedding.weight" }
                     } else {
-                        // Fall back to 0_StaticEmbedding subfolder
-                        let t = repo.get(&format!("{prefix}0_StaticEmbedding/tokenizer.json"))
-                            .context("tokenizer.json not found (tried root and 0_StaticEmbedding/)")?;
-                        let m = repo.get(&format!("{prefix}0_StaticEmbedding/model.safetensors"))
-                            .context("model.safetensors not found (tried root and 0_StaticEmbedding/)")?;
-                        ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embedding.weight" }
+                        // Only config.json → native model2vec
+                        let t = repo.get(&format!("{prefix}tokenizer.json")).context("tokenizer.json missing")?;
+                        let m = repo.get(&format!("{prefix}model.safetensors")).context("model.safetensors missing")?;
+                        ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c_m2v, modules_path: modules, embedding_key: "embeddings" }
                     }
                 }
-                // 3. Config-in-parent fallback: subfolder points directly at the model files,
-                //    config_sentence_transformers.json lives at the repo root (no prefix).
+                // 2. Only config_sentence_transformers.json (root or 0_StaticEmbedding subfolder)
+                else if let Ok(c_st) = repo.get(&format!("{prefix}config_sentence_transformers.json")) {
+                    let (t, m) = hub_st_files(&repo, &prefix)?;
+                    ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c_st, modules_path: modules, embedding_key: "embedding.weight" }
+                }
+                // 3. Config-in-parent fallback: the subfolder points directly at the model
+                //    files and the config lives one level up (mirrors resolve_local layout 4).
+                //    Use parent_of_prefix so nested paths like "some/path/0_StaticEmbedding/"
+                //    look in "some/path/", not the repo root.
                 else if !prefix.is_empty() {
-                    if let Ok(c) = repo.get("config_sentence_transformers.json") {
+                    let parent_prefix = parent_of_prefix(&prefix);
+                    let parent_modules = repo.get(&format!("{parent_prefix}modules.json")).ok();
+                    if let Ok(c) = repo.get(&format!("{parent_prefix}config_sentence_transformers.json")) {
                         let t = repo.get(&format!("{prefix}tokenizer.json"))
                             .context("tokenizer.json not found in subfolder")?;
                         let m = repo.get(&format!("{prefix}model.safetensors"))
                             .context("model.safetensors not found in subfolder")?;
-                        ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, embedding_key: "embedding.weight" }
+                        ResolvedPaths { tokenizer_path: t, model_path: m, config_path: c, modules_path: parent_modules, embedding_key: "embedding.weight" }
                     } else {
                         return Err(anyhow!(
                             "no valid model layout found on HuggingFace Hub for '{}'. \
@@ -229,8 +282,9 @@ impl StaticModel {
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
-        // Read normalize default: config file first, then modules.json, then true
-        let normalize = normalize.unwrap_or_else(|| read_normalize(&cfg_path));
+        // Read normalize default: config file first, then modules.json, then true.
+        // Pass the explicitly downloaded modules path for Hub models; local models derive it.
+        let normalize = normalize.unwrap_or_else(|| read_normalize(&cfg_path, mod_path.as_deref()));
 
         // Serialize the tokenizer to JSON, then parse it and get the unk_token
         let spec_json = tokenizer
@@ -445,5 +499,30 @@ impl StaticModel {
             }
         }
         sum
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parent_of_prefix;
+
+    #[test]
+    fn test_parent_of_prefix_root_subfolder() {
+        assert_eq!(parent_of_prefix("0_StaticEmbedding/"), "");
+    }
+
+    #[test]
+    fn test_parent_of_prefix_nested() {
+        assert_eq!(parent_of_prefix("some/path/0_StaticEmbedding/"), "some/path/");
+    }
+
+    #[test]
+    fn test_parent_of_prefix_single_level() {
+        assert_eq!(parent_of_prefix("models/"), "");
+    }
+
+    #[test]
+    fn test_parent_of_prefix_two_levels() {
+        assert_eq!(parent_of_prefix("a/b/"), "a/");
     }
 }
