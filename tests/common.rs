@@ -65,10 +65,17 @@ pub fn temp_st_dir(modules_json: Option<&str>) -> TempDir {
     dir
 }
 
-/// Build a temp dir that has BOTH `config.json` and `config_sentence_transformers.json`.
+/// Build a temp dir that has BOTH `config.json` and `config_sentence_transformers.json`
+/// with **conflicting** normalize values:
+/// - `config.json` → `normalize: false`  (native layout would give unnormalized output)
+/// - `config_sentence_transformers.json` → `normalize: true`  (ST layout gives unit norm)
+///
+/// This lets callers prove which config was actually used.
 pub fn temp_both_configs_dir() -> TempDir {
-    let dir = temp_st_dir(None);
-    fs::write(dir.path().join("config.json"), PLAIN_CONFIG).expect("write config.json");
+    let dir = temp_st_dir(None); // writes config_sentence_transformers.json with normalize=true
+    // Intentionally different normalize value so a test can detect which config won.
+    let native_config = r#"{"model_type":"model2vec","normalize":false,"hidden_dim":64}"#;
+    fs::write(dir.path().join("config.json"), native_config).expect("write config.json");
     dir
 }
 

@@ -67,6 +67,21 @@ fn test_all_layouts_load() {
     }
 }
 
+/// When both config.json (normalize=false) and config_sentence_transformers.json (normalize=true)
+/// are present, the sentence-transformers layout must win.
+/// A regression back to "native wins" would produce an unnormalized embedding and fail here.
+#[test]
+fn test_both_configs_prefers_sentence_transformers() {
+    let dir = temp_both_configs_dir();
+    let model = assert_loads(dir.path().to_str().unwrap(), None);
+    let norm = embedding_norm(&model, "hello world");
+    assert!(
+        (norm - 1.0).abs() < 1e-5,
+        "expected unit norm (ST config wins), got {norm} — \
+         loader may be preferring config.json (native) over config_sentence_transformers.json"
+    );
+}
+
 /// ST and native model2vec layouts with the same weights should give identical embeddings
 #[test]
 fn test_sentence_transformers_matches_model2vec() {
