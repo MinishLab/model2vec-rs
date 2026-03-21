@@ -10,7 +10,6 @@ use std::{
 };
 use tokenizers::Tokenizer;
 
-/// Which embedding-tensor naming convention a model uses.
 #[derive(Debug, Clone, Copy)]
 enum ModelLayout {
     Native,
@@ -34,8 +33,6 @@ struct ResolvedPaths {
     layout: ModelLayout,
 }
 
-/// Check whether `config_base/config_file`, `model_base/tokenizer.json`, and
-/// `model_base/model.safetensors` all exist, and if so return a `ResolvedPaths`.
 fn local_probe(config_base: &Path, model_base: &Path, config_file: &str, layout: ModelLayout) -> Option<ResolvedPaths> {
     let config_path = config_base.join(config_file);
     let tokenizer_path = model_base.join("tokenizer.json");
@@ -49,8 +46,6 @@ fn local_probe(config_base: &Path, model_base: &Path, config_file: &str, layout:
     })
 }
 
-/// Fetch `config_prefix/config_file`, `model_prefix/tokenizer.json`, and
-/// `model_prefix/model.safetensors` from the Hub; return `None` if any is missing.
 fn hub_probe(
     repo: &ApiRepo,
     config_prefix: &str,
@@ -72,7 +67,7 @@ fn hub_probe(
 }
 
 fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
-    // Native model2vec — skip when a sentence-transformers config is also present.
+    // Native model2vec, skip if sentence-transformers config is also present.
     if !folder.join("config_sentence_transformers.json").exists() {
         if let r @ Some(_) = local_probe(folder, folder, "config.json", ModelLayout::Native) {
             return r;
@@ -108,7 +103,7 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
 }
 
 fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
-    // Native model2vec — skip when a sentence-transformers config is also present.
+    // Native model2vec, skip if sentence-transformers config is also present.
     if repo.get(&format!("{prefix}config_sentence_transformers.json")).is_err() {
         if let Some(r) = hub_probe(repo, prefix, prefix, "config.json", ModelLayout::Native) {
             return Ok(r);

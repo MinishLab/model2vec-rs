@@ -38,21 +38,13 @@ fn test_all_layouts_load() {
     let nested = temp_nested_st_dir();
 
     let cases: &[(&str, Option<&str>)] = &[
-        // Native model2vec
         ("tests/fixtures/test-model-float32", None),
-        // Sentence-transformers root layout
         ("tests/fixtures/test-model-sentence-transformers", None),
-        // 0_StaticEmbedding subfolder (auto-detected)
         ("tests/fixtures/test-model-static-embedding", None),
-        // 0_StaticEmbedding via explicit subfolder arg
         ("tests/fixtures/test-model-static-embedding", Some("0_StaticEmbedding")),
-        // Direct path into 0_StaticEmbedding
         ("tests/fixtures/test-model-static-embedding/0_StaticEmbedding", None),
-        // Both configs present — ST should win
         (both.path().to_str().unwrap(), None),
-        // Nested subfolder path
         (nested.path().to_str().unwrap(), Some("some/path/0_StaticEmbedding")),
-        // Direct path into nested 0_StaticEmbedding
         (
             &format!("{}/some/path/0_StaticEmbedding", nested.path().display()),
             None,
