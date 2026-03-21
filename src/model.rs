@@ -33,7 +33,12 @@ struct ResolvedPaths {
     layout: ModelLayout,
 }
 
-fn local_probe(config_base: &Path, model_base: &Path, config_file: &str, layout: ModelLayout) -> Option<ResolvedPaths> {
+fn match_local_layout(
+    config_base: &Path,
+    model_base: &Path,
+    config_file: &str,
+    layout: ModelLayout,
+) -> Option<ResolvedPaths> {
     let config_path = config_base.join(config_file);
     let tokenizer_path = model_base.join("tokenizer.json");
     let model_path = model_base.join("model.safetensors");
@@ -46,7 +51,7 @@ fn local_probe(config_base: &Path, model_base: &Path, config_file: &str, layout:
     })
 }
 
-fn hub_probe(
+fn match_hub_layout(
     repo: &ApiRepo,
     config_prefix: &str,
     model_prefix: &str,
@@ -69,12 +74,12 @@ fn hub_probe(
 fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
     // Native model2vec, skip if sentence-transformers config is also present.
     if !folder.join("config_sentence_transformers.json").exists() {
-        if let r @ Some(_) = local_probe(folder, folder, "config.json", ModelLayout::Native) {
+        if let r @ Some(_) = match_local_layout(folder, folder, "config.json", ModelLayout::Native) {
             return r;
         }
     }
     // Sentence Transformers root layout.
-    if let r @ Some(_) = local_probe(
+    if let r @ Some(_) = match_local_layout(
         folder,
         folder,
         "config_sentence_transformers.json",
@@ -84,7 +89,7 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
     }
     // Sentence Transformers with model files in 0_StaticEmbedding/.
     let sub = folder.join("0_StaticEmbedding");
-    if let r @ Some(_) = local_probe(
+    if let r @ Some(_) = match_local_layout(
         folder,
         &sub,
         "config_sentence_transformers.json",
@@ -94,7 +99,7 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
     }
     // Config lives one level up (caller pointed directly at the model-files directory).
     let parent = folder.parent()?;
-    local_probe(
+    match_local_layout(
         parent,
         folder,
         "config_sentence_transformers.json",
@@ -105,12 +110,12 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
 fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
     // Native model2vec, skip if sentence-transformers config is also present.
     if repo.get(&format!("{prefix}config_sentence_transformers.json")).is_err() {
-        if let Some(r) = hub_probe(repo, prefix, prefix, "config.json", ModelLayout::Native) {
+        if let Some(r) = match_hub_layout(repo, prefix, prefix, "config.json", ModelLayout::Native) {
             return Ok(r);
         }
     }
     // Sentence Transformers root layout.
-    if let Some(r) = hub_probe(
+    if let Some(r) = match_hub_layout(
         repo,
         prefix,
         prefix,
@@ -121,7 +126,7 @@ fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
     }
     // Sentence Transformers with model files in 0_StaticEmbedding/.
     let sub_prefix = format!("{prefix}0_StaticEmbedding/");
-    if let Some(r) = hub_probe(
+    if let Some(r) = match_hub_layout(
         repo,
         prefix,
         &sub_prefix,
@@ -136,7 +141,7 @@ fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
         Some(p) if !p.as_os_str().is_empty() => format!("{}/", p.display()),
         _ => String::new(),
     };
-    hub_probe(
+    match_hub_layout(
         repo,
         &parent,
         prefix,
