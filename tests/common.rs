@@ -30,27 +30,19 @@ pub fn embedding_norm(model: &StaticModel, text: &str) -> f32 {
 
 const ST_CONFIG: &str = r#"{"normalize": true}"#;
 
-fn copy_st_blobs(dir: &std::path::Path) {
+fn copy_native_blobs(dir: &std::path::Path) {
     for file in ["model.safetensors", "tokenizer.json"] {
-        fs::copy(
-            format!("tests/fixtures/test-model-sentence-transformers/{file}"),
-            dir.join(file),
-        )
-        .expect("copy fixture blob");
+        fs::copy(format!("tests/fixtures/test-model-float32/{file}"), dir.join(file)).expect("copy fixture blob");
     }
-}
-
-fn temp_st_dir() -> TempDir {
-    let dir = tempfile::tempdir().expect("tempdir");
-    copy_st_blobs(dir.path());
-    fs::write(dir.path().join("config_sentence_transformers.json"), ST_CONFIG).expect("write ST config");
-    dir
 }
 
 /// Both configs present: `config.json` has `normalize: false`,
 /// `config_sentence_transformers.json` has `normalize: true`.
+/// Uses native weights (embeddings tensor) so no cross-layout fallback is needed.
 pub fn temp_both_configs_dir() -> TempDir {
-    let dir = temp_st_dir();
+    let dir = tempfile::tempdir().expect("tempdir");
+    copy_native_blobs(dir.path());
+    fs::write(dir.path().join("config_sentence_transformers.json"), ST_CONFIG).expect("write ST config");
     fs::write(
         dir.path().join("config.json"),
         r#"{"model_type":"model2vec","normalize":false}"#,
@@ -64,7 +56,13 @@ pub fn temp_nested_st_dir() -> TempDir {
     let base = dir.path().join("some/path");
     let emb_dir = base.join("0_StaticEmbedding");
     fs::create_dir_all(&emb_dir).expect("create nested dir");
-    copy_st_blobs(&emb_dir);
+    for file in ["model.safetensors", "tokenizer.json"] {
+        fs::copy(
+            format!("tests/fixtures/test-model-sentence-transformers/{file}"),
+            emb_dir.join(file),
+        )
+        .expect("copy fixture blob");
+    }
     fs::write(base.join("config_sentence_transformers.json"), ST_CONFIG).expect("write nested ST config");
     dir
 }

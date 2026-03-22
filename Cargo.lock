@@ -792,6 +792,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokenizers",
+ "ureq",
 ]
 
 [[package]]

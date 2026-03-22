@@ -50,26 +50,44 @@ fn match_local_layout(
     })
 }
 
+fn is_not_found(e: &hf_hub::api::sync::ApiError) -> bool {
+    use hf_hub::api::sync::ApiError;
+    matches!(e, ApiError::RequestError(e) if matches!(e.as_ref(), ureq::Error::Status(404, _)))
+}
+
 fn match_hub_layout(
     repo: &ApiRepo,
     config_prefix: &str,
     model_prefix: &str,
     config_file: &str,
     layout: ModelLayout,
-) -> Option<ResolvedPaths> {
-    let config_path = repo.get(&format!("{config_prefix}{config_file}")).ok()?;
-    let tokenizer_path = repo.get(&format!("{model_prefix}tokenizer.json")).ok()?;
-    let model_path = repo.get(&format!("{model_prefix}model.safetensors")).ok()?;
-    Some(ResolvedPaths {
-        config_path,
-        tokenizer_path,
-        model_path,
-        layout,
-    })
+) -> Option<Result<ResolvedPaths>> {
+    // Probe whether this layout exists: only a 404 means "not this layout".
+    // Any other error (auth, network) is a real failure and must propagate.
+    let config_path = match repo.get(&format!("{config_prefix}{config_file}")) {
+        Ok(path) => path,
+        Err(e) if is_not_found(&e) => return None,
+        Err(e) => return Some(Err(e.into())),
+    };
+    // Config present — layout matched. Any further error is a real failure.
+    Some((|| {
+        let tokenizer_path = repo
+            .get(&format!("{model_prefix}tokenizer.json"))
+            .context("failed to download tokenizer.json")?;
+        let model_path = repo
+            .get(&format!("{model_prefix}model.safetensors"))
+            .context("failed to download model.safetensors")?;
+        Ok(ResolvedPaths {
+            config_path,
+            tokenizer_path,
+            model_path,
+            layout,
+        })
+    })())
 }
 
 fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
-    // Native model2vec — tried first, matching Python model2vec layout resolution order.
+    // Native model2vec, tried first to match Python model2vec layout resolution order.
     if let r @ Some(_) = match_local_layout(folder, folder, "config.json", ModelLayout::Native) {
         return r;
     }
@@ -103,9 +121,9 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
 }
 
 fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
-    // Native model2vec — tried first, matching Python model2vec layout resolution order.
+    // Native model2vec, tried first to match Python model2vec layout resolution order.
     if let Some(r) = match_hub_layout(repo, prefix, prefix, "config.json", ModelLayout::Native) {
-        return Ok(r);
+        return r;
     }
     // Sentence Transformers root layout.
     if let Some(r) = match_hub_layout(
@@ -115,7 +133,7 @@ fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
         "config_sentence_transformers.json",
         ModelLayout::SentenceTransformers,
     ) {
-        return Ok(r);
+        return r;
     }
     // Sentence Transformers with model files in 0_StaticEmbedding/.
     let sub_prefix = format!("{prefix}0_StaticEmbedding/");
@@ -126,7 +144,7 @@ fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
         "config_sentence_transformers.json",
         ModelLayout::SentenceTransformers,
     ) {
-        return Ok(r);
+        return r;
     }
     // Config lives one level up.
     let trimmed = prefix.trim_end_matches('/');
@@ -141,7 +159,7 @@ fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
         "config_sentence_transformers.json",
         ModelLayout::SentenceTransformers,
     )
-    .ok_or_else(|| anyhow!("no valid model layout found in '{prefix}'"))
+    .unwrap_or_else(|| Err(anyhow!("no valid model layout found in '{prefix}'")))
 }
 
 /// Static embedding model for Model2Vec
@@ -199,25 +217,16 @@ impl StaticModel {
 
         let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
 
-        let normalize = normalize.unwrap_or_else(|| {
-            std::fs::File::open(&cfg_path)
-                .ok()
-                .and_then(|f| serde_json::from_reader::<_, Value>(f).ok())
-                .and_then(|cfg| cfg.get("normalize").and_then(Value::as_bool))
-                .unwrap_or(false)
-        });
+        let f = std::fs::File::open(&cfg_path).context("failed to read config")?;
+        let cfg: Value = serde_json::from_reader(f).context("failed to parse config")?;
+        let normalize = normalize.unwrap_or_else(|| cfg.get("normalize").and_then(Value::as_bool).unwrap_or(false));
 
         let model_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
         let safet = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
         let emb_key = layout.embedding_key();
         let tensor = safet
             .tensor(emb_key)
-            .or_else(|_| safet.tensor("embeddings"))
-            .or_else(|_| safet.tensor("embedding.weight"))
-            .or_else(|_| safet.tensor("0"))
-            .with_context(|| {
-                format!("embedding tensor not found (tried '{emb_key}', 'embeddings', 'embedding.weight', '0')")
-            })?;
+            .with_context(|| format!("embedding tensor '{emb_key}' not found"))?;
 
         let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2-D")?;
         let raw = tensor.data();
@@ -386,7 +395,7 @@ impl StaticModel {
         Ok((median_token_length, unk_token_id))
     }
 
-    /// Char-level truncation to max_tokens × median_token_length
+    /// Char-level truncation to max_tokens * median_token_length
     fn truncate_str(s: &str, max_tokens: usize, median_len: usize) -> &str {
         let max_chars = max_tokens.saturating_mul(median_len);
         match s.char_indices().nth(max_chars) {
