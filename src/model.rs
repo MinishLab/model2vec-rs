@@ -29,7 +29,6 @@ struct ResolvedPaths {
     tokenizer_path: PathBuf,
     model_path: PathBuf,
     config_path: PathBuf,
-    modules_path: Option<PathBuf>,
     layout: ModelLayout,
 }
 
@@ -46,7 +45,6 @@ fn match_local_layout(
         config_path,
         tokenizer_path,
         model_path,
-        modules_path: None,
         layout,
     })
 }
@@ -61,22 +59,18 @@ fn match_hub_layout(
     let config_path = repo.get(&format!("{config_prefix}{config_file}")).ok()?;
     let tokenizer_path = repo.get(&format!("{model_prefix}tokenizer.json")).ok()?;
     let model_path = repo.get(&format!("{model_prefix}model.safetensors")).ok()?;
-    let modules_path = repo.get(&format!("{config_prefix}modules.json")).ok();
     Some(ResolvedPaths {
         config_path,
         tokenizer_path,
         model_path,
-        modules_path,
         layout,
     })
 }
 
 fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
-    // Native model2vec, skip if sentence-transformers config is also present.
-    if !folder.join("config_sentence_transformers.json").exists() {
-        if let r @ Some(_) = match_local_layout(folder, folder, "config.json", ModelLayout::Native) {
-            return r;
-        }
+    // Native model2vec — tried first, matching Python model2vec layout resolution order.
+    if let r @ Some(_) = match_local_layout(folder, folder, "config.json", ModelLayout::Native) {
+        return r;
     }
     // Sentence Transformers root layout.
     if let r @ Some(_) = match_local_layout(
@@ -108,11 +102,9 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
 }
 
 fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
-    // Native model2vec, skip if sentence-transformers config is also present.
-    if repo.get(&format!("{prefix}config_sentence_transformers.json")).is_err() {
-        if let Some(r) = match_hub_layout(repo, prefix, prefix, "config.json", ModelLayout::Native) {
-            return Ok(r);
-        }
+    // Native model2vec — tried first, matching Python model2vec layout resolution order.
+    if let Some(r) = match_hub_layout(repo, prefix, prefix, "config.json", ModelLayout::Native) {
+        return Ok(r);
     }
     // Sentence Transformers root layout.
     if let Some(r) = match_hub_layout(
@@ -186,7 +178,6 @@ impl StaticModel {
             tokenizer_path: tok_path,
             model_path: mdl_path,
             config_path: cfg_path,
-            modules_path: mod_path,
             layout,
         } = if base.exists() {
             let folder = subfolder.map(|s| base.join(s)).unwrap_or_else(|| base.to_path_buf());
@@ -212,41 +203,28 @@ impl StaticModel {
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
         let normalize = normalize.unwrap_or_else(|| {
-            // 1. explicit key in config file
-            if let Some(v) = std::fs::File::open(&cfg_path)
+            std::fs::File::open(&cfg_path)
                 .ok()
                 .and_then(|f| serde_json::from_reader::<_, Value>(f).ok())
                 .and_then(|cfg| cfg.get("normalize").and_then(Value::as_bool))
-            {
-                return v;
-            }
-            // 2. Normalize stage in modules.json; default true
-            let derived = cfg_path.parent().unwrap_or_else(|| Path::new("")).join("modules.json");
-            let modules_path = mod_path.as_deref().unwrap_or(&derived);
-            let Ok(f) = std::fs::File::open(modules_path) else {
-                return true;
-            };
-            let Ok(Value::Array(modules)) = serde_json::from_reader::<_, Value>(f) else {
-                return true;
-            };
-            modules.iter().any(|m| {
-                m.get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t.contains("Normalize"))
-            })
+                .unwrap_or(false)
         });
 
         let spec_json = tokenizer
             .to_string(false)
             .map_err(|e| anyhow!("tokenizer -> JSON failed: {e}"))?;
         let spec: Value = serde_json::from_str(&spec_json)?;
-        // If no unk token is defined, don't filter anything.
-        // If one is defined but absent from the vocab, fall back to id 0.
         let unk_token_id = spec
             .get("model")
             .and_then(|m| m.get("unk_token"))
             .and_then(Value::as_str)
-            .map(|unk| tokenizer.token_to_id(unk).map(|id| id as usize).unwrap_or(0));
+            .map(|unk| {
+                tokenizer
+                    .token_to_id(unk)
+                    .map(|id| id as usize)
+                    .ok_or_else(|| anyhow!("unk_token '{unk}' not found in vocabulary"))
+            })
+            .transpose()?;
 
         let model_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
         let safet = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;

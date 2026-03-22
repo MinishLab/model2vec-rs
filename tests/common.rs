@@ -40,20 +40,17 @@ fn copy_st_blobs(dir: &std::path::Path) {
     }
 }
 
-pub fn temp_st_dir(modules_json: Option<&str>) -> TempDir {
+fn temp_st_dir() -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     copy_st_blobs(dir.path());
     fs::write(dir.path().join("config_sentence_transformers.json"), ST_CONFIG).expect("write ST config");
-    if let Some(content) = modules_json {
-        fs::write(dir.path().join("modules.json"), content).expect("write modules.json");
-    }
     dir
 }
 
 /// Both configs present: `config.json` has `normalize: false`,
 /// `config_sentence_transformers.json` has `normalize: true`.
 pub fn temp_both_configs_dir() -> TempDir {
-    let dir = temp_st_dir(None);
+    let dir = temp_st_dir();
     fs::write(
         dir.path().join("config.json"),
         r#"{"model_type":"model2vec","normalize":false}"#,

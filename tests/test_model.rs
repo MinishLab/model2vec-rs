@@ -1,5 +1,5 @@
 mod common;
-use common::{assert_loads, embedding_norm, load_test_model, temp_both_configs_dir, temp_nested_st_dir, temp_st_dir};
+use common::{assert_loads, embedding_norm, load_test_model, temp_both_configs_dir, temp_nested_st_dir};
 use model2vec_rs::model::StaticModel;
 
 /// Test that encoding an empty input slice yields an empty output
@@ -61,15 +61,17 @@ fn test_all_layouts_load() {
     }
 }
 
-/// config_sentence_transformers.json (normalize=true) must win over config.json (normalize=false).
+/// When both config.json and config_sentence_transformers.json are present, native wins
+/// (config.json), matching Python model2vec layout resolution order.
+/// config.json has normalize=false so embeddings should not be unit-normalized.
 #[test]
-fn test_both_configs_prefers_sentence_transformers() {
+fn test_both_configs_prefers_native() {
     let dir = temp_both_configs_dir();
     let model = assert_loads(dir.path().to_str().unwrap(), None);
     let norm = embedding_norm(&model, "hello world");
     assert!(
-        (norm - 1.0).abs() < 1e-5,
-        "expected unit norm (ST config wins), got {norm}"
+        (norm - 1.0).abs() > 1e-3,
+        "expected non-unit norm (native config.json wins with normalize=false), got {norm}"
     );
 }
 
@@ -89,45 +91,6 @@ fn test_sentence_transformers_matches_model2vec() {
             assert!((x - y).abs() < 1e-5, "embeddings should match: {x} vs {y}");
         }
     }
-}
-
-/// modules.json Normalize stage controls normalization when config lacks the key
-#[test]
-fn test_normalize_from_modules_json() {
-    const WITH_NORMALIZE: &str = r#"[
-        {"idx":0,"name":"0","path":".","type":"sentence_transformers.models.StaticEmbedding"},
-        {"idx":1,"name":"1","path":"1_Normalize","type":"sentence_transformers.models.Normalize"}
-    ]"#;
-    const WITHOUT_NORMALIZE: &str = r#"[
-        {"idx":0,"name":"0","path":".","type":"sentence_transformers.models.StaticEmbedding"}
-    ]"#;
-
-    let dir_norm = temp_st_dir(Some(WITH_NORMALIZE));
-    let dir_no_norm = temp_st_dir(Some(WITHOUT_NORMALIZE));
-
-    // Overwrite with a config that has no "normalize" key so modules.json is the source of truth.
-    let no_key_config = r#"{"model_type":"model2vec"}"#;
-    std::fs::write(dir_norm.path().join("config_sentence_transformers.json"), no_key_config).unwrap();
-    std::fs::write(
-        dir_no_norm.path().join("config_sentence_transformers.json"),
-        no_key_config,
-    )
-    .unwrap();
-
-    let model_norm = assert_loads(dir_norm.path().to_str().unwrap(), None);
-    let model_no_norm = assert_loads(dir_no_norm.path().to_str().unwrap(), None);
-
-    let norm_normalized = embedding_norm(&model_norm, "hello world");
-    let norm_unnormalized = embedding_norm(&model_no_norm, "hello world");
-
-    assert!(
-        (norm_normalized - 1.0).abs() < 1e-5,
-        "normalized model should have unit norm, got {norm_normalized}"
-    );
-    assert!(
-        norm_unnormalized > norm_normalized,
-        "un-normalized model should have larger norm"
-    );
 }
 
 /// Override of the `normalize` flag in from_pretrained works correctly
