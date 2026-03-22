@@ -87,11 +87,9 @@ fn match_hub_layout(
 }
 
 fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
-    // Native model2vec.
     if let r @ Some(_) = match_local_layout(folder, folder, "config.json", ModelLayout::Native) {
         return r;
     }
-    // Sentence Transformers root layout.
     if let r @ Some(_) = match_local_layout(
         folder,
         folder,
@@ -121,11 +119,9 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
 }
 
 fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
-    // Native model2vec.
     if let Some(r) = match_hub_layout(repo, prefix, prefix, "config.json", ModelLayout::Native) {
         return r;
     }
-    // Sentence Transformers root layout.
     if let Some(r) = match_hub_layout(
         repo,
         prefix,
@@ -291,6 +287,13 @@ impl StaticModel {
     /// * `normalize` - Whether to L2-normalize output embeddings
     /// * `weights` - Optional per-token weights for quantized models
     /// * `token_mapping` - Optional token ID mapping for quantized models
+    fn check_shape(len: usize, rows: usize, cols: usize) -> Result<()> {
+        if len != rows * cols {
+            return Err(anyhow!("embeddings length {} != rows {} * cols {}", len, rows, cols));
+        }
+        Ok(())
+    }
+
     pub fn from_owned(
         tokenizer: Tokenizer,
         embeddings: Vec<f32>,
@@ -300,14 +303,7 @@ impl StaticModel {
         weights: Option<Vec<f32>>,
         token_mapping: Option<Vec<usize>>,
     ) -> Result<Self> {
-        if embeddings.len() != rows * cols {
-            return Err(anyhow!(
-                "embeddings length {} != rows {} * cols {}",
-                embeddings.len(),
-                rows,
-                cols
-            ));
-        }
+        Self::check_shape(embeddings.len(), rows, cols)?;
 
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
 
@@ -345,14 +341,7 @@ impl StaticModel {
         weights: Option<&'static [f32]>,
         token_mapping: Option<&'static [usize]>,
     ) -> Result<Self> {
-        if embeddings.len() != rows * cols {
-            return Err(anyhow!(
-                "embeddings length {} != rows {} * cols {}",
-                embeddings.len(),
-                rows,
-                cols
-            ));
-        }
+        Self::check_shape(embeddings.len(), rows, cols)?;
 
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
 
@@ -375,10 +364,7 @@ impl StaticModel {
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
-        let spec_json = tokenizer
-            .to_string(false)
-            .map_err(|e| anyhow!("tokenizer -> JSON failed: {e}"))?;
-        let spec: Value = serde_json::from_str(&spec_json)?;
+        let spec: Value = serde_json::to_value(tokenizer).context("failed to serialize tokenizer")?;
         let unk_token = spec
             .get("model")
             .and_then(|m| m.get("unk_token"))
@@ -430,7 +416,7 @@ impl StaticModel {
                 .tokenizer
                 .encode_batch_fast::<String>(
                     truncated.into_iter().map(Into::into).collect(),
-                    /* add_special_tokens = */ false,
+                    false,
                 )
                 .expect("tokenization failed");
             for encoding in encodings {
