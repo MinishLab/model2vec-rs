@@ -62,32 +62,32 @@ fn match_hub_layout(
     config_file: &str,
     layout: ModelLayout,
 ) -> Option<Result<ResolvedPaths>> {
-    // Probe whether this layout exists: only a 404 means "not this layout".
-    // Any other error (auth, network) is a real failure and must propagate.
+    // 404 = not this layout; other errors (auth, network) propagate.
     let config_path = match repo.get(&format!("{config_prefix}{config_file}")) {
         Ok(path) => path,
         Err(e) if is_not_found(&e) => return None,
         Err(e) => return Some(Err(e.into())),
     };
-    // Config present — layout matched. Any further error is a real failure.
-    Some((|| {
-        let tokenizer_path = repo
-            .get(&format!("{model_prefix}tokenizer.json"))
-            .context("failed to download tokenizer.json")?;
-        let model_path = repo
-            .get(&format!("{model_prefix}model.safetensors"))
-            .context("failed to download model.safetensors")?;
-        Ok(ResolvedPaths {
-            config_path,
-            tokenizer_path,
-            model_path,
-            layout,
-        })
-    })())
+    let tokenizer_path = match repo.get(&format!("{model_prefix}tokenizer.json")) {
+        Ok(path) => path,
+        Err(e) if is_not_found(&e) => return None,
+        Err(e) => return Some(Err(e.into())),
+    };
+    let model_path = match repo.get(&format!("{model_prefix}model.safetensors")) {
+        Ok(path) => path,
+        Err(e) if is_not_found(&e) => return None,
+        Err(e) => return Some(Err(e.into())),
+    };
+    Some(Ok(ResolvedPaths {
+        config_path,
+        tokenizer_path,
+        model_path,
+        layout,
+    }))
 }
 
 fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
-    // Native model2vec, tried first to match Python model2vec layout resolution order.
+    // Native model2vec.
     if let r @ Some(_) = match_local_layout(folder, folder, "config.json", ModelLayout::Native) {
         return r;
     }
@@ -110,7 +110,7 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
     ) {
         return r;
     }
-    // Config lives one level up (caller pointed directly at the model-files directory).
+    // Config lives one level up.
     let parent = folder.parent()?;
     match_local_layout(
         parent,
@@ -121,7 +121,7 @@ fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
 }
 
 fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
-    // Native model2vec, tried first to match Python model2vec layout resolution order.
+    // Native model2vec.
     if let Some(r) = match_hub_layout(repo, prefix, prefix, "config.json", ModelLayout::Native) {
         return r;
     }
