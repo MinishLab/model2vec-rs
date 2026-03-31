@@ -43,18 +43,15 @@ impl StaticModel {
         M: AsRef<[u8]>,
         C: AsRef<[u8]>,
     {
-        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes)
-            .map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
 
         // Read normalize default from config.json
-        let cfg: Value = serde_json::from_slice(config_bytes.as_ref())
-            .context("failed to parse config.json")?;
+        let cfg: Value = serde_json::from_slice(config_bytes.as_ref()).context("failed to parse config.json")?;
         let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
         let normalize = normalize.unwrap_or(cfg_norm);
 
         // Load the safetensors
-        let safet = SafeTensors::deserialize(model_bytes.as_ref())
-            .context("failed to parse safetensors")?;
+        let safet = SafeTensors::deserialize(model_bytes.as_ref()).context("failed to parse safetensors")?;
         let tensor = safet
             .tensor("embeddings")
             .or_else(|_| safet.tensor("0"))
