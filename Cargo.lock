@@ -1288,7 +1288,6 @@ dependencies = [
  "esaxx-rs",
  "fancy-regex",
  "getrandom 0.3.3",
- "hf-hub",
  "indicatif",
  "itertools",
  "log",
