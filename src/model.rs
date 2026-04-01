@@ -1,11 +1,14 @@
 use anyhow::{anyhow, Context, Result};
 use half::f16;
+#[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::Api;
 use ndarray::{Array2, ArrayView2, CowArray, Ix2};
 use safetensors::{tensor::Dtype, SafeTensors};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::{env, fs, path::Path};
+#[cfg(feature = "hf-hub")]
+use std::env;
+use std::{fs, path::Path};
 use tokenizers::Tokenizer;
 
 /// Static embedding model for Model2Vec
@@ -379,9 +382,13 @@ fn resolve_model_files<P: AsRef<Path>>(
     token: Option<&str>,
     subfolder: Option<&str>,
 ) -> Result<ModelFiles> {
+    #[cfg(feature = "hf-hub")]
     if let Some(tok) = token {
         env::set_var("HF_HUB_TOKEN", tok);
     }
+
+    #[cfg(not(feature = "hf-hub"))]
+    let _ = token;
 
     let (tokenizer, model, config) = {
         let base = repo_or_path.as_ref();
@@ -395,14 +402,23 @@ fn resolve_model_files<P: AsRef<Path>>(
             }
             (tokenizer, model, config)
         } else {
-            let api = Api::new().context("hf-hub API init failed")?;
-            let repo = api.model(repo_or_path.as_ref().to_string_lossy().into_owned());
-            let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
-            (
-                repo.get(&format!("{prefix}tokenizer.json"))?,
-                repo.get(&format!("{prefix}model.safetensors"))?,
-                repo.get(&format!("{prefix}config.json"))?,
-            )
+            #[cfg(feature = "hf-hub")]
+            {
+                let api = Api::new().context("hf-hub API init failed")?;
+                let repo = api.model(repo_or_path.as_ref().to_string_lossy().into_owned());
+                let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
+                (
+                    repo.get(&format!("{prefix}tokenizer.json"))?,
+                    repo.get(&format!("{prefix}model.safetensors"))?,
+                    repo.get(&format!("{prefix}config.json"))?,
+                )
+            }
+            #[cfg(not(feature = "hf-hub"))]
+            {
+                return Err(anyhow!(
+                    "remote model downloads require the `hf-hub` feature; pass a local model directory instead"
+                ));
+            }
         }
     };
 
