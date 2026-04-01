@@ -382,11 +382,6 @@ fn resolve_model_files<P: AsRef<Path>>(
     token: Option<&str>,
     subfolder: Option<&str>,
 ) -> Result<ModelFiles> {
-    #[cfg(feature = "hf-hub")]
-    if let Some(tok) = token {
-        env::set_var("HF_HUB_TOKEN", tok);
-    }
-
     #[cfg(not(feature = "hf-hub"))]
     let _ = token;
 
@@ -404,14 +399,9 @@ fn resolve_model_files<P: AsRef<Path>>(
         } else {
             #[cfg(feature = "hf-hub")]
             {
-                let api = Api::new().context("hf-hub API init failed")?;
-                let repo = api.model(repo_or_path.as_ref().to_string_lossy().into_owned());
-                let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
-                (
-                    repo.get(&format!("{prefix}tokenizer.json"))?,
-                    repo.get(&format!("{prefix}model.safetensors"))?,
-                    repo.get(&format!("{prefix}config.json"))?,
-                )
+                let files =
+                    download_model_files(repo_or_path.as_ref().to_string_lossy().as_ref(), token, subfolder)?;
+                (files.tokenizer, files.model, files.config)
             }
             #[cfg(not(feature = "hf-hub"))]
             {
@@ -427,4 +417,33 @@ fn resolve_model_files<P: AsRef<Path>>(
         model,
         config,
     })
+}
+
+#[cfg(feature = "hf-hub")]
+fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&str>) -> Result<ModelFiles> {
+    let previous = token.and_then(|_| env::var_os("HF_HUB_TOKEN"));
+    if let Some(tok) = token {
+        env::set_var("HF_HUB_TOKEN", tok);
+    }
+
+    let result = (|| {
+        let api = Api::new().context("hf-hub API init failed")?;
+        let repo = api.model(repo_id.to_owned());
+        let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
+        Ok(ModelFiles {
+            tokenizer: repo.get(&format!("{prefix}tokenizer.json"))?,
+            model: repo.get(&format!("{prefix}model.safetensors"))?,
+            config: repo.get(&format!("{prefix}config.json"))?,
+        })
+    })();
+
+    if token.is_some() {
+        if let Some(value) = previous {
+            env::set_var("HF_HUB_TOKEN", value);
+        } else {
+            env::remove_var("HF_HUB_TOKEN");
+        }
+    }
+
+    result
 }
