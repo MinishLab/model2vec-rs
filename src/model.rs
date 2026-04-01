@@ -399,8 +399,7 @@ fn resolve_model_files<P: AsRef<Path>>(
         } else {
             #[cfg(feature = "hf-hub")]
             {
-                let files =
-                    download_model_files(repo_or_path.as_ref().to_string_lossy().as_ref(), token, subfolder)?;
+                let files = download_model_files(repo_or_path.as_ref().to_string_lossy().as_ref(), token, subfolder)?;
                 (files.tokenizer, files.model, files.config)
             }
             #[cfg(not(feature = "hf-hub"))]
