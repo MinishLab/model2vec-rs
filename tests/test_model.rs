@@ -122,3 +122,13 @@ fn test_from_bytes_matches_from_pretrained_for_local_model() {
         );
     }
 }
+
+#[cfg(not(feature = "hf-hub"))]
+#[test]
+fn test_from_pretrained_remote_requires_hf_hub_feature() {
+    let err = StaticModel::from_pretrained("minishlab/potion-base-2M", None, None, None).unwrap_err();
+    assert!(
+        err.to_string().contains("hf-hub"),
+        "expected remote loading without hf-hub to mention the missing feature"
+    );
+}
