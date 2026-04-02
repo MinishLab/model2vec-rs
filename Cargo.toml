@@ -16,6 +16,7 @@ exclude = ["tests/*"]
 [features]
 default      = ["onig", "hf-hub"]
 hf-hub       = ["dep:hf-hub"]
+local-only   = []
 onig         = ["tokenizers/onig",
                 "tokenizers/progressbar",
                 "tokenizers/esaxx_fast"]
@@ -23,6 +24,8 @@ onig         = ["tokenizers/onig",
 fancy-regex  = ["tokenizers/fancy-regex",
                 "tokenizers/progressbar",
                 "tokenizers/esaxx_fast"]
+wasm         = ["local-only",
+                "tokenizers/unstable_wasm"]
 
 [dependencies]
 tokenizers = { version = "0.21", default-features = false }

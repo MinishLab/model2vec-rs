@@ -145,6 +145,27 @@ cargo build --release
 *   **Batch Processing:** Encodes multiple sentences in batches.
 *   **Configurable Encoding:** Allows customization of maximum sequence length and batch size during encoding.
 
+### Feature flags
+
+The crate exposes a few feature combinations for different runtimes:
+
+* `default`: native build with `onig` tokenization and optional Hugging Face Hub downloads
+* `fancy-regex`: alternative tokenizer backend for native builds
+* `local-only`: restrict loading to local paths or `from_bytes(...)`
+* `wasm`: minimal WebAssembly-oriented feature set for local or in-memory loading
+
+The `wasm` feature is intended for `wasm32-unknown-unknown` builds that only load
+models from local files or in-memory bytes. Remote Hugging Face downloads are not
+available in this mode.
+
+For `wasm32-unknown-unknown`, `getrandom` also requires a target-specific backend
+configuration. The minimal check command is:
+
+```bash
+RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
+cargo check --no-default-features --features wasm --target wasm32-unknown-unknown
+```
+
 ## What is Model2Vec?
 
 Model2Vec is a technique to distill large sentence transformer models into highly efficient static embedding models. This process significantly reduces model size and computational requirements for inference. For a detailed understanding of how Model2Vec works, including the distillation process and model training, please refer to the [main Model2Vec Python repository](https://github.com/MinishLab/model2vec) and its [documentation](https://github.com/MinishLab/model2vec/blob/main/docs/what_is_model2vec.md).
