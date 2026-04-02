@@ -151,12 +151,21 @@ The crate exposes a few feature combinations for different runtimes:
 
 * `default`: native build with `onig` tokenization and optional Hugging Face Hub downloads
 * `fancy-regex`: alternative tokenizer backend for native builds
-* `local-only`: restrict loading to local paths or `from_bytes(...)`
-* `wasm`: minimal WebAssembly-oriented feature set for local or in-memory loading
+* `local-only`: disable remote model downloads and restrict loading to local paths or `from_bytes(...)`
+* `wasm`: minimal WebAssembly-oriented feature set for in-memory loading via `from_bytes(...)`
 
-The `wasm` feature is intended for `wasm32-unknown-unknown` builds that only load
-models from local files or in-memory bytes. Remote Hugging Face downloads are not
-available in this mode.
+Typical invocations are:
+
+* native local-only build:
+  `cargo build --no-default-features --features onig,local-only`
+* wasm check:
+  `RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check --no-default-features --features wasm --target wasm32-unknown-unknown`
+
+The `wasm` feature is intended for `wasm32-unknown-unknown` builds that load models
+from in-memory bytes, for example after fetching assets over HTTP or embedding them
+into the binary. Direct filesystem access is usually not available in browser-style
+WebAssembly environments, so callers should pass file contents through `from_bytes(...)`.
+Remote Hugging Face downloads are not available in this mode.
 
 For `wasm32-unknown-unknown`, `getrandom` also requires a target-specific backend
 configuration. The minimal check command is:

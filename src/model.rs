@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use half::f16;
-#[cfg(feature = "hf-hub")]
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
 use hf_hub::api::sync::Api;
 use ndarray::{Array2, ArrayView2, CowArray, Ix2};
 use safetensors::{tensor::Dtype, SafeTensors};
 use serde_json::Value;
 use std::borrow::Cow;
-#[cfg(feature = "hf-hub")]
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
 use std::env;
 use std::{fs, path::Path};
 use tokenizers::Tokenizer;
@@ -384,6 +384,8 @@ fn resolve_model_files<P: AsRef<Path>>(
 ) -> Result<ModelFiles> {
     #[cfg(not(feature = "hf-hub"))]
     let _ = token;
+    #[cfg(feature = "local-only")]
+    let _ = token;
 
     let (tokenizer, model, config) = {
         let base = repo_or_path.as_ref();
@@ -397,12 +399,18 @@ fn resolve_model_files<P: AsRef<Path>>(
             }
             (tokenizer, model, config)
         } else {
-            #[cfg(feature = "hf-hub")]
+            #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
             {
                 let files = download_model_files(repo_or_path.as_ref().to_string_lossy().as_ref(), token, subfolder)?;
                 (files.tokenizer, files.model, files.config)
             }
-            #[cfg(not(feature = "hf-hub"))]
+            #[cfg(feature = "local-only")]
+            {
+                return Err(anyhow!(
+                    "remote model downloads are disabled by the `local-only` feature; pass a local model directory instead"
+                ));
+            }
+            #[cfg(all(not(feature = "hf-hub"), not(feature = "local-only")))]
             {
                 return Err(anyhow!(
                     "remote model downloads require the `hf-hub` feature; pass a local model directory instead"
@@ -418,7 +426,7 @@ fn resolve_model_files<P: AsRef<Path>>(
     })
 }
 
-#[cfg(feature = "hf-hub")]
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
 fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&str>) -> Result<ModelFiles> {
     let previous = token.and_then(|_| env::var_os("HF_HUB_TOKEN"));
     if let Some(tok) = token {
