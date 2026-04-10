@@ -1,162 +1,18 @@
 use anyhow::{anyhow, Context, Result};
 use half::f16;
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
 use hf_hub::api::sync::{Api, ApiRepo};
 use ndarray::{Array2, ArrayView2, CowArray, Ix2};
 use safetensors::{tensor::Dtype, SafeTensors};
 use serde_json::Value;
 use std::borrow::Cow;
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+use std::env;
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
 };
 use tokenizers::Tokenizer;
-
-#[derive(Debug, Clone, Copy)]
-enum ModelLayout {
-    Native,
-    SentenceTransformers,
-}
-
-impl ModelLayout {
-    fn embedding_key(self) -> &'static str {
-        match self {
-            Self::Native => "embeddings",
-            Self::SentenceTransformers => "embedding.weight",
-        }
-    }
-}
-
-struct ResolvedPaths {
-    tokenizer_path: PathBuf,
-    model_path: PathBuf,
-    config_path: PathBuf,
-    layout: ModelLayout,
-}
-
-fn match_local_layout(
-    config_base: &Path,
-    model_base: &Path,
-    config_file: &str,
-    layout: ModelLayout,
-) -> Option<ResolvedPaths> {
-    let config_path = config_base.join(config_file);
-    let tokenizer_path = model_base.join("tokenizer.json");
-    let model_path = model_base.join("model.safetensors");
-    (config_path.exists() && tokenizer_path.exists() && model_path.exists()).then_some(ResolvedPaths {
-        config_path,
-        tokenizer_path,
-        model_path,
-        layout,
-    })
-}
-
-fn is_not_found(e: &hf_hub::api::sync::ApiError) -> bool {
-    use hf_hub::api::sync::ApiError;
-    matches!(e, ApiError::RequestError(e) if matches!(e.as_ref(), ureq::Error::Status(404, _)))
-}
-
-fn match_hub_layout(
-    repo: &ApiRepo,
-    config_prefix: &str,
-    model_prefix: &str,
-    config_file: &str,
-    layout: ModelLayout,
-) -> Option<Result<ResolvedPaths>> {
-    // 404 = not this layout; other errors (auth, network) propagate.
-    let config_path = match repo.get(&format!("{config_prefix}{config_file}")) {
-        Ok(path) => path,
-        Err(e) if is_not_found(&e) => return None,
-        Err(e) => return Some(Err(e.into())),
-    };
-    let tokenizer_path = match repo.get(&format!("{model_prefix}tokenizer.json")) {
-        Ok(path) => path,
-        Err(e) if is_not_found(&e) => return None,
-        Err(e) => return Some(Err(e.into())),
-    };
-    let model_path = match repo.get(&format!("{model_prefix}model.safetensors")) {
-        Ok(path) => path,
-        Err(e) if is_not_found(&e) => return None,
-        Err(e) => return Some(Err(e.into())),
-    };
-    Some(Ok(ResolvedPaths {
-        config_path,
-        tokenizer_path,
-        model_path,
-        layout,
-    }))
-}
-
-fn resolve_local(folder: &Path) -> Option<ResolvedPaths> {
-    if let r @ Some(_) = match_local_layout(folder, folder, "config.json", ModelLayout::Native) {
-        return r;
-    }
-    if let r @ Some(_) = match_local_layout(
-        folder,
-        folder,
-        "config_sentence_transformers.json",
-        ModelLayout::SentenceTransformers,
-    ) {
-        return r;
-    }
-    // Sentence Transformers with model files in 0_StaticEmbedding/.
-    let sub = folder.join("0_StaticEmbedding");
-    if let r @ Some(_) = match_local_layout(
-        folder,
-        &sub,
-        "config_sentence_transformers.json",
-        ModelLayout::SentenceTransformers,
-    ) {
-        return r;
-    }
-    // Config lives one level up.
-    let parent = folder.parent()?;
-    match_local_layout(
-        parent,
-        folder,
-        "config_sentence_transformers.json",
-        ModelLayout::SentenceTransformers,
-    )
-}
-
-fn resolve_hub(repo: &ApiRepo, prefix: &str) -> Result<ResolvedPaths> {
-    if let Some(r) = match_hub_layout(repo, prefix, prefix, "config.json", ModelLayout::Native) {
-        return r;
-    }
-    if let Some(r) = match_hub_layout(
-        repo,
-        prefix,
-        prefix,
-        "config_sentence_transformers.json",
-        ModelLayout::SentenceTransformers,
-    ) {
-        return r;
-    }
-    // Sentence Transformers with model files in 0_StaticEmbedding/.
-    let sub_prefix = format!("{prefix}0_StaticEmbedding/");
-    if let Some(r) = match_hub_layout(
-        repo,
-        prefix,
-        &sub_prefix,
-        "config_sentence_transformers.json",
-        ModelLayout::SentenceTransformers,
-    ) {
-        return r;
-    }
-    // Config lives one level up.
-    let trimmed = prefix.trim_end_matches('/');
-    let parent = match Path::new(trimmed).parent() {
-        Some(p) if !p.as_os_str().is_empty() => format!("{}/", p.display()),
-        _ => String::new(),
-    };
-    match_hub_layout(
-        repo,
-        &parent,
-        prefix,
-        "config_sentence_transformers.json",
-        ModelLayout::SentenceTransformers,
-    )
-    .unwrap_or_else(|| Err(anyhow!("no valid model layout found in '{prefix}'")))
-}
 
 /// Static embedding model for Model2Vec
 #[derive(Debug, Clone)]
@@ -170,59 +26,132 @@ pub struct StaticModel {
     unk_token_id: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+struct ModelFiles {
+    tokenizer: PathBuf,
+    model: PathBuf,
+    config: PathBuf,
+}
+
+fn match_local_layout(config_base: &Path, model_base: &Path, config_file: &str) -> Option<ModelFiles> {
+    let config = config_base.join(config_file);
+    let tokenizer = model_base.join("tokenizer.json");
+    let model = model_base.join("model.safetensors");
+    (config.exists() && tokenizer.exists() && model.exists()).then_some(ModelFiles {
+        tokenizer,
+        model,
+        config,
+    })
+}
+
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+fn is_not_found(e: &hf_hub::api::sync::ApiError) -> bool {
+    use hf_hub::api::sync::ApiError;
+
+    matches!(e, ApiError::RequestError(e) if matches!(e.as_ref(), ureq::Error::Status(404, _)))
+}
+
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+fn match_hub_layout(
+    repo: &ApiRepo,
+    config_prefix: &str,
+    model_prefix: &str,
+    config_file: &str,
+) -> Option<Result<ModelFiles>> {
+    let config = match repo.get(&format!("{config_prefix}{config_file}")) {
+        Ok(path) => path,
+        Err(e) if is_not_found(&e) => return None,
+        Err(e) => return Some(Err(e.into())),
+    };
+    let tokenizer = match repo.get(&format!("{model_prefix}tokenizer.json")) {
+        Ok(path) => path,
+        Err(e) if is_not_found(&e) => return None,
+        Err(e) => return Some(Err(e.into())),
+    };
+    let model = match repo.get(&format!("{model_prefix}model.safetensors")) {
+        Ok(path) => path,
+        Err(e) if is_not_found(&e) => return None,
+        Err(e) => return Some(Err(e.into())),
+    };
+
+    Some(Ok(ModelFiles {
+        tokenizer,
+        model,
+        config,
+    }))
+}
+
+fn resolve_local_model_files(folder: &Path) -> Option<ModelFiles> {
+    if let files @ Some(_) = match_local_layout(folder, folder, "config.json") {
+        return files;
+    }
+    if let files @ Some(_) = match_local_layout(folder, folder, "config_sentence_transformers.json") {
+        return files;
+    }
+
+    let sub = folder.join("0_StaticEmbedding");
+    if let files @ Some(_) = match_local_layout(folder, &sub, "config_sentence_transformers.json") {
+        return files;
+    }
+
+    let parent = folder.parent()?;
+    match_local_layout(parent, folder, "config_sentence_transformers.json")
+}
+
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+fn resolve_hub_model_files(repo: &ApiRepo, prefix: &str) -> Result<ModelFiles> {
+    if let Some(files) = match_hub_layout(repo, prefix, prefix, "config.json") {
+        return files;
+    }
+    if let Some(files) = match_hub_layout(repo, prefix, prefix, "config_sentence_transformers.json") {
+        return files;
+    }
+
+    let sub_prefix = format!("{prefix}0_StaticEmbedding/");
+    if let Some(files) = match_hub_layout(repo, prefix, &sub_prefix, "config_sentence_transformers.json") {
+        return files;
+    }
+
+    let trimmed = prefix.trim_end_matches('/');
+    let parent = match Path::new(trimmed).parent() {
+        Some(path) if !path.as_os_str().is_empty() => format!("{}/", path.display()),
+        _ => String::new(),
+    };
+
+    match_hub_layout(repo, &parent, prefix, "config_sentence_transformers.json")
+        .unwrap_or_else(|| Err(anyhow!("no valid model layout found in '{prefix}'")))
+}
+
 impl StaticModel {
-    /// Load a Model2Vec model from a local folder or the HuggingFace Hub.
+    /// Load a Model2Vec model directly from in-memory bytes.
     ///
-    /// # Arguments
-    /// * `repo_or_path` - HuggingFace repo ID or local path to the model folder.
-    /// * `token` - Optional HuggingFace token for authenticated downloads.
-    /// * `normalize` - Optional flag to normalize embeddings (default from config file).
-    /// * `subfolder` - Optional subfolder within the repo or path to look for model files.
-    pub fn from_pretrained<P: AsRef<Path>>(
-        repo_or_path: P,
-        token: Option<&str>,
+    /// This path is useful for runtimes that fetch model assets as bytes
+    /// rather than reading them from a local filesystem.
+    pub fn from_bytes<T, M, C>(
+        tokenizer_bytes: T,
+        model_bytes: M,
+        config_bytes: C,
         normalize: Option<bool>,
-        subfolder: Option<&str>,
-    ) -> Result<Self> {
-        if let Some(tok) = token {
-            env::set_var("HF_HUB_TOKEN", tok);
-        }
+    ) -> Result<Self>
+    where
+        T: AsRef<[u8]>,
+        M: AsRef<[u8]>,
+        C: AsRef<[u8]>,
+    {
+        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
 
-        let base = repo_or_path.as_ref();
-        let ResolvedPaths {
-            tokenizer_path: tok_path,
-            model_path: mdl_path,
-            config_path: cfg_path,
-            layout,
-        } = if base.exists() {
-            let folder = subfolder.map(|s| base.join(s)).unwrap_or_else(|| base.to_path_buf());
-            resolve_local(&folder).ok_or_else(|| {
-                anyhow!(
-                    "no valid model layout found in {folder:?}. \
-                     Tried: model2vec (config.json), sentence-transformers \
-                     (config_sentence_transformers.json), and 0_StaticEmbedding subfolder."
-                )
-            })?
-        } else {
-            let api = Api::new().context("hf-hub API init failed")?;
-            let repo = api.model(base.to_string_lossy().into_owned());
-            let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
-            resolve_hub(&repo, &prefix)
-                .with_context(|| format!("could not load '{}' from HuggingFace Hub", base.display()))?
-        };
+        // Read normalize default from config.json
+        let cfg: Value = serde_json::from_slice(config_bytes.as_ref()).context("failed to parse config.json")?;
+        let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
+        let normalize = normalize.unwrap_or(cfg_norm);
 
-        let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
-
-        let f = std::fs::File::open(&cfg_path).context("failed to read config")?;
-        let cfg: Value = serde_json::from_reader(f).context("failed to parse config")?;
-        let normalize = normalize.unwrap_or_else(|| cfg.get("normalize").and_then(Value::as_bool).unwrap_or(false));
-
-        let model_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
-        let safet = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
-        let emb_key = layout.embedding_key();
+        // Load the safetensors
+        let safet = SafeTensors::deserialize(model_bytes.as_ref()).context("failed to parse safetensors")?;
         let tensor = safet
-            .tensor(emb_key)
-            .with_context(|| format!("embedding tensor '{emb_key}' not found"))?;
+            .tensor("embeddings")
+            .or_else(|_| safet.tensor("0"))
+            .or_else(|_| safet.tensor("embedding.weight"))
+            .context("embeddings tensor not found")?;
 
         let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2-D")?;
         let raw = tensor.data();
@@ -275,6 +204,26 @@ impl StaticModel {
         };
 
         Self::from_owned(tokenizer, floats, rows, cols, normalize, weights, token_mapping)
+    }
+
+    /// Load a Model2Vec model from a local folder or the HuggingFace Hub.
+    ///
+    /// # Arguments
+    /// * `repo_or_path` - HuggingFace repo ID or local path to the model folder.
+    /// * `token` - Optional HuggingFace token for authenticated downloads.
+    /// * `normalize` - Optional flag to normalize embeddings (default from the resolved config file).
+    /// * `subfolder` - Optional subfolder within the repo or path to look for model files.
+    pub fn from_pretrained<P: AsRef<Path>>(
+        repo_or_path: P,
+        token: Option<&str>,
+        normalize: Option<bool>,
+        subfolder: Option<&str>,
+    ) -> Result<Self> {
+        let files = resolve_model_files(repo_or_path, token, subfolder)?;
+        let tokenizer_bytes = fs::read(&files.tokenizer).context("failed to read tokenizer.json")?;
+        let model_bytes = fs::read(&files.model).context("failed to read model.safetensors")?;
+        let config_bytes = fs::read(&files.config).context("failed to read config.json")?;
+        Self::from_bytes(tokenizer_bytes, model_bytes, config_bytes, normalize)
     }
 
     /// Construct from owned data.
@@ -414,10 +363,7 @@ impl StaticModel {
                 .collect();
             let encodings = self
                 .tokenizer
-                .encode_batch_fast::<String>(
-                    truncated.into_iter().map(Into::into).collect(),
-                    false,
-                )
+                .encode_batch_fast::<String>(truncated.into_iter().map(Into::into).collect(), false)
                 .expect("tokenization failed");
             for encoding in encodings {
                 let mut token_ids = encoding.get_ids().to_vec();
@@ -478,4 +424,68 @@ impl StaticModel {
         }
         sum
     }
+}
+
+fn resolve_model_files<P: AsRef<Path>>(
+    repo_or_path: P,
+    token: Option<&str>,
+    subfolder: Option<&str>,
+) -> Result<ModelFiles> {
+    #[cfg(any(not(feature = "hf-hub"), feature = "local-only"))]
+    let _ = token;
+
+    let base = repo_or_path.as_ref();
+    if base.exists() {
+        let folder = subfolder.map(|s| base.join(s)).unwrap_or_else(|| base.to_path_buf());
+        return resolve_local_model_files(&folder).ok_or_else(|| {
+            anyhow!(
+                "no valid model layout found in {folder:?}. \
+                 Tried: model2vec (config.json), sentence-transformers \
+                 (config_sentence_transformers.json), and 0_StaticEmbedding subfolder."
+            )
+        });
+    }
+
+    #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+    {
+        download_model_files(repo_or_path.as_ref().to_string_lossy().as_ref(), token, subfolder)
+    }
+    #[cfg(feature = "local-only")]
+    {
+        Err(anyhow!(
+            "remote model downloads are disabled by the `local-only` feature; pass a local model directory instead"
+        ))
+    }
+    #[cfg(all(not(feature = "hf-hub"), not(feature = "local-only")))]
+    {
+        Err(anyhow!(
+            "remote model downloads require the `hf-hub` feature; pass a local model directory instead"
+        ))
+    }
+}
+
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&str>) -> Result<ModelFiles> {
+    let previous = token.and_then(|_| env::var_os("HF_HUB_TOKEN"));
+    if let Some(tok) = token {
+        env::set_var("HF_HUB_TOKEN", tok);
+    }
+
+    let result = (|| {
+        let api = Api::new().context("hf-hub API init failed")?;
+        let repo = api.model(repo_id.to_owned());
+        let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
+        resolve_hub_model_files(&repo, &prefix)
+            .with_context(|| format!("could not load '{repo_id}' from HuggingFace Hub"))
+    })();
+
+    if token.is_some() {
+        if let Some(value) = previous {
+            env::set_var("HF_HUB_TOKEN", value);
+        } else {
+            env::remove_var("HF_HUB_TOKEN");
+        }
+    }
+
+    result
 }

@@ -14,23 +14,25 @@ categories = ["science", "text-processing"]
 exclude = ["tests/*"]
 
 [features]
-default      = ["onig"]
+default      = ["onig", "hf-hub"]
+hf-hub       = ["dep:hf-hub", "dep:ureq"]
+local-only   = []
 onig         = ["tokenizers/onig",
                 "tokenizers/progressbar",
-                "tokenizers/esaxx_fast",
-                "tokenizers/http"]
+                "tokenizers/esaxx_fast"]
 
 fancy-regex  = ["tokenizers/fancy-regex",
                 "tokenizers/progressbar",
-                "tokenizers/esaxx_fast",
-                "tokenizers/http"]
+                "tokenizers/esaxx_fast"]
+wasm         = ["local-only",
+                "tokenizers/unstable_wasm"]
 
 [dependencies]
 tokenizers = { version = "0.21", default-features = false }
 safetensors = "0.5"
 ndarray = "0.15"
-hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
-ureq = "2"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
+ureq = { version = "2", optional = true }
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
 serde_json = "1.0"

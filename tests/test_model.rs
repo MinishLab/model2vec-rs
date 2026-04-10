@@ -1,6 +1,7 @@
 mod common;
 use common::{assert_loads, embedding_norm, load_test_model, temp_both_configs_dir, temp_nested_st_dir};
 use model2vec_rs::model::StaticModel;
+use std::fs;
 
 /// Test that encoding an empty input slice yields an empty output
 #[test]
@@ -129,7 +130,6 @@ fn test_load_invalid_path_error() {
 #[test]
 fn test_from_borrowed() {
     use safetensors::SafeTensors;
-    use std::fs;
     use tokenizers::Tokenizer;
 
     let path = "tests/fixtures/test-model-float32";
@@ -150,4 +150,49 @@ fn test_from_borrowed() {
     let model = StaticModel::from_borrowed(tokenizer, floats, rows, cols, true, None, None).unwrap();
     let emb = model.encode_single("hello");
     assert!(!emb.is_empty());
+}
+
+#[test]
+fn test_from_bytes_matches_from_pretrained_for_local_model() {
+    let path = "tests/fixtures/test-model-float32";
+    let from_path = StaticModel::from_pretrained(path, None, None, None).unwrap();
+    let from_bytes = StaticModel::from_bytes(
+        fs::read(format!("{path}/tokenizer.json")).unwrap(),
+        fs::read(format!("{path}/model.safetensors")).unwrap(),
+        fs::read(format!("{path}/config.json")).unwrap(),
+        None,
+    )
+    .unwrap();
+
+    let query = "hello world";
+    let path_embedding = from_path.encode_single(query);
+    let bytes_embedding = from_bytes.encode_single(query);
+
+    assert_eq!(path_embedding.len(), bytes_embedding.len());
+    for (left, right) in path_embedding.iter().zip(bytes_embedding.iter()) {
+        assert!(
+            (left - right).abs() < 1e-6,
+            "expected byte-loaded model to match path-loaded model"
+        );
+    }
+}
+
+#[cfg(all(not(feature = "hf-hub"), not(feature = "local-only")))]
+#[test]
+fn test_from_pretrained_remote_requires_hf_hub_feature() {
+    let err = StaticModel::from_pretrained("minishlab/potion-base-2M", None, None, None).unwrap_err();
+    assert!(
+        err.to_string().contains("hf-hub"),
+        "expected remote loading without hf-hub to mention the missing feature"
+    );
+}
+
+#[cfg(feature = "local-only")]
+#[test]
+fn test_from_pretrained_remote_disallowed_by_local_only_feature() {
+    let err = StaticModel::from_pretrained("minishlab/potion-base-2M", None, None, None).unwrap_err();
+    assert!(
+        err.to_string().contains("local-only"),
+        "expected remote loading with local-only to mention the local-only restriction"
+    );
 }
