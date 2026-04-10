@@ -123,7 +123,7 @@ fn test_from_bytes_matches_from_pretrained_for_local_model() {
     }
 }
 
-#[cfg(not(feature = "hf-hub"))]
+#[cfg(all(not(feature = "hf-hub"), not(feature = "local-only")))]
 #[test]
 fn test_from_pretrained_remote_requires_hf_hub_feature() {
     let err = StaticModel::from_pretrained("minishlab/potion-base-2M", None, None, None).unwrap_err();
@@ -133,7 +133,7 @@ fn test_from_pretrained_remote_requires_hf_hub_feature() {
     );
 }
 
-#[cfg(all(feature = "hf-hub", feature = "local-only"))]
+#[cfg(feature = "local-only")]
 #[test]
 fn test_from_pretrained_remote_disallowed_by_local_only_feature() {
     let err = StaticModel::from_pretrained("minishlab/potion-base-2M", None, None, None).unwrap_err();
