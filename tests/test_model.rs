@@ -132,3 +132,13 @@ fn test_from_pretrained_remote_requires_hf_hub_feature() {
         "expected remote loading without hf-hub to mention the missing feature"
     );
 }
+
+#[cfg(all(feature = "hf-hub", feature = "local-only"))]
+#[test]
+fn test_from_pretrained_remote_disallowed_by_local_only_feature() {
+    let err = StaticModel::from_pretrained("minishlab/potion-base-2M", None, None, None).unwrap_err();
+    assert!(
+        err.to_string().contains("local-only"),
+        "expected remote loading with local-only to mention the local-only restriction"
+    );
+}
