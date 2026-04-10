@@ -226,6 +226,13 @@ impl StaticModel {
         Self::from_bytes(tokenizer_bytes, model_bytes, config_bytes, normalize)
     }
 
+    fn check_shape(len: usize, rows: usize, cols: usize) -> Result<()> {
+        if len != rows * cols {
+            return Err(anyhow!("embeddings length {} != rows {} * cols {}", len, rows, cols));
+        }
+        Ok(())
+    }
+
     /// Construct from owned data.
     ///
     /// # Arguments
@@ -236,13 +243,6 @@ impl StaticModel {
     /// * `normalize` - Whether to L2-normalize output embeddings
     /// * `weights` - Optional per-token weights for quantized models
     /// * `token_mapping` - Optional token ID mapping for quantized models
-    fn check_shape(len: usize, rows: usize, cols: usize) -> Result<()> {
-        if len != rows * cols {
-            return Err(anyhow!("embeddings length {} != rows {} * cols {}", len, rows, cols));
-        }
-        Ok(())
-    }
-
     pub fn from_owned(
         tokenizer: Tokenizer,
         embeddings: Vec<f32>,
@@ -253,12 +253,9 @@ impl StaticModel {
         token_mapping: Option<Vec<usize>>,
     ) -> Result<Self> {
         Self::check_shape(embeddings.len(), rows, cols)?;
-
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
-
         let embeddings =
             Array2::from_shape_vec((rows, cols), embeddings).context("failed to build embeddings array")?;
-
         Ok(Self {
             tokenizer,
             embeddings: CowArray::from(embeddings),
@@ -291,11 +288,8 @@ impl StaticModel {
         token_mapping: Option<&'static [usize]>,
     ) -> Result<Self> {
         Self::check_shape(embeddings.len(), rows, cols)?;
-
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
-
         let embeddings = ArrayView2::from_shape((rows, cols), embeddings).context("failed to build embeddings view")?;
-
         Ok(Self {
             tokenizer,
             embeddings: CowArray::from(embeddings),
@@ -332,11 +326,9 @@ impl StaticModel {
 
     /// Char-level truncation to max_tokens * median_token_length
     fn truncate_str(s: &str, max_tokens: usize, median_len: usize) -> &str {
-        let max_chars = max_tokens.saturating_mul(median_len);
-        match s.char_indices().nth(max_chars) {
-            Some((byte_idx, _)) => &s[..byte_idx],
-            None => s,
-        }
+        s.char_indices()
+            .nth(max_tokens.saturating_mul(median_len))
+            .map_or(s, |(byte_idx, _)| &s[..byte_idx])
     }
 
     /// Encode texts into embeddings.

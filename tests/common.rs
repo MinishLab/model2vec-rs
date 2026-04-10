@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use model2vec_rs::model::StaticModel;
-use std::fs;
+use std::{fs, path::Path};
 use tempfile::TempDir;
 
 pub fn load_test_model() -> StaticModel {
@@ -28,41 +28,29 @@ pub fn embedding_norm(model: &StaticModel, text: &str) -> f32 {
     emb[0].iter().map(|&x| x * x).sum::<f32>().sqrt()
 }
 
-const ST_CONFIG: &str = r#"{"normalize": true}"#;
-
-fn copy_native_blobs(dir: &std::path::Path) {
+fn copy_model_blobs(source: &Path, target: &Path) {
     for file in ["model.safetensors", "tokenizer.json"] {
-        fs::copy(format!("tests/fixtures/test-model-float32/{file}"), dir.join(file)).expect("copy fixture blob");
+        fs::copy(source.join(file), target.join(file)).expect("copy fixture blob");
     }
 }
 
-/// Both configs present: `config.json` has `normalize: false`,
-/// `config_sentence_transformers.json` has `normalize: true`.
-/// Uses native weights (embeddings tensor) so no cross-layout fallback is needed.
-pub fn temp_both_configs_dir() -> TempDir {
+pub fn temp_layout_dir(model_source: &str, model_target: &str, configs: &[(&str, &str)]) -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
-    copy_native_blobs(dir.path());
-    fs::write(dir.path().join("config_sentence_transformers.json"), ST_CONFIG).expect("write ST config");
-    fs::write(
-        dir.path().join("config.json"),
-        r#"{"model_type":"model2vec","normalize":false}"#,
-    )
-    .expect("write config.json");
-    dir
-}
+    let model_dir = if model_target.is_empty() {
+        dir.path().to_path_buf()
+    } else {
+        dir.path().join(model_target)
+    };
+    fs::create_dir_all(&model_dir).expect("create model dir");
+    copy_model_blobs(Path::new(model_source), &model_dir);
 
-pub fn temp_nested_st_dir() -> TempDir {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let base = dir.path().join("some/path");
-    let emb_dir = base.join("0_StaticEmbedding");
-    fs::create_dir_all(&emb_dir).expect("create nested dir");
-    for file in ["model.safetensors", "tokenizer.json"] {
-        fs::copy(
-            format!("tests/fixtures/test-model-sentence-transformers/{file}"),
-            emb_dir.join(file),
-        )
-        .expect("copy fixture blob");
+    for (config_rel, contents) in configs {
+        let config_path = dir.path().join(config_rel);
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent).expect("create config dir");
+        }
+        fs::write(config_path, contents).expect("write config");
     }
-    fs::write(base.join("config_sentence_transformers.json"), ST_CONFIG).expect("write nested ST config");
+
     dir
 }

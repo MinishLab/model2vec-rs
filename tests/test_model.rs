@@ -1,7 +1,12 @@
 mod common;
-use common::{assert_loads, embedding_norm, load_test_model, temp_both_configs_dir, temp_nested_st_dir};
+use common::{assert_loads, embedding_norm, load_test_model, temp_layout_dir};
 use model2vec_rs::model::StaticModel;
 use std::fs;
+
+const ST_CONFIG: &str = r#"{"normalize": true}"#;
+const NON_NORMALIZED_NATIVE_CONFIG: &str = r#"{"model_type":"model2vec","normalize":false}"#;
+const STATIC_EMBEDDING_SUBFOLDER: &str = "0_StaticEmbedding";
+const NESTED_STATIC_EMBEDDING_SUBFOLDER: &str = "some/path/0_StaticEmbedding";
 
 /// Test that encoding an empty input slice yields an empty output
 #[test]
@@ -35,25 +40,43 @@ fn test_encode_single() {
 /// All supported model layouts should load and produce non-empty embeddings
 #[test]
 fn test_all_layouts_load() {
-    let both = temp_both_configs_dir();
-    let nested = temp_nested_st_dir();
+    let both = temp_layout_dir(
+        "tests/fixtures/test-model-float32",
+        "",
+        &[
+            ("config_sentence_transformers.json", ST_CONFIG),
+            ("config.json", NON_NORMALIZED_NATIVE_CONFIG),
+        ],
+    );
+    let generated_static = temp_layout_dir(
+        "tests/fixtures/test-model-sentence-transformers",
+        STATIC_EMBEDDING_SUBFOLDER,
+        &[("config_sentence_transformers.json", ST_CONFIG)],
+    );
+    let nested = temp_layout_dir(
+        "tests/fixtures/test-model-sentence-transformers",
+        NESTED_STATIC_EMBEDDING_SUBFOLDER,
+        &[("some/path/config_sentence_transformers.json", ST_CONFIG)],
+    );
 
-    let cases: &[(&str, Option<&str>)] = &[
-        ("tests/fixtures/test-model-float32", None),
-        ("tests/fixtures/test-model-sentence-transformers", None),
-        ("tests/fixtures/test-model-static-embedding", None),
-        ("tests/fixtures/test-model-static-embedding", Some("0_StaticEmbedding")),
-        ("tests/fixtures/test-model-static-embedding/0_StaticEmbedding", None),
-        (both.path().to_str().unwrap(), None),
-        (nested.path().to_str().unwrap(), Some("some/path/0_StaticEmbedding")),
+    let generated_static_root = generated_static.path().display().to_string();
+    let nested_root = nested.path().display().to_string();
+    let cases = vec![
+        ("tests/fixtures/test-model-float32".to_string(), None),
+        ("tests/fixtures/test-model-sentence-transformers".to_string(), None),
+        (generated_static_root.clone(), None),
         (
-            &format!("{}/some/path/0_StaticEmbedding", nested.path().display()),
-            None,
+            generated_static_root.clone(),
+            Some(STATIC_EMBEDDING_SUBFOLDER.to_string()),
         ),
+        (format!("{generated_static_root}/{STATIC_EMBEDDING_SUBFOLDER}"), None),
+        (both.path().display().to_string(), None),
+        (nested_root.clone(), Some(NESTED_STATIC_EMBEDDING_SUBFOLDER.to_string())),
+        (format!("{nested_root}/{NESTED_STATIC_EMBEDDING_SUBFOLDER}"), None),
     ];
 
-    for &(path, subfolder) in cases {
-        let model = assert_loads(path, subfolder);
+    for (path, subfolder) in &cases {
+        let model = assert_loads(path, subfolder.as_deref());
         let emb = model.encode(&["hello".to_string()]);
         assert!(
             !emb[0].is_empty(),
@@ -67,7 +90,14 @@ fn test_all_layouts_load() {
 /// config.json has normalize=false so embeddings should not be unit-normalized.
 #[test]
 fn test_both_configs_prefers_native() {
-    let dir = temp_both_configs_dir();
+    let dir = temp_layout_dir(
+        "tests/fixtures/test-model-float32",
+        "",
+        &[
+            ("config_sentence_transformers.json", ST_CONFIG),
+            ("config.json", NON_NORMALIZED_NATIVE_CONFIG),
+        ],
+    );
     let model = assert_loads(dir.path().to_str().unwrap(), None);
     let norm = embedding_norm(&model, "hello world");
     assert!(
