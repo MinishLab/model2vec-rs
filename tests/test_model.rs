@@ -1,7 +1,12 @@
 mod common;
-use common::load_test_model;
+use common::{assert_loads, embedding_norm, load_test_model, temp_layout_dir};
 use model2vec_rs::model::StaticModel;
 use std::fs;
+
+const ST_CONFIG: &str = r#"{"normalize": true}"#;
+const NON_NORMALIZED_NATIVE_CONFIG: &str = r#"{"model_type":"model2vec","normalize":false}"#;
+const STATIC_EMBEDDING_SUBFOLDER: &str = "0_StaticEmbedding";
+const NESTED_STATIC_EMBEDDING_SUBFOLDER: &str = "some/path/0_StaticEmbedding";
 
 /// Test that encoding an empty input slice yields an empty output
 #[test]
@@ -17,8 +22,7 @@ fn test_encode_empty_sentence() {
     let model = load_test_model();
     let embs = model.encode(&["".to_string()]);
     assert_eq!(embs.len(), 1);
-    let vec = &embs[0];
-    assert!(vec.iter().all(|&x| x == 0.0), "All entries should be zero");
+    assert!(embs[0].iter().all(|&x| x == 0.0), "All entries should be zero");
 }
 
 /// Test that encoding a single sentence returns the correct shape
@@ -26,49 +30,129 @@ fn test_encode_empty_sentence() {
 fn test_encode_single() {
     let model = load_test_model();
     let sentence = "hello world";
-
-    // Single-sentence helper → 1-D
     let one_d = model.encode_single(sentence);
-
-    // Batch call with a 1-element slice → 2-D wrapper
     let two_d = model.encode(&[sentence.to_string()]);
-
-    // Shape assertions
     assert!(!one_d.is_empty(), "encode_single must return a non-empty 1-D vector");
-    assert_eq!(
-        two_d.len(),
-        1,
-        "encode(&[..]) should wrap the result in a Vec with length 1"
+    assert_eq!(two_d.len(), 1);
+    assert_eq!(two_d[0].len(), one_d.len());
+}
+
+/// All supported model layouts should load and produce non-empty embeddings
+#[test]
+fn test_all_layouts_load() {
+    let both = temp_layout_dir(
+        "tests/fixtures/test-model-float32",
+        "",
+        &[
+            ("config_sentence_transformers.json", ST_CONFIG),
+            ("config.json", NON_NORMALIZED_NATIVE_CONFIG),
+        ],
     );
-    assert_eq!(
-        two_d[0].len(),
-        one_d.len(),
-        "inner vector dimensionality should match encode_single output"
+    let generated_static = temp_layout_dir(
+        "tests/fixtures/test-model-sentence-transformers",
+        STATIC_EMBEDDING_SUBFOLDER,
+        &[("config_sentence_transformers.json", ST_CONFIG)],
+    );
+    let nested = temp_layout_dir(
+        "tests/fixtures/test-model-sentence-transformers",
+        NESTED_STATIC_EMBEDDING_SUBFOLDER,
+        &[("some/path/config_sentence_transformers.json", ST_CONFIG)],
+    );
+
+    let generated_static_root = generated_static.path().display().to_string();
+    let nested_root = nested.path().display().to_string();
+    let cases = vec![
+        ("tests/fixtures/test-model-float32".to_string(), None),
+        ("tests/fixtures/test-model-sentence-transformers".to_string(), None),
+        (generated_static_root.clone(), None),
+        (
+            generated_static_root.clone(),
+            Some(STATIC_EMBEDDING_SUBFOLDER.to_string()),
+        ),
+        (format!("{generated_static_root}/{STATIC_EMBEDDING_SUBFOLDER}"), None),
+        (both.path().display().to_string(), None),
+        (nested_root.clone(), Some(NESTED_STATIC_EMBEDDING_SUBFOLDER.to_string())),
+        (format!("{nested_root}/{NESTED_STATIC_EMBEDDING_SUBFOLDER}"), None),
+    ];
+
+    for (path, subfolder) in &cases {
+        let model = assert_loads(path, subfolder.as_deref());
+        let emb = model.encode(&["hello".to_string()]);
+        assert!(
+            !emb[0].is_empty(),
+            "empty embedding for path={path:?} subfolder={subfolder:?}"
+        );
+    }
+}
+
+/// When both config.json and config_sentence_transformers.json are present, native wins
+/// (config.json), matching Python model2vec layout resolution order.
+/// config.json has normalize=false so embeddings should not be unit-normalized.
+#[test]
+fn test_both_configs_prefers_native() {
+    let dir = temp_layout_dir(
+        "tests/fixtures/test-model-float32",
+        "",
+        &[
+            ("config_sentence_transformers.json", ST_CONFIG),
+            ("config.json", NON_NORMALIZED_NATIVE_CONFIG),
+        ],
+    );
+    let model = assert_loads(dir.path().to_str().unwrap(), None);
+    let norm = embedding_norm(&model, "hello world");
+    assert!(
+        (norm - 1.0).abs() > 1e-3,
+        "expected non-unit norm (native config.json wins with normalize=false), got {norm}"
     );
 }
 
-/// Test override of `normalize` flag in from_pretrained
+/// ST and native model2vec layouts with the same weights should give identical embeddings
+#[test]
+fn test_sentence_transformers_matches_model2vec() {
+    let model_m2v = StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, None, None).unwrap();
+    let model_st =
+        StaticModel::from_pretrained("tests/fixtures/test-model-sentence-transformers", None, None, None).unwrap();
+    let sentences = vec!["hello".to_string(), "world test sentence".to_string()];
+    for (a, b) in model_m2v
+        .encode(&sentences)
+        .iter()
+        .zip(model_st.encode(&sentences).iter())
+    {
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-5, "embeddings should match: {x} vs {y}");
+        }
+    }
+}
+
+/// Override of the `normalize` flag in from_pretrained works correctly
 #[test]
 fn test_normalization_flag_override() {
-    // Load with normalize = true (default in config)
     let model_norm = StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, None, None).unwrap();
-    let emb_norm = model_norm.encode(&["test sentence".to_string()])[0].clone();
-    let norm_norm = emb_norm.iter().map(|&x| x * x).sum::<f32>().sqrt();
-
-    // Load with normalize = false override
     let model_no_norm =
         StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, Some(false), None).unwrap();
-    let emb_no = model_no_norm.encode(&["test sentence".to_string()])[0].clone();
-    let norm_no = emb_no.iter().map(|&x| x * x).sum::<f32>().sqrt();
 
-    // Normalized version should have unit length, override should give larger norm
+    let norm_norm = embedding_norm(&model_norm, "test sentence");
+    let norm_no = embedding_norm(&model_no_norm, "test sentence");
+
     assert!(
         (norm_norm - 1.0).abs() < 1e-5,
-        "Normalized vector should have unit norm"
+        "normalized vector should have unit norm"
     );
     assert!(
         norm_no > norm_norm,
-        "Without normalization override, norm should be larger"
+        "without normalization override, norm should be larger"
+    );
+}
+
+/// A path that matches no known layout returns a helpful error
+#[test]
+fn test_load_invalid_path_error() {
+    let result = StaticModel::from_pretrained("tests/fixtures", None, None, None);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("no valid model layout"),
+        "error should mention layout: {msg}"
     );
 }
 

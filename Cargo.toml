@@ -15,7 +15,7 @@ exclude = ["tests/*"]
 
 [features]
 default      = ["onig", "hf-hub"]
-hf-hub       = ["dep:hf-hub"]
+hf-hub       = ["dep:hf-hub", "dep:ureq"]
 local-only   = []
 onig         = ["tokenizers/onig",
                 "tokenizers/progressbar",
@@ -32,6 +32,7 @@ tokenizers = { version = "0.21", default-features = false }
 safetensors = "0.5"
 ndarray = "0.15"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
+ureq = { version = "2", optional = true }
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
 serde_json = "1.0"
@@ -40,3 +41,4 @@ half = "2.0"
 [dev-dependencies]
 approx = "0.5"
 serde_json = "1.0"
+tempfile = "3"
