@@ -91,9 +91,9 @@ fn main() -> Result<()> {
 }
 ```
 
-**c. Loading from in-memory bytes (`wasm` / embedded use cases):**
+**Alternative: Loading from in-memory bytes (`wasm` / embedded use cases):**
 
-When filesystem access is unavailable, such as in WebAssembly environments or when model files are fetched over HTTP, use `from_bytes` instead:
+When filesystem access is unavailable, use `from_bytes` instead of `from_pretrained`:
 
 ```rust
 use model2vec_rs::model::StaticModel;
@@ -108,7 +108,7 @@ let model = StaticModel::from_bytes(
 let embeddings = model.encode(&["Hello world".to_string()]);
 ```
 
-This is the intended loading path for the `wasm` and `local-only` feature configurations.
+See the [feature flags](#feature-flags) section for `wasm` and `local-only` build configurations.
 
 ---
 
@@ -136,25 +136,6 @@ The compiled binary installed via `cargo install` is significantly faster (often
     model2vec-rs encode my_texts.txt "minishlab/potion-base-8M" --output embeddings_output.json
     ```
 
-**c. (Alternative for Developers) Running CLI from a cloned repository:**
-
-```shell
-# Clone and navigate to the repository directory
-git clone https://github.com/MinishLab/model2vec-rs.git
-cd model2vec-rs
-
-# Build and run with release optimizations (recommended for better performance):
-cargo run --release -- encode "Hello world" "minishlab/potion-base-8M"
-
-# For quicker development cycles instead (slower execution):
-cargo run -- encode "Hello world" "minishlab/potion-base-8M"
-
-# Alternatively, build the executable first:
-cargo build --release
-
-# Then run with:
-./target/release/model2vec-rs encode "Hello world" "minishlab/potion-base-8M"
-```
 
 ## Features
 
@@ -174,23 +155,13 @@ The crate exposes a few feature combinations for different runtimes:
 * `local-only`: disable remote model downloads and restrict loading to local paths or `from_bytes(...)`
 * `wasm`: minimal WebAssembly-oriented feature set for in-memory loading via `from_bytes(...)`
 
-Typical invocations are:
-
-* native local-only build:
-  `cargo build --no-default-features --features onig,local-only`
-* wasm check:
-  `RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check --no-default-features --features wasm --target wasm32-unknown-unknown`
-
-The `wasm` feature is intended for `wasm32-unknown-unknown` builds that load models
-from in-memory bytes, for example after fetching assets over HTTP or embedding them
-into the binary. Direct filesystem access is usually not available in browser-style
-WebAssembly environments, so callers should pass file contents through `from_bytes(...)`.
-Remote Hugging Face downloads are not available in this mode.
-
-For `wasm32-unknown-unknown`, `getrandom` also requires a target-specific backend
-configuration. The minimal check command is:
+Typical invocations:
 
 ```bash
+# native local-only build
+cargo build --no-default-features --features onig,local-only
+
+# wasm (requires getrandom backend config)
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \
 cargo check --no-default-features --features wasm --target wasm32-unknown-unknown
 ```
@@ -210,7 +181,7 @@ A variety of pre-trained Model2Vec models are available on the [HuggingFace Hub 
 | [potion-base-32M](https://huggingface.co/minishlab/potion-base-32M)   | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 32.3M   | General   |
 | [potion-multilingual-128M](https://huggingface.co/minishlab/potion-multilingual-128M) | Multilingual | [bge-m3](https://huggingface.co/BAAI/bge-m3)      | 128M    | General   |
 | [potion-retrieval-32M](https://huggingface.co/minishlab/potion-retrieval-32M) | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 32.3M   | Retrieval |
-| [potion-code-16M](https://huggingface.co/minishlab/potion-code-16M)           | Code       | [codebert-base](https://huggingface.co/microsoft/codebert-base)   | 16M     | Code      |
+| [potion-code-16M](https://huggingface.co/minishlab/potion-code-16M)           | Code       | [CodeRankEmbed](https://huggingface.co/nomic-ai/CodeRankEmbed)    | 16M     | Code      |
 | [potion-base-8M](https://huggingface.co/minishlab/potion-base-8M)     | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 7.5M    | General   |
 | [potion-base-4M](https://huggingface.co/minishlab/potion-base-4M)     | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 3.7M    | General   |
 | [potion-base-2M](https://huggingface.co/minishlab/potion-base-2M)     | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 1.8M    | General   |
