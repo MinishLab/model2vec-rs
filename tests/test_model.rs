@@ -42,7 +42,7 @@ fn test_encode_single() {
 fn test_all_layouts_load() {
     let both = temp_layout_dir(
         "tests/fixtures/test-model-float32",
-        "",
+        None,
         &[
             ("config_sentence_transformers.json", ST_CONFIG),
             ("config.json", NON_NORMALIZED_NATIVE_CONFIG),
@@ -50,12 +50,12 @@ fn test_all_layouts_load() {
     );
     let generated_static = temp_layout_dir(
         "tests/fixtures/test-model-sentence-transformers",
-        STATIC_EMBEDDING_SUBFOLDER,
+        Some(STATIC_EMBEDDING_SUBFOLDER),
         &[("config_sentence_transformers.json", ST_CONFIG)],
     );
     let nested = temp_layout_dir(
         "tests/fixtures/test-model-sentence-transformers",
-        NESTED_STATIC_EMBEDDING_SUBFOLDER,
+        Some(NESTED_STATIC_EMBEDDING_SUBFOLDER),
         &[("some/path/config_sentence_transformers.json", ST_CONFIG)],
     );
 
@@ -92,7 +92,7 @@ fn test_all_layouts_load() {
 fn test_both_configs_prefers_native() {
     let dir = temp_layout_dir(
         "tests/fixtures/test-model-float32",
-        "",
+        None,
         &[
             ("config_sentence_transformers.json", ST_CONFIG),
             ("config.json", NON_NORMALIZED_NATIVE_CONFIG),

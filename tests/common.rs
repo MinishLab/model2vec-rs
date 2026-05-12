@@ -34,12 +34,11 @@ fn copy_model_blobs(source: &Path, target: &Path) {
     }
 }
 
-pub fn temp_layout_dir(model_source: &str, model_target: &str, configs: &[(&str, &str)]) -> TempDir {
+pub fn temp_layout_dir(model_source: &str, model_target: Option<&str>, configs: &[(&str, &str)]) -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
-    let model_dir = if model_target.is_empty() {
-        dir.path().to_path_buf()
-    } else {
-        dir.path().join(model_target)
+    let model_dir = match model_target {
+        Some(sub) => dir.path().join(sub),
+        None => dir.path().to_path_buf(),
     };
     fs::create_dir_all(&model_dir).expect("create model dir");
     copy_model_blobs(Path::new(model_source), &model_dir);
