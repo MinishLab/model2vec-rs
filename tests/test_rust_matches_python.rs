@@ -10,8 +10,16 @@ fn check_fixture(model: &StaticModel, fixture_path: &str, inputs: Vec<String>) {
     let expected: Vec<Vec<f32>> = serde_json::from_str(&fixture).expect("failed to parse fixture");
     let output = model.encode(&inputs);
 
-    assert_eq!(output.len(), expected.len(), "sentence count mismatch for {fixture_path}");
-    assert_eq!(output[0].len(), expected[0].len(), "dimension mismatch for {fixture_path}");
+    assert_eq!(
+        output.len(),
+        expected.len(),
+        "sentence count mismatch for {fixture_path}"
+    );
+    assert_eq!(
+        output[0].len(),
+        expected[0].len(),
+        "dimension mismatch for {fixture_path}"
+    );
     for (o, e) in output[0].iter().zip(&expected[0]) {
         assert_relative_eq!(o, e, max_relative = 1e-5);
     }
@@ -21,7 +29,11 @@ fn check_fixture(model: &StaticModel, fixture_path: &str, inputs: Vec<String>) {
 fn test_encode_matches_python_model2vec() {
     let model = load_test_model();
     let long_text = vec!["hello"; 1000].join(" ");
-    check_fixture(&model, "tests/fixtures/embeddings_short.json", vec!["hello world".to_string()]);
+    check_fixture(
+        &model,
+        "tests/fixtures/embeddings_short.json",
+        vec!["hello world".to_string()],
+    );
     check_fixture(&model, "tests/fixtures/embeddings_long.json", vec![long_text]);
 }
 
@@ -29,5 +41,9 @@ fn test_encode_matches_python_model2vec() {
 fn test_encode_matches_python_model2vec_vocab_quantized() {
     let model = load_test_model_vocab_quantized();
     let long_text = vec!["hello"; 1000].join(" ");
-    check_fixture(&model, "tests/fixtures/embeddings_vocab_quantized.json", vec![long_text]);
+    check_fixture(
+        &model,
+        "tests/fixtures/embeddings_vocab_quantized.json",
+        vec![long_text],
+    );
 }

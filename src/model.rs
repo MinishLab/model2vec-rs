@@ -65,17 +65,37 @@ fn match_hub_layout(
             Err(e) => Err(e.into()),
         }
     };
-    let Some(config) = fetch(format!("{config_prefix}{config_file}"))? else { return Ok(None) };
-    let Some(tokenizer) = fetch(format!("{model_prefix}tokenizer.json"))? else { return Ok(None) };
-    let Some(model) = fetch(format!("{model_prefix}model.safetensors"))? else { return Ok(None) };
-    Ok(Some(ModelFiles { tokenizer, model, config }))
+    let Some(config) = fetch(format!("{config_prefix}{config_file}"))? else {
+        return Ok(None);
+    };
+    let Some(tokenizer) = fetch(format!("{model_prefix}tokenizer.json"))? else {
+        return Ok(None);
+    };
+    let Some(model) = fetch(format!("{model_prefix}model.safetensors"))? else {
+        return Ok(None);
+    };
+    Ok(Some(ModelFiles {
+        tokenizer,
+        model,
+        config,
+    }))
 }
 
 fn resolve_local_model_files(folder: &Path) -> Option<ModelFiles> {
     match_local_layout(folder, folder, "config.json")
         .or_else(|| match_local_layout(folder, folder, "config_sentence_transformers.json"))
-        .or_else(|| match_local_layout(folder, &folder.join("0_StaticEmbedding"), "config_sentence_transformers.json"))
-        .or_else(|| folder.parent().and_then(|p| match_local_layout(p, folder, "config_sentence_transformers.json")))
+        .or_else(|| {
+            match_local_layout(
+                folder,
+                &folder.join("0_StaticEmbedding"),
+                "config_sentence_transformers.json",
+            )
+        })
+        .or_else(|| {
+            folder
+                .parent()
+                .and_then(|p| match_local_layout(p, folder, "config_sentence_transformers.json"))
+        })
 }
 
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
@@ -87,9 +107,15 @@ fn resolve_hub_model_files(repo: &ApiRepo, prefix: &str) -> Result<ModelFiles> {
         _ => String::new(),
     };
 
-    if let Some(f) = match_hub_layout(repo, prefix, prefix, "config.json")? { return Ok(f); }
-    if let Some(f) = match_hub_layout(repo, prefix, prefix, "config_sentence_transformers.json")? { return Ok(f); }
-    if let Some(f) = match_hub_layout(repo, prefix, &sub_prefix, "config_sentence_transformers.json")? { return Ok(f); }
+    if let Some(f) = match_hub_layout(repo, prefix, prefix, "config.json")? {
+        return Ok(f);
+    }
+    if let Some(f) = match_hub_layout(repo, prefix, prefix, "config_sentence_transformers.json")? {
+        return Ok(f);
+    }
+    if let Some(f) = match_hub_layout(repo, prefix, &sub_prefix, "config_sentence_transformers.json")? {
+        return Ok(f);
+    }
     match_hub_layout(repo, &parent, prefix, "config_sentence_transformers.json")?
         .ok_or_else(|| anyhow!("no valid model layout found in '{prefix}'"))
 }
@@ -218,7 +244,12 @@ impl StaticModel {
         token_mapping: Option<Vec<usize>>,
     ) -> Result<Self> {
         if embeddings.len() != rows * cols {
-            return Err(anyhow!("embeddings length {} != rows {} * cols {}", embeddings.len(), rows, cols));
+            return Err(anyhow!(
+                "embeddings length {} != rows {} * cols {}",
+                embeddings.len(),
+                rows,
+                cols
+            ));
         }
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
         let embeddings =
@@ -255,7 +286,12 @@ impl StaticModel {
         token_mapping: Option<&'static [usize]>,
     ) -> Result<Self> {
         if embeddings.len() != rows * cols {
-            return Err(anyhow!("embeddings length {} != rows {} * cols {}", embeddings.len(), rows, cols));
+            return Err(anyhow!(
+                "embeddings length {} != rows {} * cols {}",
+                embeddings.len(),
+                rows,
+                cols
+            ));
         }
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
         let embeddings = ArrayView2::from_shape((rows, cols), embeddings).context("failed to build embeddings view")?;

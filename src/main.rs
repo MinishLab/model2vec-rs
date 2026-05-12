@@ -62,7 +62,11 @@ fn main() -> Result<()> {
             let embs = StaticModel::from_pretrained(&model, None, None, None)?.encode(&texts);
             write_output(&embs, output)?;
         }
-        Commands::EncodeSingle { sentence, model, output } => {
+        Commands::EncodeSingle {
+            sentence,
+            model,
+            output,
+        } => {
             let embedding = StaticModel::from_pretrained(&model, None, None, None)?.encode_single(&sentence);
             write_output(&embedding, output)?;
         }
