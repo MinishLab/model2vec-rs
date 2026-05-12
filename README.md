@@ -209,12 +209,15 @@ MIT
 
 ## Citing Model2Vec
 
-If you use the Model2Vec methodology or models in your research or work, please cite the original Model2Vec project:
+If you use Model2Vec in your research, please cite the following:
 ```bibtex
-@article{minishlab2024model2vec,
-  author = {Tulkens, Stephan and {van Dongen}, Thomas},
-  title = {Model2Vec: Fast State-of-the-Art Static Embeddings},
-  year = {2024},
-  url = {https://github.com/MinishLab/model2vec}
+@software{minishlab2024model2vec,
+  author       = {Stephan Tulkens and {van Dongen}, Thomas},
+  title        = {Model2Vec: Fast State-of-the-Art Static Embeddings},
+  year         = {2024},
+  publisher    = {Zenodo},
+  doi          = {10.5281/zenodo.17270888},
+  url          = {https://github.com/MinishLab/model2vec},
+  license      = {MIT}
 }
 ```
