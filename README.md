@@ -91,6 +91,25 @@ fn main() -> Result<()> {
 }
 ```
 
+**c. Loading from in-memory bytes (`wasm` / embedded use cases):**
+
+When filesystem access is unavailable, such as in WebAssembly environments or when model files are fetched over HTTP, use `from_bytes` instead:
+
+```rust
+use model2vec_rs::model::StaticModel;
+
+let model = StaticModel::from_bytes(
+    include_bytes!("path/to/tokenizer.json").as_ref(),
+    include_bytes!("path/to/model.safetensors").as_ref(),
+    include_bytes!("path/to/config.json").as_ref(),
+    None, // normalize: None reads the value from config.json
+)?;
+
+let embeddings = model.encode(&["Hello world".to_string()]);
+```
+
+This is the intended loading path for the `wasm` and `local-only` feature configurations.
+
 ---
 
 ### 2. Using the `model2vec-rs` CLI
@@ -142,6 +161,7 @@ cargo build --release
 *   **Fast Inference:** Optimized Rust implementation for fast embedding generation.
 *   **Hugging Face Hub Integration:** Load pre-trained Model2Vec models directly from the Hugging Face Hub using model IDs, or use models from local paths.
 *   **Model Formats:** Supports models with f32, f16, and i8 weight types stored in `safetensors` files.
+*   **Flexible Loading:** Load models from the Hub (`from_pretrained`), raw bytes (`from_bytes`), or owned/borrowed data (`from_owned`, `from_borrowed`) for embedded and WASM use cases.
 *   **Batch Processing:** Encodes multiple sentences in batches.
 *   **Configurable Encoding:** Allows customization of maximum sequence length and batch size during encoding.
 
@@ -190,6 +210,7 @@ A variety of pre-trained Model2Vec models are available on the [HuggingFace Hub 
 | [potion-base-32M](https://huggingface.co/minishlab/potion-base-32M)   | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 32.3M   | General   |
 | [potion-multilingual-128M](https://huggingface.co/minishlab/potion-multilingual-128M) | Multilingual | [bge-m3](https://huggingface.co/BAAI/bge-m3)      | 128M    | General   |
 | [potion-retrieval-32M](https://huggingface.co/minishlab/potion-retrieval-32M) | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 32.3M   | Retrieval |
+| [potion-code-16M](https://huggingface.co/minishlab/potion-code-16M)           | Code       | [codebert-base](https://huggingface.co/microsoft/codebert-base)   | 16M     | Code      |
 | [potion-base-8M](https://huggingface.co/minishlab/potion-base-8M)     | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 7.5M    | General   |
 | [potion-base-4M](https://huggingface.co/minishlab/potion-base-4M)     | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 3.7M    | General   |
 | [potion-base-2M](https://huggingface.co/minishlab/potion-base-2M)     | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 1.8M    | General   |
