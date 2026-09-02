@@ -1,13 +1,11 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use half::f16;
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
-use hf_hub::api::sync::{Api, ApiRepo};
+use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
 use ndarray::{Array2, ArrayView2, CowArray, Ix2};
-use safetensors::{tensor::Dtype, SafeTensors};
+use safetensors::{SafeTensors, tensor::Dtype};
 use serde_json::Value;
 use std::borrow::Cow;
-#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
-use std::env;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -47,12 +45,16 @@ fn match_local_layout(config_base: &Path, model_base: &Path, config_file: &str) 
 fn decode_token_mapping(dtype: Dtype, raw: &[u8]) -> Result<Vec<usize>> {
     let mapping = match dtype {
         Dtype::I64 => raw
-            .chunks_exact(8)
-            .map(|b| i64::from_le_bytes(b.try_into().unwrap()) as usize)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&b| i64::from_le_bytes(b) as usize)
             .collect(),
         Dtype::I32 => raw
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as usize)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| i32::from_le_bytes(b) as usize)
             .collect(),
         other => return Err(anyhow!("unsupported mapping dtype: {:?}", other)),
     };
@@ -170,13 +172,12 @@ impl StaticModel {
         let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2-D")?;
         let raw = tensor.data();
         let floats: Vec<f32> = match tensor.dtype() {
-            Dtype::F32 => raw
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect(),
+            Dtype::F32 => raw.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect(),
             Dtype::F16 => raw
-                .chunks_exact(2)
-                .map(|b| f16::from_le_bytes(b.try_into().unwrap()).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| f16::from_le_bytes(b).to_f32())
                 .collect(),
             Dtype::I8 => raw.iter().map(|&b| f32::from(b as i8)).collect(),
             other => return Err(anyhow!("unsupported tensor dtype: {other:?}")),
@@ -187,16 +188,17 @@ impl StaticModel {
                 let raw = t.data();
                 let v: Vec<f32> = match t.dtype() {
                     Dtype::F64 => raw
-                        .chunks_exact(8)
-                        .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|&b| f64::from_le_bytes(b) as f32)
                         .collect(),
-                    Dtype::F32 => raw
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                        .collect(),
+                    Dtype::F32 => raw.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect(),
                     Dtype::F16 => raw
-                        .chunks_exact(2)
-                        .map(|b| half::f16::from_le_bytes(b.try_into().unwrap()).to_f32())
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&b| half::f16::from_le_bytes(b).to_f32())
                         .collect(),
                     other => return Err(anyhow!("unsupported weights dtype: {:?}", other)),
                 };
@@ -472,28 +474,14 @@ fn resolve_model_files<P: AsRef<Path>>(
 
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
 fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&str>) -> Result<ModelFiles> {
-    let previous = token.and_then(|_| env::var_os("HF_HUB_TOKEN"));
-    if let Some(tok) = token {
-        env::set_var("HF_HUB_TOKEN", tok);
+    let api = match token {
+        Some(token) => ApiBuilder::new().with_token(Some(token.to_owned())).build(),
+        None => Api::new(),
     }
-
-    let result = (|| {
-        let api = Api::new().context("hf-hub API init failed")?;
-        let repo = api.model(repo_id.to_owned());
-        let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
-        resolve_hub_model_files(&repo, &prefix)
-            .with_context(|| format!("could not load '{repo_id}' from HuggingFace Hub"))
-    })();
-
-    if token.is_some() {
-        if let Some(value) = previous {
-            env::set_var("HF_HUB_TOKEN", value);
-        } else {
-            env::remove_var("HF_HUB_TOKEN");
-        }
-    }
-
-    result
+    .context("hf-hub API init failed")?;
+    let repo = api.model(repo_id.to_owned());
+    let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
+    resolve_hub_model_files(&repo, &prefix).with_context(|| format!("could not load '{repo_id}' from HuggingFace Hub"))
 }
 
 #[cfg(test)]

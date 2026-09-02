@@ -170,8 +170,10 @@ fn test_from_borrowed() {
     let [rows, cols]: [usize; 2] = tensor.shape().try_into().unwrap();
     let floats: Vec<f32> = tensor
         .data()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| f32::from_le_bytes(b))
         .collect();
 
     // Leak to get 'static lifetime (fine for tests)
