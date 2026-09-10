@@ -117,9 +117,11 @@ See the [feature flags](#feature-flags) section for `wasm` and `local-only` buil
 **a. Install the CLI tool:**
 This command compiles the crate in release mode (for speed) and installs the `model2vec-rs` executable to Cargo's binary directory `~/.cargo/bin/`.
 ```bash
-cargo install model2vec-rs
+cargo install model2vec-rs --features cli
 ```
 Ensure `~/.cargo/bin/` is in your system's `PATH` to run `model2vec-rs` from any directory.
+The CLI is opt-in; default library builds do not include Clap.
+From a checkout, use `cargo run --release --features cli -- ...`.
 
 **b. Generate embeddings via CLI:**
 The compiled binary installed via `cargo install` is significantly faster (often >10x) than running via `cargo run -- ...` without release mode.
@@ -151,6 +153,7 @@ The compiled binary installed via `cargo install` is significantly faster (often
 The crate exposes a few feature combinations for different runtimes:
 
 * `default`: native build with `onig` tokenization and optional Hugging Face Hub downloads
+* `cli`: build the command-line executable with Clap (not enabled by default)
 * `fancy-regex`: alternative tokenizer backend for native builds
 * `local-only`: disable remote model downloads and restrict loading to local paths or `from_bytes(...)`
 * `wasm`: minimal WebAssembly-oriented feature set for in-memory loading via `from_bytes(...)`

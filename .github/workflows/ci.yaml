@@ -16,6 +16,9 @@ jobs:
           - name: default
             build: cargo build --verbose
             test: cargo test --verbose
+          - name: cli
+            build: cargo build --features cli --verbose
+            test: cargo test --features cli --verbose
           - name: fancy-regex
             build: cargo build --no-default-features --features fancy-regex --verbose
             test: cargo test --no-default-features --features fancy-regex --verbose
