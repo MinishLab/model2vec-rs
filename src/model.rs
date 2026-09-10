@@ -10,7 +10,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, models::ModelWrapper};
 
 /// Static embedding model for Model2Vec
 #[derive(Debug, Clone)]
@@ -323,11 +323,12 @@ impl StaticModel {
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
-        let spec: Value = serde_json::to_value(tokenizer).context("failed to serialize tokenizer")?;
-        let unk_token = spec
-            .get("model")
-            .and_then(|m| m.get("unk_token"))
-            .and_then(Value::as_str);
+        let unk_token = match tokenizer.get_model() {
+            ModelWrapper::BPE(model) => model.unk_token.as_deref(),
+            ModelWrapper::WordPiece(model) => Some(model.unk_token.as_str()),
+            ModelWrapper::WordLevel(model) => Some(model.unk_token.as_str()),
+            ModelWrapper::Unigram(_) => None,
+        };
         let unk_token_id = if let Some(tok) = unk_token {
             let id = tokenizer
                 .token_to_id(tok)
