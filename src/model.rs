@@ -262,28 +262,15 @@ impl StaticModel {
         weights: Option<Vec<f32>>,
         token_mapping: Option<Vec<usize>>,
     ) -> Result<Self> {
-        if embeddings.len() != rows * cols {
-            return Err(anyhow!(
-                "embeddings length {} != rows {} * cols {}",
-                embeddings.len(),
-                rows,
-                cols
-            ));
-        }
-        let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
-        let embeddings =
-            Array2::from_shape_vec((rows, cols), embeddings).context("failed to build embeddings array")?;
-        Ok(Self {
-            inner: Arc::new(StaticModelInner {
-                tokenizer,
-                embeddings: CowArray::from(embeddings),
-                weights: weights.map(Cow::Owned),
-                token_mapping: token_mapping.map(Cow::Owned),
-                normalize,
-                median_token_length,
-                unk_token_id,
-            }),
-        })
+        Self::from_storage(
+            tokenizer,
+            Cow::Owned(embeddings),
+            rows,
+            cols,
+            normalize,
+            weights.map(Cow::Owned),
+            token_mapping.map(Cow::Owned),
+        )
     }
 
     /// Construct from static slices (zero-copy for embedded binary data).
@@ -296,7 +283,6 @@ impl StaticModel {
     /// * `normalize` - Whether to L2-normalize output embeddings
     /// * `weights` - Optional static per-token weights for quantized models
     /// * `token_mapping` - Optional static token ID mapping for quantized models
-    #[allow(dead_code)] // Public API for external crates
     pub fn from_borrowed(
         tokenizer: Tokenizer,
         embeddings: &'static [f32],
@@ -305,6 +291,26 @@ impl StaticModel {
         normalize: bool,
         weights: Option<&'static [f32]>,
         token_mapping: Option<&'static [usize]>,
+    ) -> Result<Self> {
+        Self::from_storage(
+            tokenizer,
+            Cow::Borrowed(embeddings),
+            rows,
+            cols,
+            normalize,
+            weights.map(Cow::Borrowed),
+            token_mapping.map(Cow::Borrowed),
+        )
+    }
+
+    fn from_storage(
+        tokenizer: Tokenizer,
+        embeddings: Cow<'static, [f32]>,
+        rows: usize,
+        cols: usize,
+        normalize: bool,
+        weights: Option<Cow<'static, [f32]>>,
+        token_mapping: Option<Cow<'static, [usize]>>,
     ) -> Result<Self> {
         if embeddings.len() != rows * cols {
             return Err(anyhow!(
@@ -315,13 +321,20 @@ impl StaticModel {
             ));
         }
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
-        let embeddings = ArrayView2::from_shape((rows, cols), embeddings).context("failed to build embeddings view")?;
+        let embeddings = match embeddings {
+            Cow::Owned(data) => {
+                CowArray::from(Array2::from_shape_vec((rows, cols), data).context("failed to build embeddings array")?)
+            }
+            Cow::Borrowed(data) => {
+                CowArray::from(ArrayView2::from_shape((rows, cols), data).context("failed to build embeddings view")?)
+            }
+        };
         Ok(Self {
             inner: Arc::new(StaticModelInner {
                 tokenizer,
-                embeddings: CowArray::from(embeddings),
-                weights: weights.map(Cow::Borrowed),
-                token_mapping: token_mapping.map(Cow::Borrowed),
+                embeddings,
+                weights,
+                token_mapping,
                 normalize,
                 median_token_length,
                 unk_token_id,

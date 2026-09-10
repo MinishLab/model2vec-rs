@@ -1,11 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use model2vec_rs::model::StaticModel;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
-
-mod model;
-use model::StaticModel;
 
 fn write_output<T: serde::Serialize + std::fmt::Debug>(data: &T, path: Option<String>) -> Result<()> {
     match path {
