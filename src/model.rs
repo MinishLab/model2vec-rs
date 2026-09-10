@@ -9,12 +9,20 @@ use std::borrow::Cow;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokenizers::{Tokenizer, models::ModelWrapper};
 
-/// Static embedding model for Model2Vec
+/// Static embedding model for Model2Vec.
+///
+/// Clones share immutable model state instead of copying the tokenizer and embeddings.
 #[derive(Debug, Clone)]
 pub struct StaticModel {
+    inner: Arc<StaticModelInner>,
+}
+
+#[derive(Debug)]
+struct StaticModelInner {
     tokenizer: Tokenizer,
     embeddings: CowArray<'static, f32, Ix2>,
     weights: Option<Cow<'static, [f32]>>,
@@ -266,13 +274,15 @@ impl StaticModel {
         let embeddings =
             Array2::from_shape_vec((rows, cols), embeddings).context("failed to build embeddings array")?;
         Ok(Self {
-            tokenizer,
-            embeddings: CowArray::from(embeddings),
-            weights: weights.map(Cow::Owned),
-            token_mapping: token_mapping.map(Cow::Owned),
-            normalize,
-            median_token_length,
-            unk_token_id,
+            inner: Arc::new(StaticModelInner {
+                tokenizer,
+                embeddings: CowArray::from(embeddings),
+                weights: weights.map(Cow::Owned),
+                token_mapping: token_mapping.map(Cow::Owned),
+                normalize,
+                median_token_length,
+                unk_token_id,
+            }),
         })
     }
 
@@ -307,13 +317,15 @@ impl StaticModel {
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
         let embeddings = ArrayView2::from_shape((rows, cols), embeddings).context("failed to build embeddings view")?;
         Ok(Self {
-            tokenizer,
-            embeddings: CowArray::from(embeddings),
-            weights: weights.map(Cow::Borrowed),
-            token_mapping: token_mapping.map(Cow::Borrowed),
-            normalize,
-            median_token_length,
-            unk_token_id,
+            inner: Arc::new(StaticModelInner {
+                tokenizer,
+                embeddings: CowArray::from(embeddings),
+                weights: weights.map(Cow::Borrowed),
+                token_mapping: token_mapping.map(Cow::Borrowed),
+                normalize,
+                median_token_length,
+                unk_token_id,
+            }),
         })
     }
 
@@ -360,23 +372,24 @@ impl StaticModel {
         max_length: Option<usize>,
         batch_size: usize,
     ) -> Vec<Vec<f32>> {
+        let model = &self.inner;
         let mut embeddings = Vec::with_capacity(sentences.len());
         for batch in sentences.chunks(batch_size) {
             let truncated: Vec<&str> = batch
                 .iter()
                 .map(|text| {
                     max_length
-                        .map(|max_tok| Self::truncate_str(text, max_tok, self.median_token_length))
+                        .map(|max_tok| Self::truncate_str(text, max_tok, model.median_token_length))
                         .unwrap_or(text.as_str())
                 })
                 .collect();
-            let encodings = self
+            let encodings = model
                 .tokenizer
                 .encode_batch_fast::<String>(truncated.into_iter().map(Into::into).collect(), false)
                 .expect("tokenization failed");
             for encoding in encodings {
                 let mut token_ids = encoding.get_ids().to_vec();
-                if let Some(unk_id) = self.unk_token_id {
+                if let Some(unk_id) = model.unk_token_id {
                     token_ids.retain(|&id| id as usize != unk_id);
                 }
                 if let Some(max_tok) = max_length {
@@ -403,19 +416,20 @@ impl StaticModel {
 
     /// Mean-pool a token-ID list into a single vector.
     fn pool_ids(&self, ids: Vec<u32>) -> Vec<f32> {
-        let dim = self.embeddings.ncols();
+        let model = &self.inner;
+        let dim = model.embeddings.ncols();
         let mut sum = vec![0.0_f32; dim];
         let mut cnt = 0usize;
         for &id in &ids {
             let tok = id as usize;
-            let row_idx = self
+            let row_idx = model
                 .token_mapping
                 .as_ref()
                 .and_then(|m| m.get(tok))
                 .copied()
                 .unwrap_or(tok);
-            let scale = self.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
-            let row = self.embeddings.row(row_idx);
+            let scale = model.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
+            let row = model.embeddings.row(row_idx);
             for (s, &v) in sum.iter_mut().zip(row.iter()) {
                 *s += v * scale;
             }
@@ -425,7 +439,7 @@ impl StaticModel {
         for x in &mut sum {
             *x /= denom;
         }
-        if self.normalize {
+        if model.normalize {
             let norm = sum.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
             for x in &mut sum {
                 *x /= norm;
