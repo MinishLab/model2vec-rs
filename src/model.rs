@@ -39,6 +39,27 @@ struct ModelFiles {
     config: PathBuf,
 }
 
+fn layout_candidates<T: Copy>(base: T, subfolder: T, parent: T) -> [(T, T, &'static str); 4] {
+    [
+        (base, base, "config.json"),
+        (base, base, "config_sentence_transformers.json"),
+        (base, subfolder, "config_sentence_transformers.json"),
+        (parent, base, "config_sentence_transformers.json"),
+    ]
+}
+
+fn decode_f32(raw: &[u8]) -> Vec<f32> {
+    raw.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect()
+}
+
+fn decode_f16(raw: &[u8]) -> Vec<f32> {
+    raw.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| f16::from_le_bytes(b).to_f32())
+        .collect()
+}
+
 fn match_local_layout(config_base: &Path, model_base: &Path, config_file: &str) -> Option<ModelFiles> {
     let config = config_base.join(config_file);
     let tokenizer = model_base.join("tokenizer.json");
@@ -108,20 +129,10 @@ fn match_hub_layout(
 }
 
 fn resolve_local_model_files(folder: &Path) -> Option<ModelFiles> {
-    match_local_layout(folder, folder, "config.json")
-        .or_else(|| match_local_layout(folder, folder, "config_sentence_transformers.json"))
-        .or_else(|| {
-            match_local_layout(
-                folder,
-                &folder.join("0_StaticEmbedding"),
-                "config_sentence_transformers.json",
-            )
-        })
-        .or_else(|| {
-            folder
-                .parent()
-                .and_then(|p| match_local_layout(p, folder, "config_sentence_transformers.json"))
-        })
+    let subfolder = folder.join("0_StaticEmbedding");
+    layout_candidates(Some(folder), Some(subfolder.as_path()), folder.parent())
+        .into_iter()
+        .find_map(|(config_base, model_base, config_file)| match_local_layout(config_base?, model_base?, config_file))
 }
 
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
@@ -133,17 +144,12 @@ fn resolve_hub_model_files(repo: &ApiRepo, prefix: &str) -> Result<ModelFiles> {
         _ => String::new(),
     };
 
-    if let Some(f) = match_hub_layout(repo, prefix, prefix, "config.json")? {
-        return Ok(f);
+    for (config_prefix, model_prefix, config_file) in layout_candidates(prefix, sub_prefix.as_str(), parent.as_str()) {
+        if let Some(files) = match_hub_layout(repo, config_prefix, model_prefix, config_file)? {
+            return Ok(files);
+        }
     }
-    if let Some(f) = match_hub_layout(repo, prefix, prefix, "config_sentence_transformers.json")? {
-        return Ok(f);
-    }
-    if let Some(f) = match_hub_layout(repo, prefix, &sub_prefix, "config_sentence_transformers.json")? {
-        return Ok(f);
-    }
-    match_hub_layout(repo, &parent, prefix, "config_sentence_transformers.json")?
-        .ok_or_else(|| anyhow!("no valid model layout found in '{prefix}'"))
+    Err(anyhow!("no valid model layout found in '{prefix}'"))
 }
 
 impl StaticModel {
@@ -180,13 +186,8 @@ impl StaticModel {
         let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2-D")?;
         let raw = tensor.data();
         let floats: Vec<f32> = match tensor.dtype() {
-            Dtype::F32 => raw.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect(),
-            Dtype::F16 => raw
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&b| f16::from_le_bytes(b).to_f32())
-                .collect(),
+            Dtype::F32 => decode_f32(raw),
+            Dtype::F16 => decode_f16(raw),
             Dtype::I8 => raw.iter().map(|&b| f32::from(b as i8)).collect(),
             other => return Err(anyhow!("unsupported tensor dtype: {other:?}")),
         };
@@ -201,13 +202,8 @@ impl StaticModel {
                         .iter()
                         .map(|&b| f64::from_le_bytes(b) as f32)
                         .collect(),
-                    Dtype::F32 => raw.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect(),
-                    Dtype::F16 => raw
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|&b| half::f16::from_le_bytes(b).to_f32())
-                        .collect(),
+                    Dtype::F32 => decode_f32(raw),
+                    Dtype::F16 => decode_f16(raw),
                     other => return Err(anyhow!("unsupported weights dtype: {:?}", other)),
                 };
                 Some(v)
