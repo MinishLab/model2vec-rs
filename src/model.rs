@@ -344,19 +344,22 @@ impl StaticModel {
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
-        let unk_token = match tokenizer.get_model() {
-            ModelWrapper::BPE(model) => model.unk_token.as_deref(),
-            ModelWrapper::WordPiece(model) => Some(model.unk_token.as_str()),
-            ModelWrapper::WordLevel(model) => Some(model.unk_token.as_str()),
-            ModelWrapper::Unigram(_) => None,
-        };
-        let unk_token_id = if let Some(tok) = unk_token {
-            let id = tokenizer
+        let lookup = |tok: &str| {
+            tokenizer
                 .token_to_id(tok)
-                .ok_or_else(|| anyhow!("unk_token '{tok}' not found in vocabulary"))?;
-            Some(id as usize)
-        } else {
-            None
+                .map(|id| id as usize)
+                .ok_or_else(|| anyhow!("unk_token '{tok}' not found in vocabulary"))
+        };
+        let unk_token_id = match tokenizer.get_model() {
+            ModelWrapper::BPE(model) => model.unk_token.as_deref().map(lookup).transpose()?,
+            ModelWrapper::WordPiece(model) => Some(lookup(&model.unk_token)?),
+            ModelWrapper::WordLevel(model) => Some(lookup(&model.unk_token)?),
+            // `tokenizers` keeps Unigram's `unk_id` private, so read it from the serialized model.
+            ModelWrapper::Unigram(model) => serde_json::to_value(model)
+                .context("failed to serialize unigram model")?
+                .get("unk_id")
+                .and_then(Value::as_u64)
+                .map(|id| id as usize),
         };
 
         Ok((median_token_length, unk_token_id))
