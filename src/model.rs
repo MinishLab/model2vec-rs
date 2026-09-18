@@ -1,3 +1,4 @@
+use crate::fast_tokenizer::FastTokenizer;
 use anyhow::{Context, Result, anyhow};
 use half::f16;
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
@@ -11,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokenizers::{Tokenizer, models::ModelWrapper};
+use tokenizers::{Tokenizer, models::ModelWrapper, parallelism::MaybeParallelIterator};
 
 /// Static embedding model for Model2Vec.
 ///
@@ -24,6 +25,7 @@ pub struct StaticModel {
 #[derive(Debug)]
 struct StaticModelInner {
     tokenizer: Tokenizer,
+    fast_tokenizer: Option<FastTokenizer>,
     embeddings: CowArray<'static, f32, Ix2>,
     weights: Option<Cow<'static, [f32]>>,
     token_mapping: Option<Cow<'static, [usize]>>,
@@ -327,6 +329,7 @@ impl StaticModel {
         };
         Ok(Self {
             inner: Arc::new(StaticModelInner {
+                fast_tokenizer: FastTokenizer::new(&tokenizer),
                 tokenizer,
                 embeddings,
                 weights,
@@ -362,6 +365,15 @@ impl StaticModel {
         Ok((median_token_length, unk_token_id))
     }
 
+    /// Tokenize a single text with the HF tokenizer.
+    fn hf_encode(tokenizer: &Tokenizer, text: &str) -> Vec<u32> {
+        tokenizer
+            .encode_fast(text, false)
+            .expect("tokenization failed")
+            .get_ids()
+            .to_vec()
+    }
+
     /// Char-level truncation to max_tokens * median_token_length
     fn truncate_str(s: &str, max_tokens: usize, median_len: usize) -> &str {
         s.char_indices()
@@ -392,20 +404,35 @@ impl StaticModel {
                         .unwrap_or(text.as_str())
                 })
                 .collect();
-            let encodings = model
-                .tokenizer
-                .encode_batch_fast::<String>(truncated.into_iter().map(Into::into).collect(), false)
-                .expect("tokenization failed");
-            for encoding in encodings {
-                let mut token_ids = encoding.get_ids().to_vec();
-                if let Some(unk_id) = model.unk_token_id {
-                    token_ids.retain(|&id| id as usize != unk_id);
-                }
-                if let Some(max_tok) = max_length {
-                    token_ids.truncate(max_tok);
-                }
-                embeddings.push(self.pool_ids(token_ids));
-            }
+            let encodings: Vec<Vec<u32>> = match &model.fast_tokenizer {
+                Some(fast) => truncated
+                    .into_maybe_par_iter()
+                    .map(|text| {
+                        fast.encode(text)
+                            .unwrap_or_else(|| Self::hf_encode(&model.tokenizer, text))
+                    })
+                    .collect(),
+                None => model
+                    .tokenizer
+                    .encode_batch_fast::<String>(truncated.into_iter().map(Into::into).collect(), false)
+                    .expect("tokenization failed")
+                    .iter()
+                    .map(|encoding| encoding.get_ids().to_vec())
+                    .collect(),
+            };
+            let pooled: Vec<Vec<f32>> = encodings
+                .into_maybe_par_iter()
+                .map(|mut token_ids| {
+                    if let Some(unk_id) = model.unk_token_id {
+                        token_ids.retain(|&id| id as usize != unk_id);
+                    }
+                    if let Some(max_tok) = max_length {
+                        token_ids.truncate(max_tok);
+                    }
+                    self.pool_ids(token_ids)
+                })
+                .collect();
+            embeddings.extend(pooled);
         }
         embeddings
     }
@@ -439,7 +466,9 @@ impl StaticModel {
                 .unwrap_or(tok);
             let scale = model.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
             let row = model.embeddings.row(row_idx);
-            for (s, &v) in sum.iter_mut().zip(row.iter()) {
+            // Rows of the standard-layout array are contiguous; slices let the loop vectorize.
+            let row = row.as_slice().expect("embedding rows are contiguous");
+            for (s, &v) in sum.iter_mut().zip(row) {
                 *s += v * scale;
             }
             cnt += 1;
