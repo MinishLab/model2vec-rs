@@ -1,7 +1,8 @@
 [package]
 name = "model2vec-rs"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Official Rust Implementation of Model2Vec"
 readme = "README.md"
 license-file = "LICENSE"

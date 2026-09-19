@@ -179,15 +179,13 @@ This `model2vec-rs` crate provides a Rust-based engine specifically for **infere
 
 A variety of pre-trained Model2Vec models are available on the [HuggingFace Hub (MinishLab collection)](https://huggingface.co/collections/minishlab/model2vec-base-models-66fd9dd9b7c3b3c0f25ca90e). These can be loaded by `model2vec-rs` using their Hugging Face model ID or by providing a local path to the model files.
 
-| Model                                                                 | Language    | Distilled From (Original Sentence Transformer)                  | Params  | Task      |
+| Model                                                                 | Language    | Sentence Transformer                                            | Params  | Task      |
 |-----------------------------------------------------------------------|------------|-----------------------------------------------------------------|---------|-----------|
 | [potion-base-32M](https://huggingface.co/minishlab/potion-base-32M)   | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 32.3M   | General   |
 | [potion-multilingual-128M](https://huggingface.co/minishlab/potion-multilingual-128M) | Multilingual | [bge-m3](https://huggingface.co/BAAI/bge-m3)      | 128M    | General   |
 | [potion-retrieval-32M](https://huggingface.co/minishlab/potion-retrieval-32M) | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 32.3M   | Retrieval |
-| [potion-code-16M](https://huggingface.co/minishlab/potion-code-16M)           | Code       | [CodeRankEmbed](https://huggingface.co/nomic-ai/CodeRankEmbed)    | 16M     | Code      |
 | [potion-base-8M](https://huggingface.co/minishlab/potion-base-8M)     | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 7.5M    | General   |
-| [potion-base-4M](https://huggingface.co/minishlab/potion-base-4M)     | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 3.7M    | General   |
-| [potion-base-2M](https://huggingface.co/minishlab/potion-base-2M)     | English    | [bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5) | 1.8M    | General   |
+| [potion-code-16M-v2](https://huggingface.co/minishlab/potion-code-16M-v2) | Code       | [CodeRankEmbed](https://huggingface.co/nomic-ai/CodeRankEmbed) | 16.2M   | Code      |
 
 
 ## Performance
