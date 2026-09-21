@@ -399,7 +399,6 @@ impl StaticModel {
                 .tokenizer
                 .encode_batch_fast::<String>(truncated.into_iter().map(Into::into).collect(), false)
                 .expect("tokenization failed");
-            // Pool in parallel, like the tokenizer above; `TOKENIZERS_PARALLELISM` controls both.
             let pooled: Vec<Vec<f32>> = encodings
                 .into_maybe_par_iter()
                 .map(|encoding| {
@@ -447,7 +446,7 @@ impl StaticModel {
                 .unwrap_or(tok);
             let scale = model.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
             let row = model.embeddings.row(row_idx);
-            // Rows of the standard-layout array are contiguous; slices let the loop vectorize.
+            // Summing over a slice instead of a strided row lets the loop vectorize.
             let row = row.as_slice().expect("embedding rows are contiguous");
             for (s, &v) in sum.iter_mut().zip(row) {
                 *s += v * scale;
