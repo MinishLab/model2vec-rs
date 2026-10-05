@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokenizers::{Tokenizer, models::ModelWrapper};
+use tokenizers::{Tokenizer, models::ModelWrapper, parallelism::MaybeParallelIterator};
 
 /// Static embedding model for Model2Vec.
 ///
@@ -399,16 +399,20 @@ impl StaticModel {
                 .tokenizer
                 .encode_batch_fast::<String>(truncated.into_iter().map(Into::into).collect(), false)
                 .expect("tokenization failed");
-            for encoding in encodings {
-                let mut token_ids = encoding.get_ids().to_vec();
-                if let Some(unk_id) = model.unk_token_id {
-                    token_ids.retain(|&id| id as usize != unk_id);
-                }
-                if let Some(max_tok) = max_length {
-                    token_ids.truncate(max_tok);
-                }
-                embeddings.push(self.pool_ids(token_ids));
-            }
+            let pooled: Vec<Vec<f32>> = encodings
+                .into_maybe_par_iter()
+                .map(|encoding| {
+                    let mut token_ids = encoding.get_ids().to_vec();
+                    if let Some(unk_id) = model.unk_token_id {
+                        token_ids.retain(|&id| id as usize != unk_id);
+                    }
+                    if let Some(max_tok) = max_length {
+                        token_ids.truncate(max_tok);
+                    }
+                    self.pool_ids(token_ids)
+                })
+                .collect();
+            embeddings.extend(pooled);
         }
         embeddings
     }
@@ -442,7 +446,9 @@ impl StaticModel {
                 .unwrap_or(tok);
             let scale = model.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
             let row = model.embeddings.row(row_idx);
-            for (s, &v) in sum.iter_mut().zip(row.iter()) {
+            // Summing over a slice instead of a strided row lets the loop vectorize.
+            let row = row.as_slice().expect("embedding rows are contiguous");
+            for (s, &v) in sum.iter_mut().zip(row) {
                 *s += v * scale;
             }
             cnt += 1;
