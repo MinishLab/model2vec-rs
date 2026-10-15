@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use half::f16;
+use half::{f16, slice::HalfFloatSliceExt};
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
 use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
 use ndarray::{Array2, ArrayView2, CowArray, Ix2};
@@ -53,11 +53,15 @@ fn decode_f32(raw: &[u8]) -> Vec<f32> {
 }
 
 fn decode_f16(raw: &[u8]) -> Vec<f32> {
-    raw.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&b| f16::from_le_bytes(b).to_f32())
-        .collect()
+    let mut decoded = vec![0.0; raw.len() / 2];
+    let mut buffer = [f16::ZERO; 1024];
+    for (bytes, output) in raw.chunks(2048).zip(decoded.chunks_mut(1024)) {
+        for (value, &bytes) in buffer.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *value = f16::from_le_bytes(bytes);
+        }
+        buffer[..output.len()].convert_to_f32_slice(output);
+    }
+    decoded
 }
 
 fn match_local_layout(config_base: &Path, model_base: &Path, config_file: &str) -> Option<ModelFiles> {
@@ -521,6 +525,34 @@ fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&s
 mod tests {
     use super::decode_token_mapping;
     use safetensors::tensor::Dtype;
+
+    // Failure modes: changed IEEE-754 values, signed zero, subnormals, NaNs,
+    // endian/alignment assumptions, and empty or partial conversion blocks.
+    #[test]
+    fn decode_f16_matches_scalar_for_all_bit_patterns() {
+        let raw: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+        let decoded = super::decode_f16(&raw);
+        assert_eq!(decoded.len(), 65536);
+        for (bits, actual) in (0..=u16::MAX).zip(decoded) {
+            let expected = half::f16::from_bits(bits).to_f32();
+            assert_eq!(actual.to_bits(), expected.to_bits(), "half bits: {bits:#06x}");
+        }
+    }
+
+    #[test]
+    fn decode_f16_handles_unaligned_input_and_partial_blocks() {
+        for len in [0, 1, 2, 7, 31, 1023, 1024, 1025, 2047, 2048, 2049] {
+            let mut bytes = vec![0xff];
+            for i in 0..len {
+                bytes.extend_from_slice(&half::f16::from_f32(i as f32 / 32.0).to_le_bytes());
+            }
+            let values = super::decode_f16(&bytes[1..]);
+            assert_eq!(values.len(), len);
+            for (i, value) in values.iter().enumerate() {
+                assert_eq!(*value, half::f16::from_f32(i as f32 / 32.0).to_f32());
+            }
+        }
+    }
 
     #[test]
     fn decode_token_mapping_supports_i32_and_i64() {
