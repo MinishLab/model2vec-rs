@@ -50,3 +50,7 @@ tempfile = "3"
 name = "model2vec-rs"
 path = "src/main.rs"
 required-features = ["cli"]
+
+[[bench]]
+name = "load"
+harness = false
