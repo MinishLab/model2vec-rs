@@ -430,11 +430,11 @@ impl StaticModel {
                 .into_maybe_par_iter()
                 .map(|encoding| {
                     let mut token_ids = encoding.get_ids().to_vec();
-                    if let Some(unk_id) = model.unk_token_id {
-                        token_ids.retain(|&id| id as usize != unk_id);
-                    }
                     if let Some(max_tok) = max_length {
                         token_ids.truncate(max_tok);
+                    }
+                    if let Some(unk_id) = model.unk_token_id {
+                        token_ids.retain(|&id| id as usize != unk_id);
                     }
                     self.pool_ids(token_ids)
                 })
