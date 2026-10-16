@@ -11,7 +11,13 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokenizers::{Tokenizer, models::ModelWrapper, parallelism::MaybeParallelIterator};
+use tokenizers::{
+    Tokenizer,
+    models::ModelWrapper,
+    parallelism::{MaybeParallelIterator, MaybeParallelRefIterator},
+};
+
+use crate::fast_wordpiece::FastWordPiece;
 
 /// Static embedding model for Model2Vec.
 ///
@@ -30,6 +36,9 @@ struct StaticModelInner {
     normalize: bool,
     median_token_length: usize,
     unk_token_id: Option<usize>,
+    /// Custom IDs-only WordPiece tokenizer; `None` for non-WordPiece
+    /// pipelines, which fall back to the `tokenizers` crate.
+    fast_tok: Option<FastWordPiece>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +326,7 @@ impl StaticModel {
             ));
         }
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
+        let fast_tok = FastWordPiece::from_tokenizer(&tokenizer);
         let embeddings = match embeddings {
             Cow::Owned(data) => {
                 CowArray::from(Array2::from_shape_vec((rows, cols), data).context("failed to build embeddings array")?)
@@ -334,6 +344,7 @@ impl StaticModel {
                 normalize,
                 median_token_length,
                 unk_token_id,
+                fast_tok,
             }),
         })
     }
@@ -395,14 +406,13 @@ impl StaticModel {
                         .unwrap_or(text.as_str())
                 })
                 .collect();
-            let encodings = model
-                .tokenizer
-                .encode_batch_fast::<String>(truncated.into_iter().map(Into::into).collect(), false)
-                .expect("tokenization failed");
-            let pooled: Vec<Vec<f32>> = encodings
+            let pooled: Vec<Vec<f32>> = self
+                .tokenize_batch_ids(&truncated)
                 .into_maybe_par_iter()
-                .map(|encoding| {
-                    let mut token_ids = encoding.get_ids().to_vec();
+                .map(|mut token_ids| {
+                    if let Some(unk_id) = model.unk_token_id {
+                        token_ids.retain(|&id| id as usize != unk_id);
+                    }
                     if let Some(max_tok) = max_length {
                         token_ids.truncate(max_tok);
                     }
@@ -415,6 +425,23 @@ impl StaticModel {
             embeddings.extend(pooled);
         }
         embeddings
+    }
+
+    /// Tokenize a batch to raw ID lists (before UNK filtering / truncation).
+    /// Uses the custom WordPiece tokenizer when the model matches that
+    /// pipeline; other pipelines (e.g. Unigram) use the `tokenizers` crate.
+    fn tokenize_batch_ids(&self, texts: &[&str]) -> Vec<Vec<u32>> {
+        let model = &self.inner;
+        if let Some(ft) = &model.fast_tok {
+            return texts.maybe_par_iter().map(|t| ft.encode_ids(t)).collect();
+        }
+        model
+            .tokenizer
+            .encode_batch_fast::<String>(texts.iter().map(|s| (*s).to_string()).collect(), false)
+            .expect("tokenization failed")
+            .into_iter()
+            .map(|e| e.get_ids().to_vec())
+            .collect()
     }
 
     /// Default encode: `max_length=512`, `batch_size=1024`
