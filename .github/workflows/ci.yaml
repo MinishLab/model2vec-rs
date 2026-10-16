@@ -61,3 +61,38 @@ jobs:
 
       - name: Check wasm feature set
         run: RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check --no-default-features --features wasm --target wasm32-unknown-unknown
+
+  python-bindings:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint (clippy)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt -- --check
+
+      - name: Build and install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install maturin pytest numpy tokenizers
+          VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --release
+
+      - name: Test
+        run: .venv/bin/python -m pytest tests

@@ -19,3 +19,6 @@ target/
 local
 .DS_Store
 data
+.venv
+__pycache__
+*.so

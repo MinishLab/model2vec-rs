@@ -338,6 +338,33 @@ impl StaticModel {
         })
     }
 
+    /// The tokenizer used to split texts into token ids.
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.inner.tokenizer
+    }
+
+    /// The embedding matrix with shape `(rows, dim)`.
+    ///
+    /// For vocabulary-quantized models, rows are indexed through [`Self::token_mapping`].
+    pub fn embeddings(&self) -> ArrayView2<'_, f32> {
+        self.inner.embeddings.view()
+    }
+
+    /// Optional per-token weights, indexed by token id.
+    pub fn weights(&self) -> Option<&[f32]> {
+        self.inner.weights.as_deref()
+    }
+
+    /// Optional mapping from token id to embedding row.
+    pub fn token_mapping(&self) -> Option<&[usize]> {
+        self.inner.token_mapping.as_deref()
+    }
+
+    /// Whether output embeddings are L2-normalized.
+    pub fn normalize(&self) -> bool {
+        self.inner.normalize
+    }
+
     /// Compute median token length and unk_token_id from tokenizer.
     fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
         let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
