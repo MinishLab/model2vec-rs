@@ -410,11 +410,11 @@ impl StaticModel {
                 .tokenize_batch_ids(&truncated)
                 .into_maybe_par_iter()
                 .map(|mut token_ids| {
-                    if let Some(unk_id) = model.unk_token_id {
-                        token_ids.retain(|&id| id as usize != unk_id);
-                    }
                     if let Some(max_tok) = max_length {
                         token_ids.truncate(max_tok);
+                    }
+                    if let Some(unk_id) = model.unk_token_id {
+                        token_ids.retain(|&id| id as usize != unk_id);
                     }
                     self.pool_ids(token_ids)
                 })
