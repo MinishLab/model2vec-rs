@@ -17,6 +17,7 @@ use tokenizers::{
     parallelism::{MaybeParallelIterator, MaybeParallelRefIterator},
 };
 
+use crate::fast_unigram::FastUnigram;
 use crate::fast_wordpiece::FastWordPiece;
 
 /// Static embedding model for Model2Vec.
@@ -39,6 +40,9 @@ struct StaticModelInner {
     /// Custom IDs-only WordPiece tokenizer; `None` for non-WordPiece
     /// pipelines, which fall back to the `tokenizers` crate.
     fast_tok: Option<FastWordPiece>,
+    /// Custom IDs-only Unigram model; `None` for non-Unigram pipelines and
+    /// for those it does not reproduce, which fall back to the `tokenizers` crate.
+    fast_unigram: Option<FastUnigram>,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +331,7 @@ impl StaticModel {
         }
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
         let fast_tok = FastWordPiece::from_tokenizer(&tokenizer);
+        let fast_unigram = FastUnigram::from_tokenizer(&tokenizer, unk_token_id);
         let embeddings = match embeddings {
             Cow::Owned(data) => {
                 CowArray::from(Array2::from_shape_vec((rows, cols), data).context("failed to build embeddings array")?)
@@ -345,6 +350,7 @@ impl StaticModel {
                 median_token_length,
                 unk_token_id,
                 fast_tok,
+                fast_unigram,
             }),
         })
     }
@@ -425,12 +431,18 @@ impl StaticModel {
     }
 
     /// Tokenize a batch to raw ID lists (before UNK filtering / truncation).
-    /// Uses the custom WordPiece tokenizer when the model matches that
-    /// pipeline; other pipelines (e.g. Unigram) use the `tokenizers` crate.
+    /// Uses the custom WordPiece tokenizer or Unigram model when the model
+    /// matches that pipeline; other pipelines use the `tokenizers` crate.
     fn tokenize_batch_ids(&self, texts: &[&str]) -> Vec<Vec<u32>> {
         let model = &self.inner;
         if let Some(ft) = &model.fast_tok {
             return texts.maybe_par_iter().map(|t| ft.encode_ids(t)).collect();
+        }
+        if let Some(fu) = &model.fast_unigram {
+            return texts
+                .maybe_par_iter()
+                .map(|t| fu.encode_ids(&model.tokenizer, t).expect("tokenization failed"))
+                .collect();
         }
         model
             .tokenizer
