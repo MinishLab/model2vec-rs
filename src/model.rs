@@ -424,20 +424,24 @@ impl StaticModel {
     }
 
     /// Truncate, tokenize and pool one text.
-    /// Uses the custom WordPiece tokenizer when the model matches that
-    /// pipeline; other pipelines (e.g. Unigram) use the `tokenizers` crate.
+    /// Uses the custom WordPiece tokenizer or Unigram model when the model
+    /// matches that pipeline; other pipelines use the `tokenizers` crate.
     fn encode_one(&self, text: &str, max_length: Option<usize>) -> Vec<f32> {
         let model = &self.inner;
         let text = max_length.map_or(text, |max_tok| {
             Self::truncate_str(text, max_tok, model.median_token_length)
         });
-        match &model.fast_tok {
-            Some(ft) => TOKEN_IDS.with_borrow_mut(|ids| {
+        match (&model.fast_tok, &model.fast_unigram) {
+            (Some(ft), _) => TOKEN_IDS.with_borrow_mut(|ids| {
                 ids.clear();
                 ft.encode_ids_into(text, ids);
                 self.pool_ids(ids, max_length)
             }),
-            None => {
+            (None, Some(fu)) => {
+                let ids = fu.encode_ids(&model.tokenizer, text).expect("tokenization failed");
+                self.pool_ids(&ids, max_length)
+            }
+            (None, None) => {
                 let encoding = model.tokenizer.encode_fast(text, false).expect("tokenization failed");
                 self.pool_ids(encoding.get_ids(), max_length)
             }
