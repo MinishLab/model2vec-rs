@@ -15,53 +15,73 @@
 //! [`FastWordPiece::from_tokenizer`] so the caller falls back to the crate.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use tokenizers::{
     Tokenizer, models::ModelWrapper, normalizers::NormalizerWrapper, pre_tokenizers::PreTokenizerWrapper,
 };
 use unicode_categories::UnicodeCategories;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::model::median_token_length;
 use crate::trie::{DoubleArrayTrie, NONE};
 
 thread_local! {
     static NORMALIZED: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-/// Magic and format version of the binary cache; bump the version whenever
-/// the layout or the meaning of any field changes.
-const CACHE_MAGIC: &[u8; 8] = b"M2VWP\x00\x00\x02";
-
-fn put_str(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-    out.extend_from_slice(s.as_bytes());
+/// The parts of `tokenizer.json` that [`FastWordPiece::from_json`] reads.
+#[derive(Deserialize)]
+struct TokenizerJson<'a> {
+    #[serde(default)]
+    added_tokens: Vec<AddedTokenJson>,
+    normalizer: Option<NormalizerJson>,
+    pre_tokenizer: Option<PreTokenizerJson>,
+    #[serde(borrow)]
+    model: ModelJson<'a>,
 }
 
-struct Reader<'a>(&'a [u8]);
+#[derive(Deserialize)]
+struct AddedTokenJson {
+    content: String,
+    single_word: bool,
+    lstrip: bool,
+    rstrip: bool,
+    normalized: bool,
+}
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let (head, tail) = self.0.split_at_checked(n)?;
-        self.0 = tail;
-        Some(head)
-    }
+#[derive(Deserialize)]
+struct NormalizerJson {
+    #[serde(rename = "type")]
+    kind: String,
+    clean_text: Option<bool>,
+    handle_chinese_chars: Option<bool>,
+    strip_accents: Option<bool>,
+    lowercase: Option<bool>,
+}
 
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
+#[derive(Deserialize)]
+struct PreTokenizerJson {
+    #[serde(rename = "type")]
+    kind: String,
+}
 
-    fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
-
-    fn str(&mut self) -> Option<&'a str> {
-        let n = self.u32()? as usize;
-        std::str::from_utf8(self.take(n)?).ok()
-    }
+#[derive(Deserialize)]
+struct ModelJson<'a> {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    unk_token: Option<String>,
+    continuing_subword_prefix: Option<String>,
+    max_input_chars_per_word: Option<usize>,
+    /// Parsed only once the pipeline is known to be WordPiece.
+    #[serde(borrow)]
+    vocab: Option<&'a RawValue>,
 }
 
 /// IDs-only WordPiece tokenizer for the BERT pipeline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FastWordPiece {
     vocab: DoubleArrayTrie,
     /// Trie node reached by the continuing-subword prefix, or `NONE`.
@@ -113,12 +133,9 @@ impl FastWordPiece {
             added_tokens.push((t.content, id));
         }
 
-        let trie = DoubleArrayTrie::build(vocab.iter().map(|(k, &id)| (k.as_bytes(), id)).collect());
-        let continuation = trie.walk(model.continuing_subword_prefix.as_bytes());
-
         Some(Self::assemble(
-            trie,
-            continuation,
+            &vocab,
+            &model.continuing_subword_prefix,
             unk_id,
             model.max_input_chars_per_word,
             norm.clean_text,
@@ -130,10 +147,61 @@ impl FastWordPiece {
         ))
     }
 
+    /// Build straight from `tokenizer.json` bytes without constructing a
+    /// [`Tokenizer`]. Returns the tokenizer and the median token length, or
+    /// `None` for another pipeline, a missing field, an unk token outside the
+    /// vocab, or added tokens that are duplicated, absent from the vocab, or
+    /// use matching flags not implemented here. Only the fields read here are
+    /// validated, so JSON the crate would reject elsewhere may still load.
+    pub(crate) fn from_json(bytes: &[u8]) -> Option<(FastWordPiece, usize)> {
+        let json: TokenizerJson = serde_json::from_slice(bytes).ok()?;
+        let model = json.model;
+        if model.kind.as_deref() != Some("WordPiece") || json.pre_tokenizer?.kind != "BertPreTokenizer" {
+            return None;
+        }
+        let norm = json.normalizer?;
+        if norm.kind != "BertNormalizer" {
+            return None;
+        }
+        let lowercase = norm.lowercase?;
+
+        let vocab: HashMap<String, u32> = serde_json::from_str(model.vocab?.get()).ok()?;
+        let unk_id = *vocab.get(&model.unk_token?)?;
+
+        // The crate gives an added token that is already in the vocab its
+        // vocab id, so with every added token in the vocab the vocab with
+        // added tokens equals the model vocab.
+        let mut added_tokens: Vec<(String, u32)> = Vec::with_capacity(json.added_tokens.len());
+        for t in json.added_tokens {
+            if t.content.is_empty() || t.normalized || t.single_word || t.lstrip || t.rstrip {
+                return None;
+            }
+            if added_tokens.iter().any(|(content, _)| *content == t.content) {
+                return None;
+            }
+            let id = *vocab.get(&t.content)?;
+            added_tokens.push((t.content, id));
+        }
+
+        let median = median_token_length(vocab.keys().map(String::as_str));
+        let ft = Self::assemble(
+            &vocab,
+            &model.continuing_subword_prefix?,
+            Some(unk_id),
+            model.max_input_chars_per_word?,
+            norm.clean_text?,
+            norm.handle_chinese_chars?,
+            norm.strip_accents.unwrap_or(lowercase),
+            lowercase,
+            added_tokens,
+        );
+        Some((ft, median))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn assemble(
-        vocab: DoubleArrayTrie,
-        continuation: u32,
+        vocab: &HashMap<String, u32>,
+        continuing_subword_prefix: &str,
         unk_id: Option<u32>,
         max_input_chars_per_word: usize,
         clean_text: bool,
@@ -150,11 +218,13 @@ impl FastWordPiece {
 
         let mut single_byte = [-1_i32; 128];
         for (b, slot) in single_byte.iter_mut().enumerate() {
-            let id = vocab.get(&[b as u8]);
-            if id != NONE {
+            if let Some(&id) = vocab.get(&(b as u8 as char).to_string()) {
                 *slot = id as i32;
             }
         }
+
+        let vocab = DoubleArrayTrie::build(vocab.iter().map(|(k, &id)| (k.as_bytes(), id)).collect());
+        let continuation = vocab.walk(continuing_subword_prefix.as_bytes());
 
         FastWordPiece {
             vocab,
@@ -169,85 +239,6 @@ impl FastWordPiece {
             added_tokens,
             added_token_first_bytes,
         }
-    }
-
-    /// Serialize to the binary cache format, tagged with the checksum of the
-    /// `tokenizer.json` it was built from and the model's median token length.
-    pub(crate) fn to_cache_bytes(&self, checksum: u64, median_token_length: usize) -> Vec<u8> {
-        let added_len: usize = self.added_tokens.iter().map(|(k, _)| k.len() + 8).sum();
-        let mut out = Vec::with_capacity(64 + 12 * self.vocab.len() + added_len);
-        out.extend_from_slice(CACHE_MAGIC);
-        out.extend_from_slice(&checksum.to_le_bytes());
-        out.extend_from_slice(&(median_token_length as u64).to_le_bytes());
-        out.extend_from_slice(&self.unk_id.unwrap_or(u32::MAX).to_le_bytes());
-        out.extend_from_slice(&(self.max_input_chars_per_word as u64).to_le_bytes());
-        let flags = self.clean_text as u8
-            | (self.handle_chinese_chars as u8) << 1
-            | (self.strip_accents as u8) << 2
-            | (self.lowercase as u8) << 3;
-        out.push(flags);
-        out.extend_from_slice(&self.continuation.to_le_bytes());
-        out.extend_from_slice(&(self.vocab.len() as u32).to_le_bytes());
-        for word in self.vocab.to_words().flatten() {
-            out.extend_from_slice(&word.to_le_bytes());
-        }
-        out.extend_from_slice(&(self.added_tokens.len() as u32).to_le_bytes());
-        for (token, id) in &self.added_tokens {
-            out.extend_from_slice(&id.to_le_bytes());
-            put_str(&mut out, token);
-        }
-        out
-    }
-
-    /// Inverse of [`Self::to_cache_bytes`]. Returns the tokenizer and the
-    /// median token length, or `None` if the bytes are malformed, from
-    /// another format version, or tagged with a different checksum.
-    pub(crate) fn from_cache_bytes(bytes: &[u8], checksum: u64) -> Option<(FastWordPiece, usize)> {
-        let mut r = Reader(bytes);
-        if r.take(CACHE_MAGIC.len())? != CACHE_MAGIC || r.u64()? != checksum {
-            return None;
-        }
-        let median_token_length = r.u64()? as usize;
-        let unk_id = Some(r.u32()?).filter(|&id| id != u32::MAX);
-        let max_input_chars_per_word = r.u64()? as usize;
-        let flags = r.take(1)?[0];
-        let continuation = r.u32()?;
-
-        let n = r.u32()? as usize;
-        let raw = r.take(n.checked_mul(12)?)?;
-        let vocab = DoubleArrayTrie::from_words(raw.as_chunks::<12>().0.iter().map(|node| {
-            let word = |i: usize| u32::from_le_bytes([node[i], node[i + 1], node[i + 2], node[i + 3]]);
-            [word(0), word(4), word(8)]
-        }))?;
-        if continuation != NONE && continuation as usize >= vocab.len() {
-            return None;
-        }
-        let n = r.u32()? as usize;
-        let mut added_tokens = Vec::with_capacity(n);
-        for _ in 0..n {
-            let id = r.u32()?;
-            let content = r.str()?;
-            if content.is_empty() {
-                return None;
-            }
-            added_tokens.push((content.to_string(), id));
-        }
-        if !r.0.is_empty() {
-            return None;
-        }
-
-        let ft = Self::assemble(
-            vocab,
-            continuation,
-            unk_id,
-            max_input_chars_per_word,
-            flags & 1 != 0,
-            flags & 2 != 0,
-            flags & 4 != 0,
-            flags & 8 != 0,
-            added_tokens,
-        );
-        Some((ft, median_token_length))
     }
 
     pub(crate) fn unk_id(&self) -> Option<u32> {
@@ -667,6 +658,7 @@ mod tests {
         let tok = Tokenizer::from_str(json).expect("build tokenizer");
         let texts: Vec<String> = ["play", "playing plays", "pplay", "ping"].map(String::from).into();
         assert_matches_crate(&tok, &texts);
+        assert_json_matches_tokenizer(json.as_bytes());
     }
 
     /// WordPiece tokenizers of models already in the local Hugging Face
@@ -680,6 +672,7 @@ mod tests {
         for (repo, file) in [
             ("minishlab/potion-base-8M", "tokenizer.json"),
             ("minishlab/potion-retrieval-32M", "tokenizer.json"),
+            ("hotchpotch/bekko-static-embedding-v1", "tokenizer.json"),
             (
                 "sentence-transformers/static-retrieval-mrl-en-v1",
                 "0_StaticEmbedding/tokenizer.json",
@@ -689,37 +682,56 @@ mod tests {
                 eprintln!("skipped: {repo} is not in the local cache");
                 continue;
             };
-            let tok = Tokenizer::from_file(path).expect("load cached tokenizer");
+            let tok = Tokenizer::from_file(&path).expect("load cached tokenizer");
             assert_matches_crate(&tok, &texts);
+            assert_json_matches_tokenizer(&std::fs::read(&path).expect("read cached tokenizer"));
         }
     }
 
+    /// `from_json` must build exactly what `from_tokenizer` builds from the
+    /// crate's tokenizer, or decline.
+    fn assert_json_matches_tokenizer(bytes: &[u8]) {
+        let tok = Tokenizer::from_bytes(bytes).expect("load tokenizer");
+        let (ft, median) = FastWordPiece::from_json(bytes).expect("WordPiece pipeline");
+        assert_eq!(Some(&ft), FastWordPiece::from_tokenizer(&tok).as_ref());
+        let vocab = tok.get_vocab(false);
+        assert_eq!(median, median_token_length(vocab.keys().map(String::as_str)));
+    }
+
     #[test]
-    fn cache_roundtrip_matches() {
+    fn from_json_matches_from_tokenizer() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/test-model-int8/tokenizer.json"
         );
-        let tok = Tokenizer::from_file(path).expect("load fixture tokenizer");
-        let ft = FastWordPiece::from_tokenizer(&tok).expect("fixture is a WordPiece pipeline");
-        let bytes = ft.to_cache_bytes(42, 7);
+        assert_json_matches_tokenizer(&std::fs::read(path).expect("read fixture tokenizer"));
+    }
 
-        let (cached, median) = FastWordPiece::from_cache_bytes(&bytes, 42).expect("valid cache");
-        assert_eq!(median, 7);
-        assert_eq!(cached.vocab, ft.vocab);
-        assert_eq!(cached.added_tokens, ft.added_tokens);
-        for text in corpus() {
-            assert_eq!(cached.encode_ids(text), ft.encode_ids(text), "mismatch for {text:?}");
-        }
-
-        assert!(FastWordPiece::from_cache_bytes(&bytes, 43).is_none());
-        assert!(FastWordPiece::from_cache_bytes(&bytes[..bytes.len() - 1], 42).is_none());
-        let mut trailing = bytes.clone();
-        trailing.push(0);
-        assert!(FastWordPiece::from_cache_bytes(&trailing, 42).is_none());
-        let mut other_version = bytes;
-        other_version[7] ^= 0xff;
-        assert!(FastWordPiece::from_cache_bytes(&other_version, 42).is_none());
+    #[test]
+    fn from_json_declines_what_it_cannot_reproduce() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let declines = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut json = json.clone();
+            edit(&mut json);
+            FastWordPiece::from_json(json.to_string().as_bytes()).is_none()
+        };
+        assert!(!declines(&|_| {}));
+        assert!(declines(&|j| j["added_tokens"][0]["normalized"] = true.into()));
+        assert!(declines(&|j| j["added_tokens"][0]["content"] = "[NOT IN VOCAB]".into()));
+        assert!(declines(&|j| {
+            let first = j["added_tokens"][0].clone();
+            j["added_tokens"].as_array_mut().unwrap().push(first);
+        }));
+        assert!(declines(&|j| j["model"]["unk_token"] = "[NOT IN VOCAB]".into()));
+        assert!(declines(&|j| j["normalizer"]["type"] = "Lowercase".into()));
+        assert!(declines(&|j| j["pre_tokenizer"] = serde_json::Value::Null));
+        assert!(declines(&|j| {
+            j["model"].as_object_mut().unwrap().remove("max_input_chars_per_word");
+        }));
     }
 
     #[test]
@@ -731,5 +743,6 @@ mod tests {
         let mut tok = Tokenizer::from_file(path).expect("load fixture tokenizer");
         tok.add_tokens(&[tokenizers::AddedToken::from("hello world", false)]);
         assert!(FastWordPiece::from_tokenizer(&tok).is_none());
+        assert!(FastWordPiece::from_json(tok.to_string(false).unwrap().as_bytes()).is_none());
     }
 }

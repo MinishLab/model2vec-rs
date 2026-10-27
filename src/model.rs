@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use half::f16;
+use half::{f16, slice::HalfFloatSliceExt};
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
 use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
 use safetensors::{SafeTensors, tensor::Dtype};
@@ -79,81 +79,31 @@ impl LoadedTokenizer {
         })
     }
 
+    /// Load from `tokenizer.json` bytes. WordPiece pipelines are read
+    /// directly from the JSON without building a [`Tokenizer`].
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let tokenizer = Tokenizer::from_bytes(bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
-        Self::from_tokenizer(tokenizer)
-    }
-
-    /// Like [`Self::from_bytes`], but for WordPiece pipelines reads the
-    /// tokenizer from a binary cache in `cache_dir` keyed by the checksum of
-    /// `bytes`, writing that cache on a miss. Cache errors are ignored.
-    fn from_bytes_cached(bytes: &[u8], cache_dir: Option<&Path>) -> Result<Self> {
-        let Some(cache_dir) = cache_dir else {
-            return Self::from_bytes(bytes);
-        };
-        let checksum = checksum(bytes);
-        let path = cache_dir.join(format!("wordpiece-{checksum:016x}.bin"));
-        if let Some((ft, median_token_length)) = fs::read(&path)
-            .ok()
-            .and_then(|cached| FastWordPiece::from_cache_bytes(&cached, checksum))
-        {
+        if let Some((ft, median_token_length)) = FastWordPiece::from_json(bytes) {
             return Ok(Self {
                 unk_token_id: ft.unk_id().map(|id| id as usize),
                 tokenization: Tokenization::WordPiece(ft),
                 median_token_length,
             });
         }
-        let loaded = Self::from_bytes(bytes)?;
-        if let Tokenization::WordPiece(ft) = &loaded.tokenization {
-            let _ = write_atomic(&path, &ft.to_cache_bytes(checksum, loaded.median_token_length));
-        }
-        Ok(loaded)
+        let tokenizer = Tokenizer::from_bytes(bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+        Self::from_tokenizer(tokenizer)
     }
 }
 
-/// Stable 64-bit checksum (FNV-1a over little-endian words).
-fn checksum(bytes: &[u8]) -> u64 {
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = 0xcbf2_9ce4_8422_2325 ^ bytes.len() as u64;
-    let (words, tail) = bytes.as_chunks::<8>();
-    for w in words {
-        h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(PRIME);
-    }
-    for &b in tail {
-        h = (h ^ u64::from(b)).wrapping_mul(PRIME);
-    }
-    h
-}
-
-fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    fs::write(&tmp, data)?;
-    fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })
-}
-
-/// Directory for the binary tokenizer cache: `MODEL2VEC_CACHE_DIR` if set
-/// (empty disables the cache), else `model2vec-rs` in the user cache dir.
-fn tokenizer_cache_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("MODEL2VEC_CACHE_DIR") {
-        return (!dir.is_empty()).then(|| PathBuf::from(dir));
-    }
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))?;
-    Some(base.join("model2vec-rs"))
+/// Median byte length of the vocabulary's tokens (1 for an empty vocabulary).
+pub(crate) fn median_token_length<'a>(tokens: impl Iterator<Item = &'a str>) -> usize {
+    let mut lens: Vec<usize> = tokens.map(str::len).collect();
+    lens.sort_unstable();
+    lens.get(lens.len() / 2).copied().unwrap_or(1)
 }
 
 /// Compute median token length and unk_token_id from tokenizer.
 fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
-    let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
-    lens.sort_unstable();
-    let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
+    let median_token_length = median_token_length(tokenizer.get_vocab(false).keys().map(String::as_str));
 
     let lookup = |tok: &str| {
         tokenizer
@@ -213,11 +163,17 @@ fn decode_f32(raw: &[u8]) -> Vec<f32> {
 }
 
 fn decode_f16(raw: &[u8]) -> Vec<f32> {
-    raw.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&b| f16::from_le_bytes(b).to_f32())
-        .collect()
+    let raw = raw.as_chunks::<2>().0;
+    let mut out = vec![0.0_f32; raw.len()];
+    let mut halves = [f16::ZERO; 1024];
+    for (src, dst) in raw.chunks(halves.len()).zip(out.chunks_mut(halves.len())) {
+        let halves = &mut halves[..src.len()];
+        for (h, &b) in halves.iter_mut().zip(src) {
+            *h = f16::from_le_bytes(b);
+        }
+        halves.convert_to_f32_slice(dst);
+    }
+    out
 }
 
 fn match_local_layout(config_base: &Path, model_base: &Path, config_file: &str) -> Option<ModelFiles> {
@@ -412,8 +368,7 @@ impl StaticModel {
         let tokenizer_bytes = fs::read(&files.tokenizer).context("failed to read tokenizer.json")?;
         let model_bytes = fs::read(&files.model).context("failed to read model.safetensors")?;
         let config_bytes = fs::read(&files.config).context("failed to read config.json")?;
-        let tokenizer = LoadedTokenizer::from_bytes_cached(&tokenizer_bytes, tokenizer_cache_dir().as_deref())?;
-        Self::from_loaded_bytes(tokenizer, &model_bytes, &config_bytes, normalize)
+        Self::from_bytes(tokenizer_bytes, model_bytes, config_bytes, normalize)
     }
 
     /// Construct from owned data.
@@ -949,49 +904,9 @@ fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&s
 
 #[cfg(test)]
 mod tests {
-    use super::{Embeddings, LoadedTokenizer, StaticModel, Tokenization, checksum, decode_token_mapping};
+    use super::{Embeddings, StaticModel, decode_token_mapping};
     use safetensors::tensor::Dtype;
     use std::borrow::Cow;
-    use std::fs;
-
-    #[test]
-    fn cached_tokenizer_matches_uncached() {
-        let fixture = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/test-model-int8/tokenizer.json"
-        );
-        let bytes = fs::read(fixture).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let cache_file = dir.path().join(format!("wordpiece-{:016x}.bin", checksum(&bytes)));
-
-        let miss = LoadedTokenizer::from_bytes_cached(&bytes, Some(dir.path())).unwrap();
-        assert!(cache_file.exists());
-        let hit = LoadedTokenizer::from_bytes_cached(&bytes, Some(dir.path())).unwrap();
-        let (Tokenization::WordPiece(a), Tokenization::WordPiece(b)) = (&miss.tokenization, &hit.tokenization) else {
-            panic!("fixture is a WordPiece pipeline");
-        };
-        assert_eq!(miss.median_token_length, hit.median_token_length);
-        assert_eq!(miss.unk_token_id, hit.unk_token_id);
-        for text in ["Hello, world!", "café [MASK] 你好", "supercalifragilistic"] {
-            assert_eq!(a.encode_ids(text), b.encode_ids(text));
-        }
-
-        // A cache file with another checksum is ignored and overwritten.
-        fs::write(&cache_file, a.to_cache_bytes(checksum(&bytes) ^ 1, 1)).unwrap();
-        let reloaded = LoadedTokenizer::from_bytes_cached(&bytes, Some(dir.path())).unwrap();
-        assert_eq!(reloaded.median_token_length, miss.median_token_length);
-        assert_eq!(
-            fs::read(&cache_file).unwrap(),
-            a.to_cache_bytes(checksum(&bytes), miss.median_token_length)
-        );
-    }
-
-    #[test]
-    fn checksum_changes_with_content() {
-        assert_ne!(checksum(b"abcdefgh"), checksum(b"abcdefgi"));
-        assert_ne!(checksum(b""), checksum(b"\0"));
-        assert_eq!(checksum(b"tokenizer"), checksum(b"tokenizer"));
-    }
 
     #[test]
     fn decode_token_mapping_supports_i32_and_i64() {
