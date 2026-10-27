@@ -14,6 +14,7 @@ use std::{
 };
 use tokenizers::{Tokenizer, models::ModelWrapper, parallelism::MaybeParallelRefIterator};
 
+use crate::fast_unigram::FastUnigram;
 use crate::fast_wordpiece::FastWordPiece;
 
 thread_local! {
@@ -40,6 +41,9 @@ struct StaticModelInner {
     /// Custom IDs-only WordPiece tokenizer; `None` for non-WordPiece
     /// pipelines, which fall back to the `tokenizers` crate.
     fast_tok: Option<FastWordPiece>,
+    /// Custom IDs-only Unigram model; `None` for non-Unigram pipelines and
+    /// for those it does not reproduce, which fall back to the `tokenizers` crate.
+    fast_unigram: Option<FastUnigram>,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +332,7 @@ impl StaticModel {
         }
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
         let fast_tok = FastWordPiece::from_tokenizer(&tokenizer);
+        let fast_unigram = FastUnigram::from_tokenizer(&tokenizer, unk_token_id);
         let embeddings = match embeddings {
             Cow::Owned(data) => {
                 CowArray::from(Array2::from_shape_vec((rows, cols), data).context("failed to build embeddings array")?)
@@ -346,6 +351,7 @@ impl StaticModel {
                 median_token_length,
                 unk_token_id,
                 fast_tok,
+                fast_unigram,
             }),
         })
     }
