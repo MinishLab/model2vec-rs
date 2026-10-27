@@ -33,6 +33,7 @@ const UNK_PENALTY: f64 = 10.0;
 const NONE: u32 = u32::MAX;
 
 /// A byte trie over the vocabulary in CSR layout.
+#[derive(Clone)]
 struct ByteTrie {
     /// Index of each node's first edge; node `n`'s edges are
     /// `edge_start[n]..edge_start[n + 1]`.
@@ -127,6 +128,7 @@ const UNSET: BestPath = BestPath {
 };
 
 /// IDs-only Unigram tokenizer over a byte trie of the model's vocabulary.
+#[derive(Clone)]
 pub(crate) struct FastUnigram {
     trie: ByteTrie,
     /// Score of each token ID.
