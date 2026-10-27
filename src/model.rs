@@ -33,6 +33,8 @@ struct StaticModelInner {
     tokenizer: Tokenizer,
     embeddings: Embeddings,
     dim: usize,
+    /// Per-row scale applied after the token weight; set by `quantize_int8`.
+    row_scales: Option<Vec<f32>>,
     weights: Option<Cow<'static, [f32]>>,
     token_mapping: Option<Cow<'static, [usize]>>,
     normalize: bool,
@@ -424,6 +426,7 @@ impl StaticModel {
                 tokenizer,
                 embeddings,
                 dim: cols,
+                row_scales: None,
                 weights,
                 token_mapping,
                 normalize,
@@ -433,6 +436,46 @@ impl StaticModel {
                 fast_unigram,
             }),
         })
+    }
+
+    /// Quantize the embeddings to int8 with one scale per row, storing them in
+    /// a quarter of the memory. Outputs are close to, but not bit-identical
+    /// with, those of the f32 model. Models that are already int8 are
+    /// returned unchanged.
+    pub fn quantize_int8(self) -> StaticModel {
+        let Embeddings::F32(table) = &self.inner.embeddings else {
+            return self;
+        };
+        let (data, mut scales) = quantize_rows(table, self.inner.dim);
+        let embeddings = Embeddings::I8(Cow::Owned(data));
+        let mut inner = match Arc::try_unwrap(self.inner) {
+            Ok(mut inner) => {
+                inner.embeddings = embeddings;
+                inner
+            }
+            Err(shared) => StaticModelInner {
+                tokenizer: shared.tokenizer.clone(),
+                embeddings,
+                dim: shared.dim,
+                row_scales: None,
+                weights: shared.weights.clone(),
+                token_mapping: shared.token_mapping.clone(),
+                normalize: shared.normalize,
+                median_token_length: shared.median_token_length,
+                unk_token_id: shared.unk_token_id,
+                fast_tok: shared.fast_tok.clone(),
+                fast_unigram: shared.fast_unigram.clone(),
+            },
+        };
+        if inner.token_mapping.is_none()
+            && let Some(weights) = inner.weights.take()
+        {
+            for (row, scale) in scales.iter_mut().enumerate() {
+                *scale *= weights.get(row).copied().unwrap_or(1.0);
+            }
+        }
+        inner.row_scales = Some(scales);
+        StaticModel { inner: Arc::new(inner) }
     }
 
     /// Compute median token length and unk_token_id from tokenizer.
@@ -594,8 +637,8 @@ impl StaticModel {
         (sum, cnt)
     }
 
-    /// Call `f` with the embedding row and weight of every non-unk token;
-    /// returns the number of rows visited.
+    /// Call `f` with the embedding row and scale (token weight times row
+    /// scale) of every non-unk token; returns the number of rows visited.
     #[inline(always)]
     fn for_each_row<T>(&self, table: &[T], ids: &[u32], mut f: impl FnMut(&[T], f32)) -> usize {
         let model = &self.inner;
@@ -605,17 +648,26 @@ impl StaticModel {
             .iter()
             .map(|&id| id as usize)
             .filter(|&tok| Some(tok) != model.unk_token_id);
-        match (&model.token_mapping, &model.weights) {
-            (None, None) => {
+        match (&model.token_mapping, &model.weights, &model.row_scales) {
+            (None, None, None) => {
                 for tok in tokens {
                     f(&table[tok * dim..(tok + 1) * dim], 1.0);
                     cnt += 1;
                 }
             }
-            (mapping, weights) => {
+            (None, None, Some(row_scales)) => {
+                for tok in tokens {
+                    f(&table[tok * dim..(tok + 1) * dim], row_scales[tok]);
+                    cnt += 1;
+                }
+            }
+            (mapping, weights, row_scales) => {
                 for tok in tokens {
                     let row_idx = mapping.as_ref().and_then(|m| m.get(tok)).copied().unwrap_or(tok);
-                    let scale = weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
+                    let mut scale = weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
+                    if let Some(row_scales) = row_scales {
+                        scale *= row_scales[row_idx];
+                    }
                     f(&table[row_idx * dim..(row_idx + 1) * dim], scale);
                     cnt += 1;
                 }
@@ -623,6 +675,24 @@ impl StaticModel {
         }
         cnt
     }
+}
+
+/// Symmetric per-row int8 quantization: each row is divided by
+/// `max|x| / 127`, rounded, and clamped to [-127, 127].
+fn quantize_rows(table: &[f32], dim: usize) -> (Vec<i8>, Vec<f32>) {
+    let mut data = Vec::with_capacity(table.len());
+    let mut scales = Vec::with_capacity(table.len() / dim.max(1));
+    for row in table.chunks_exact(dim.max(1)) {
+        let max = row.iter().fold(0.0_f32, |m, &v| m.max(v.abs()));
+        let scale = max / 127.0;
+        if scale > 0.0 {
+            data.extend(row.iter().map(|&v| (v / scale).round().clamp(-127.0, 127.0) as i8));
+        } else {
+            data.extend(std::iter::repeat_n(0, row.len()));
+        }
+        scales.push(scale);
+    }
+    (data, scales)
 }
 
 fn resolve_model_files<P: AsRef<Path>>(
@@ -709,5 +779,18 @@ mod tests {
         assert!(matches!(&int8.inner.embeddings, Embeddings::I8(Cow::Owned(t)) if t.len() == 29528 * 2));
         let f32_model = StaticModel::from_pretrained(format!("{dir}/test-model-float32"), None, None, None).unwrap();
         assert!(matches!(&f32_model.inner.embeddings, Embeddings::F32(_)));
+    }
+
+    #[test]
+    fn quantize_int8_replaces_f32_storage() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let model = StaticModel::from_pretrained(format!("{dir}/test-model-vocab-quantized"), None, None, None)
+            .unwrap()
+            .quantize_int8();
+        let inner = &model.inner;
+        let rows = inner.embeddings.len() / inner.dim;
+        assert!(matches!(&inner.embeddings, Embeddings::I8(Cow::Owned(_))));
+        assert_eq!(inner.row_scales.as_ref().map(Vec::len), Some(rows));
+        assert_eq!(inner.weights.is_none(), inner.token_mapping.is_none());
     }
 }
