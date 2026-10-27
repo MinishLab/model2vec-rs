@@ -63,3 +63,7 @@ harness = false
 [[bench]]
 name = "quantize"
 harness = false
+
+[[bench]]
+name = "nanobeir"
+harness = false

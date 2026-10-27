@@ -414,6 +414,9 @@ impl StaticModel {
         weights: Option<Cow<'static, [f32]>>,
         token_mapping: Option<Cow<'static, [usize]>>,
     ) -> Result<Self> {
+        if cols == 0 {
+            return Err(anyhow!("embedding dimension must be greater than 0"));
+        }
         if embeddings.len() != rows * cols {
             return Err(anyhow!(
                 "embeddings length {} != rows {} * cols {}",
