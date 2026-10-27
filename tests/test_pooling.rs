@@ -242,8 +242,19 @@ fn check_all(tokenizer_path: &str, dims: &[usize]) {
                 let case = Case::new(&tokenizer, dim, extras, normalize);
                 let model = case.model();
 
+                assert_eq!(model.dim(), dim, "{} dim()", case.label());
                 for (max_length, ids) in MAX_LENGTHS.iter().zip(&ids) {
                     let want = case.reference(ids);
+                    let flat = model.encode_flat_with_args(&texts, *max_length);
+                    assert_eq!(
+                        flat.len(),
+                        texts.len() * dim,
+                        "{} encode_flat_with_args length",
+                        case.label()
+                    );
+                    let rows: Vec<Vec<f32>> = flat.chunks_exact(dim).map(<[f32]>::to_vec).collect();
+                    let what = format!("encode_flat_with_args(max_length={max_length:?})");
+                    assert_bit_identical(&case, &what, &rows, &want, &texts);
                     for batch_size in [1, 1024] {
                         let got = model.encode_with_args(&texts, *max_length, batch_size);
                         let what = format!("encode_with_args(max_length={max_length:?}, batch_size={batch_size})");
@@ -251,6 +262,7 @@ fn check_all(tokenizer_path: &str, dims: &[usize]) {
                     }
                     if *max_length == Some(512) {
                         assert_bit_identical(&case, "encode", &model.encode(&texts), &want, &texts);
+                        assert_eq!(model.encode_flat(&texts), want.concat(), "{} encode_flat", case.label());
                         let singles: Vec<Vec<f32>> = texts.iter().map(|t| model.encode_single(t)).collect();
                         assert_bit_identical(&case, "encode_single", &singles, &want, &texts);
                     }
@@ -268,6 +280,14 @@ fn wordpiece_pooling_matches_reference() {
 #[test]
 fn unigram_pooling_matches_reference() {
     check_all(UNIGRAM_TOKENIZER, &[2, 64, 256, 1000]);
+}
+
+#[test]
+fn encode_flat_of_no_texts_is_empty() {
+    let tokenizer = Tokenizer::from_file(WORDPIECE_TOKENIZER).expect("load fixture tokenizer");
+    let model = Case::new(&tokenizer, 64, Extras::None, true).model();
+    assert!(model.encode_flat(&[]).is_empty());
+    assert!(model.encode(&[]).is_empty());
 }
 
 #[test]
@@ -289,6 +309,7 @@ fn interleaved_lengths_reuse_buffers_correctly() {
     let singles: Vec<Vec<f32>> = texts.iter().map(|t| model.encode_single(t)).collect();
     assert_bit_identical(&case, "encode_single", &singles, &want, &texts);
     assert_bit_identical(&case, "encode", &model.encode(&texts), &want, &texts);
+    assert_eq!(model.encode_flat(&texts), want.concat(), "{} encode_flat", case.label());
 }
 
 #[test]

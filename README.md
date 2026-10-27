@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     ];
 
     // Generate embeddings using default parameters
-    // (Default max_length: Some(512), Default batch_size: 1024)
+    // (Default max_length: Some(512), all sentences in one batch)
     let embeddings = model.encode(&sentences);
     // `embeddings` is a Vec<Vec<f32>>
     println!("Generated {} embeddings.", embeddings.len());
@@ -86,6 +86,15 @@ fn main() -> Result<()> {
         512,       // Custom batch size for processing
     );
     println!("Generated {} custom embeddings.", custom_embeddings.len());
+
+    // `encode_flat` returns one row-major `Vec<f32>` of
+    // `sentences.len() * model.dim()` values. Use it when you want contiguous
+    // output or only read the rows; prefer `encode` if you need an owned
+    // `Vec<f32>` per sentence.
+    let flat = model.encode_flat(&sentences);
+    for row in flat.chunks_exact(model.dim()) {
+        println!("First value: {}", row[0]);
+    }
 
     Ok(())
 }
