@@ -2,7 +2,6 @@ use anyhow::{Context, Result, anyhow};
 use half::f16;
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
 use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
-use ndarray::{Array2, ArrayView2, CowArray, Ix2};
 use safetensors::{SafeTensors, tensor::Dtype};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -32,7 +31,8 @@ pub struct StaticModel {
 #[derive(Debug)]
 struct StaticModelInner {
     tokenizer: Tokenizer,
-    embeddings: CowArray<'static, f32, Ix2>,
+    embeddings: Embeddings,
+    dim: usize,
     weights: Option<Cow<'static, [f32]>>,
     token_mapping: Option<Cow<'static, [usize]>>,
     normalize: bool,
@@ -44,6 +44,22 @@ struct StaticModelInner {
     /// Custom IDs-only Unigram model; `None` for non-Unigram pipelines and
     /// for those it does not reproduce, which fall back to the `tokenizers` crate.
     fast_unigram: Option<FastUnigram>,
+}
+
+/// Embedding table in its stored element type, row-major with `dim` columns.
+#[derive(Debug)]
+enum Embeddings {
+    F32(Cow<'static, [f32]>),
+    I8(Cow<'static, [i8]>),
+}
+
+impl Embeddings {
+    fn len(&self) -> usize {
+        match self {
+            Embeddings::F32(table) => table.len(),
+            Embeddings::I8(table) => table.len(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -199,10 +215,10 @@ impl StaticModel {
 
         let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2-D")?;
         let raw = tensor.data();
-        let floats: Vec<f32> = match tensor.dtype() {
-            Dtype::F32 => decode_f32(raw),
-            Dtype::F16 => decode_f16(raw),
-            Dtype::I8 => raw.iter().map(|&b| f32::from(b as i8)).collect(),
+        let embeddings = match tensor.dtype() {
+            Dtype::F32 => Embeddings::F32(Cow::Owned(decode_f32(raw))),
+            Dtype::F16 => Embeddings::F32(Cow::Owned(decode_f16(raw))),
+            Dtype::I8 => Embeddings::I8(Cow::Owned(raw.iter().map(|&b| b as i8).collect())),
             other => return Err(anyhow!("unsupported tensor dtype: {other:?}")),
         };
 
@@ -230,7 +246,15 @@ impl StaticModel {
             Err(_) => None,
         };
 
-        Self::from_owned(tokenizer, floats, rows, cols, normalize, weights, token_mapping)
+        Self::from_storage(
+            tokenizer,
+            embeddings,
+            rows,
+            cols,
+            normalize,
+            weights.map(Cow::Owned),
+            token_mapping.map(Cow::Owned),
+        )
     }
 
     /// Load a Model2Vec model from a local folder or the HuggingFace Hub.
@@ -274,7 +298,7 @@ impl StaticModel {
     ) -> Result<Self> {
         Self::from_storage(
             tokenizer,
-            Cow::Owned(embeddings),
+            Embeddings::F32(Cow::Owned(embeddings)),
             rows,
             cols,
             normalize,
@@ -304,7 +328,69 @@ impl StaticModel {
     ) -> Result<Self> {
         Self::from_storage(
             tokenizer,
-            Cow::Borrowed(embeddings),
+            Embeddings::F32(Cow::Borrowed(embeddings)),
+            rows,
+            cols,
+            normalize,
+            weights.map(Cow::Borrowed),
+            token_mapping.map(Cow::Borrowed),
+        )
+    }
+
+    /// Construct from owned int8 data, as written by model2vec's
+    /// `quantize_to="int8"`. The embeddings stay int8 in memory.
+    ///
+    /// # Arguments
+    /// * `tokenizer` - Pre-deserialized tokenizer
+    /// * `embeddings` - Owned int8 embedding data
+    /// * `rows` - Number of vocabulary entries
+    /// * `cols` - Embedding dimension
+    /// * `normalize` - Whether to L2-normalize output embeddings
+    /// * `weights` - Optional per-token weights for quantized models
+    /// * `token_mapping` - Optional token ID mapping for quantized models
+    pub fn from_owned_i8(
+        tokenizer: Tokenizer,
+        embeddings: Vec<i8>,
+        rows: usize,
+        cols: usize,
+        normalize: bool,
+        weights: Option<Vec<f32>>,
+        token_mapping: Option<Vec<usize>>,
+    ) -> Result<Self> {
+        Self::from_storage(
+            tokenizer,
+            Embeddings::I8(Cow::Owned(embeddings)),
+            rows,
+            cols,
+            normalize,
+            weights.map(Cow::Owned),
+            token_mapping.map(Cow::Owned),
+        )
+    }
+
+    /// Construct from static int8 slices (zero-copy for embedded binary data),
+    /// as written by model2vec's `quantize_to="int8"`.
+    ///
+    /// # Arguments
+    /// * `tokenizer` - Pre-deserialized tokenizer
+    /// * `embeddings` - Static int8 embedding data (borrowed, no copy)
+    /// * `rows` - Number of vocabulary entries
+    /// * `cols` - Embedding dimension
+    /// * `normalize` - Whether to L2-normalize output embeddings
+    /// * `weights` - Optional static per-token weights for quantized models
+    /// * `token_mapping` - Optional static token ID mapping for quantized models
+    pub fn from_borrowed_i8(
+        tokenizer: Tokenizer,
+        embeddings: &'static [i8],
+        rows: usize,
+        cols: usize,
+        normalize: bool,
+        weights: Option<&'static [f32]>,
+        token_mapping: Option<&'static [usize]>,
+    ) -> Result<Self> {
+        Self::from_storage(
+            tokenizer,
+            Embeddings::I8(Cow::Borrowed(embeddings)),
             rows,
             cols,
             normalize,
@@ -315,7 +401,7 @@ impl StaticModel {
 
     fn from_storage(
         tokenizer: Tokenizer,
-        embeddings: Cow<'static, [f32]>,
+        embeddings: Embeddings,
         rows: usize,
         cols: usize,
         normalize: bool,
@@ -333,18 +419,11 @@ impl StaticModel {
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
         let fast_tok = FastWordPiece::from_tokenizer(&tokenizer);
         let fast_unigram = FastUnigram::from_tokenizer(&tokenizer, unk_token_id);
-        let embeddings = match embeddings {
-            Cow::Owned(data) => {
-                CowArray::from(Array2::from_shape_vec((rows, cols), data).context("failed to build embeddings array")?)
-            }
-            Cow::Borrowed(data) => {
-                CowArray::from(ArrayView2::from_shape((rows, cols), data).context("failed to build embeddings view")?)
-            }
-        };
         Ok(Self {
             inner: Arc::new(StaticModelInner {
                 tokenizer,
                 embeddings,
+                dim: cols,
                 weights,
                 token_mapping,
                 normalize,
@@ -452,15 +531,9 @@ impl StaticModel {
     fn pool_ids(&self, ids: &[u32], max_length: Option<usize>) -> Vec<f32> {
         let model = &self.inner;
         let ids = &ids[..max_length.map_or(ids.len(), |max_tok| max_tok.min(ids.len()))];
-        let (mut sum, cnt) = match model.embeddings.ncols() {
-            64 => self.sum_rows_fixed::<64>(ids),
-            128 => self.sum_rows_fixed::<128>(ids),
-            256 => self.sum_rows_fixed::<256>(ids),
-            384 => self.sum_rows_fixed::<384>(ids),
-            512 => self.sum_rows_fixed::<512>(ids),
-            768 => self.sum_rows_fixed::<768>(ids),
-            1024 => self.sum_rows_fixed::<1024>(ids),
-            _ => self.sum_rows_dyn(ids),
+        let (mut sum, cnt) = match &model.embeddings {
+            Embeddings::F32(table) => self.sum_rows(table, ids),
+            Embeddings::I8(table) => self.sum_rows(table, ids),
         };
         let denom = cnt.max(1) as f32;
         for x in &mut sum {
@@ -475,24 +548,47 @@ impl StaticModel {
         sum
     }
 
+    /// Weighted row sum, using a compile-time dimension when one matches.
+    fn sum_rows<T: Copy>(&self, table: &[T], ids: &[u32]) -> (Vec<f32>, usize)
+    where
+        f32: From<T>,
+    {
+        match self.inner.dim {
+            64 => self.sum_rows_fixed::<T, 64>(table, ids),
+            128 => self.sum_rows_fixed::<T, 128>(table, ids),
+            256 => self.sum_rows_fixed::<T, 256>(table, ids),
+            384 => self.sum_rows_fixed::<T, 384>(table, ids),
+            512 => self.sum_rows_fixed::<T, 512>(table, ids),
+            768 => self.sum_rows_fixed::<T, 768>(table, ids),
+            1024 => self.sum_rows_fixed::<T, 1024>(table, ids),
+            _ => self.sum_rows_dyn(table, ids),
+        }
+    }
+
     /// Weighted row sum for a compile-time embedding dimension.
-    fn sum_rows_fixed<const D: usize>(&self, ids: &[u32]) -> (Vec<f32>, usize) {
+    fn sum_rows_fixed<T: Copy, const D: usize>(&self, table: &[T], ids: &[u32]) -> (Vec<f32>, usize)
+    where
+        f32: From<T>,
+    {
         let mut sum = [0.0_f32; D];
-        let cnt = self.for_each_row(ids, |row, scale| {
-            let row: &[f32; D] = row.try_into().expect("embedding row has D columns");
+        let cnt = self.for_each_row(table, ids, |row, scale| {
+            let row: &[T; D] = row.try_into().expect("embedding row has D columns");
             for (s, &v) in sum.iter_mut().zip(row) {
-                *s += v * scale;
+                *s += f32::from(v) * scale;
             }
         });
         (sum.to_vec(), cnt)
     }
 
     /// Weighted row sum for any embedding dimension.
-    fn sum_rows_dyn(&self, ids: &[u32]) -> (Vec<f32>, usize) {
-        let mut sum = vec![0.0_f32; self.inner.embeddings.ncols()];
-        let cnt = self.for_each_row(ids, |row, scale| {
+    fn sum_rows_dyn<T: Copy>(&self, table: &[T], ids: &[u32]) -> (Vec<f32>, usize)
+    where
+        f32: From<T>,
+    {
+        let mut sum = vec![0.0_f32; self.inner.dim];
+        let cnt = self.for_each_row(table, ids, |row, scale| {
             for (s, &v) in sum.iter_mut().zip(row) {
-                *s += v * scale;
+                *s += f32::from(v) * scale;
             }
         });
         (sum, cnt)
@@ -501,10 +597,9 @@ impl StaticModel {
     /// Call `f` with the embedding row and weight of every non-unk token;
     /// returns the number of rows visited.
     #[inline(always)]
-    fn for_each_row(&self, ids: &[u32], mut f: impl FnMut(&[f32], f32)) -> usize {
+    fn for_each_row<T>(&self, table: &[T], ids: &[u32], mut f: impl FnMut(&[T], f32)) -> usize {
         let model = &self.inner;
-        let table = model.embeddings.as_slice().expect("embeddings are contiguous");
-        let dim = model.embeddings.ncols();
+        let dim = model.dim;
         let mut cnt = 0;
         let tokens = ids
             .iter()
@@ -582,8 +677,9 @@ fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&s
 
 #[cfg(test)]
 mod tests {
-    use super::decode_token_mapping;
+    use super::{Embeddings, StaticModel, decode_token_mapping};
     use safetensors::tensor::Dtype;
+    use std::borrow::Cow;
 
     #[test]
     fn decode_token_mapping_supports_i32_and_i64() {
@@ -604,5 +700,14 @@ mod tests {
     fn decode_token_mapping_rejects_unsupported_dtype() {
         let err = decode_token_mapping(Dtype::F32, &[0, 0, 0, 0]).unwrap_err();
         assert!(err.to_string().contains("unsupported mapping dtype"));
+    }
+
+    #[test]
+    fn int8_models_keep_i8_storage() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let int8 = StaticModel::from_pretrained(format!("{dir}/test-model-int8"), None, None, None).unwrap();
+        assert!(matches!(&int8.inner.embeddings, Embeddings::I8(Cow::Owned(t)) if t.len() == 29528 * 2));
+        let f32_model = StaticModel::from_pretrained(format!("{dir}/test-model-float32"), None, None, None).unwrap();
+        assert!(matches!(&f32_model.inner.embeddings, Embeddings::F32(_)));
     }
 }
