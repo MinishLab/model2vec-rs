@@ -118,5 +118,20 @@
     "NanoSCIDOCS": 0.259793,
     "NanoSciFact": 0.578403,
     "NanoTouche2020": 0.475323
+  },
+  "hotchpotch/bekko-static-embedding-v1": {
+    "NanoArguAna": 0.481588,
+    "NanoClimateFEVER": 0.346348,
+    "NanoDBPedia": 0.56677,
+    "NanoFEVER": 0.733361,
+    "NanoFiQA2018": 0.363626,
+    "NanoHotpotQA": 0.724093,
+    "NanoMSMARCO": 0.448949,
+    "NanoNFCorpus": 0.357624,
+    "NanoNQ": 0.421227,
+    "NanoQuoraRetrieval": 0.932645,
+    "NanoSCIDOCS": 0.357047,
+    "NanoSciFact": 0.711873,
+    "NanoTouche2020": 0.523074
   }
 }
