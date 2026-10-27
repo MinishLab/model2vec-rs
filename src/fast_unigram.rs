@@ -23,94 +23,12 @@
 //! padding configured, or no `unk_id`) return `None` from
 //! [`FastUnigram::from_tokenizer`] so the caller falls back to the crate.
 
+use crate::trie::{DoubleArrayTrie, NONE};
 use tokenizers::{Model, OffsetReferential, OffsetType, PreTokenizer, Tokenizer, models::ModelWrapper};
 
 /// `tokenizers`' `K_UNK_PENALTY`: an unknown character scores this much below
 /// the lowest-scoring piece.
 const UNK_PENALTY: f64 = 10.0;
-
-/// Marks an absent child node, an absent node token, or an unset path start.
-const NONE: u32 = u32::MAX;
-
-/// A byte trie over the vocabulary in CSR layout.
-#[derive(Clone)]
-struct ByteTrie {
-    /// Index of each node's first edge; node `n`'s edges are
-    /// `edge_start[n]..edge_start[n + 1]`.
-    edge_start: Vec<u32>,
-    /// Each edge's byte, sorted within a node.
-    edge_byte: Vec<u8>,
-    /// Each edge's child node.
-    edge_child: Vec<u32>,
-    /// The token ID a node spells, or `NONE`.
-    node_token: Vec<u32>,
-}
-
-impl ByteTrie {
-    /// Build from `(piece, id)` pairs, breadth first, so every node's edges are
-    /// appended together and in byte order.
-    fn build(mut pieces: Vec<(&[u8], u32)>) -> ByteTrie {
-        pieces.sort_unstable();
-        pieces.dedup_by(|a, b| a.0 == b.0);
-        let mut trie = ByteTrie {
-            edge_start: vec![0],
-            edge_byte: Vec::new(),
-            edge_child: Vec::new(),
-            node_token: vec![NONE],
-        };
-        // Each queued node covers the sorted pieces in `lo..hi` that share its
-        // `depth`-byte prefix.
-        let mut queue = std::collections::VecDeque::from([(0usize, 0usize, pieces.len())]);
-        while let Some((depth, mut lo, hi)) = queue.pop_front() {
-            let node = trie.edge_start.len() - 1;
-            if lo < hi && pieces[lo].0.len() == depth {
-                trie.node_token[node] = pieces[lo].1;
-                lo += 1;
-            }
-            while lo < hi {
-                let byte = pieces[lo].0[depth];
-                let mut end = lo + 1;
-                while end < hi && pieces[end].0[depth] == byte {
-                    end += 1;
-                }
-                trie.edge_byte.push(byte);
-                trie.edge_child.push(trie.node_token.len() as u32);
-                trie.node_token.push(NONE);
-                queue.push_back((depth + 1, lo, end));
-                lo = end;
-            }
-            trie.edge_start.push(trie.edge_byte.len() as u32);
-        }
-        trie
-    }
-
-    /// The child of `node` along `byte`, or `NONE`.
-    #[inline(always)]
-    fn child(&self, node: u32, byte: u8) -> u32 {
-        let lo = self.edge_start[node as usize] as usize;
-        let hi = self.edge_start[node as usize + 1] as usize;
-        let bytes = &self.edge_byte[lo..hi];
-        // Most nodes have a handful of edges, where a scan beats a search.
-        let found = if bytes.len() <= 8 {
-            bytes.iter().position(|&b| b == byte)
-        } else {
-            bytes.binary_search(&byte).ok()
-        };
-        found.map_or(NONE, |i| self.edge_child[lo + i])
-    }
-
-    /// The token ID `key` spells, or `NONE`.
-    fn get(&self, key: &[u8]) -> u32 {
-        let mut node = 0;
-        for &byte in key {
-            node = self.child(node, byte);
-            if node == NONE {
-                return NONE;
-            }
-        }
-        self.node_token[node as usize]
-    }
-}
 
 /// The best path ending at a byte position of a pre-token.
 #[derive(Clone, Copy)]
@@ -130,7 +48,7 @@ const UNSET: BestPath = BestPath {
 /// IDs-only Unigram tokenizer over a byte trie of the model's vocabulary.
 #[derive(Clone)]
 pub(crate) struct FastUnigram {
-    trie: ByteTrie,
+    trie: DoubleArrayTrie,
     /// Score of each token ID.
     scores: Vec<f64>,
     unk_id: u32,
@@ -144,7 +62,7 @@ impl std::fmt::Debug for FastUnigram {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         fmt.debug_struct("FastUnigram")
             .field("vocab", &self.scores.len())
-            .field("trie_nodes", &self.trie.node_token.len())
+            .field("trie_nodes", &self.trie.len())
             .field("unk_id", &self.unk_id)
             .field("byte_fallback", &self.byte_fallback)
             .finish()
@@ -174,7 +92,7 @@ impl FastUnigram {
             pieces.push((piece.as_bytes(), model.token_to_id(piece)?));
         }
         let unk_score = model.min_score - UNK_PENALTY;
-        let trie = ByteTrie::build(pieces);
+        let trie = DoubleArrayTrie::build(pieces);
 
         let mut byte_ids = [NONE; 256];
         for (byte, slot) in byte_ids.iter_mut().enumerate() {
@@ -244,7 +162,7 @@ impl FastUnigram {
                     break;
                 }
                 end += 1;
-                let id = self.trie.node_token[node as usize];
+                let id = self.trie.token(node);
                 if id != NONE {
                     self.relax(
                         &mut best[end],
