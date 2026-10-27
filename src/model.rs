@@ -647,13 +647,15 @@ impl StaticModel {
     where
         f32: From<T>,
     {
-        let sum: &mut [f32; D] = out.try_into().expect("output row has D columns");
-        self.for_each_row(table, ids, |row, scale| {
+        let mut sum = [0.0_f32; D];
+        let cnt = self.for_each_row(table, ids, |row, scale| {
             let row: &[T; D] = row.try_into().expect("embedding row has D columns");
             for (s, &v) in sum.iter_mut().zip(row) {
                 *s += f32::from(v) * scale;
             }
-        })
+        });
+        out.copy_from_slice(&sum);
+        cnt
     }
 
     /// Weighted row sum for any embedding dimension.
