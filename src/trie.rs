@@ -7,7 +7,7 @@
 /// Marks an absent node, an absent token, or a free slot's parent.
 pub(crate) const NONE: u32 = u32::MAX;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Node {
     base: u32,
     parent: u32,
@@ -53,7 +53,7 @@ impl Candidates {
 }
 
 /// Double-array trie over byte strings. The root is node 0.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DoubleArrayTrie {
     nodes: Vec<Node>,
 }

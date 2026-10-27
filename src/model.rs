@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use half::f16;
+use half::{f16, slice::HalfFloatSliceExt};
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
 use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
 use safetensors::{SafeTensors, tensor::Dtype};
@@ -34,7 +34,7 @@ pub struct StaticModel {
 
 #[derive(Debug)]
 struct StaticModelInner {
-    tokenizer: Tokenizer,
+    tokenizer: LoadedTokenizer,
     embeddings: Embeddings,
     dim: usize,
     /// Per-row scale applied after the token weight; set by `quantize_int8`.
@@ -42,14 +42,88 @@ struct StaticModelInner {
     weights: Option<Cow<'static, [f32]>>,
     token_mapping: Option<Cow<'static, [usize]>>,
     normalize: bool,
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+enum Tokenization {
+    /// Custom IDs-only WordPiece tokenizer, which needs no `Tokenizer`.
+    WordPiece(FastWordPiece),
+    /// Custom IDs-only Unigram model on top of the crate's pre-processing.
+    Unigram(Tokenizer, FastUnigram),
+    /// Pipelines neither custom tokenizer reproduces.
+    Crate(Tokenizer),
+}
+
+#[derive(Debug, Clone)]
+struct LoadedTokenizer {
+    tokenization: Tokenization,
     median_token_length: usize,
     unk_token_id: Option<usize>,
-    /// Custom IDs-only WordPiece tokenizer; `None` for non-WordPiece
-    /// pipelines, which fall back to the `tokenizers` crate.
-    fast_tok: Option<FastWordPiece>,
-    /// Custom IDs-only Unigram model; `None` for non-Unigram pipelines and
-    /// for those it does not reproduce, which fall back to the `tokenizers` crate.
-    fast_unigram: Option<FastUnigram>,
+}
+
+impl LoadedTokenizer {
+    fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
+        let (median_token_length, unk_token_id) = compute_metadata(&tokenizer)?;
+        let tokenization = if let Some(ft) = FastWordPiece::from_tokenizer(&tokenizer) {
+            Tokenization::WordPiece(ft)
+        } else if let Some(fu) = FastUnigram::from_tokenizer(&tokenizer, unk_token_id) {
+            Tokenization::Unigram(tokenizer, fu)
+        } else {
+            Tokenization::Crate(tokenizer)
+        };
+        Ok(Self {
+            tokenization,
+            median_token_length,
+            unk_token_id,
+        })
+    }
+
+    /// Load from `tokenizer.json` bytes. WordPiece pipelines are read
+    /// directly from the JSON without building a [`Tokenizer`].
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if let Some((ft, median_token_length)) = FastWordPiece::from_json(bytes) {
+            return Ok(Self {
+                unk_token_id: ft.unk_id().map(|id| id as usize),
+                tokenization: Tokenization::WordPiece(ft),
+                median_token_length,
+            });
+        }
+        let tokenizer = Tokenizer::from_bytes(bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+        Self::from_tokenizer(tokenizer)
+    }
+}
+
+/// Median byte length of the vocabulary's tokens (1 for an empty vocabulary).
+pub(crate) fn median_token_length<'a>(tokens: impl Iterator<Item = &'a str>) -> usize {
+    let mut lens: Vec<usize> = tokens.map(str::len).collect();
+    lens.sort_unstable();
+    lens.get(lens.len() / 2).copied().unwrap_or(1)
+}
+
+/// Compute median token length and unk_token_id from tokenizer.
+fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
+    let median_token_length = median_token_length(tokenizer.get_vocab(false).keys().map(String::as_str));
+
+    let lookup = |tok: &str| {
+        tokenizer
+            .token_to_id(tok)
+            .map(|id| id as usize)
+            .ok_or_else(|| anyhow!("unk_token '{tok}' not found in vocabulary"))
+    };
+    let unk_token_id = match tokenizer.get_model() {
+        ModelWrapper::BPE(model) => model.unk_token.as_deref().map(lookup).transpose()?,
+        ModelWrapper::WordPiece(model) => Some(lookup(&model.unk_token)?),
+        ModelWrapper::WordLevel(model) => Some(lookup(&model.unk_token)?),
+        // `tokenizers` keeps Unigram's `unk_id` private, so read it from the serialized model.
+        ModelWrapper::Unigram(model) => serde_json::to_value(model)
+            .context("failed to serialize unigram model")?
+            .get("unk_id")
+            .and_then(Value::as_u64)
+            .map(|id| id as usize),
+    };
+
+    Ok((median_token_length, unk_token_id))
 }
 
 /// Embedding table in its stored element type, row-major with `dim` columns.
@@ -89,11 +163,17 @@ fn decode_f32(raw: &[u8]) -> Vec<f32> {
 }
 
 fn decode_f16(raw: &[u8]) -> Vec<f32> {
-    raw.as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&b| f16::from_le_bytes(b).to_f32())
-        .collect()
+    let raw = raw.as_chunks::<2>().0;
+    let mut out = vec![0.0_f32; raw.len()];
+    let mut halves = [f16::ZERO; 1024];
+    for (src, dst) in raw.chunks(halves.len()).zip(out.chunks_mut(halves.len())) {
+        let halves = &mut halves[..src.len()];
+        for (h, &b) in halves.iter_mut().zip(src) {
+            *h = f16::from_le_bytes(b);
+        }
+        halves.convert_to_f32_slice(dst);
+    }
+    out
 }
 
 fn match_local_layout(config_base: &Path, model_base: &Path, config_file: &str) -> Option<ModelFiles> {
@@ -204,15 +284,23 @@ impl StaticModel {
         M: AsRef<[u8]>,
         C: AsRef<[u8]>,
     {
-        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+        let tokenizer = LoadedTokenizer::from_bytes(tokenizer_bytes.as_ref())?;
+        Self::from_loaded_bytes(tokenizer, model_bytes.as_ref(), config_bytes.as_ref(), normalize)
+    }
 
+    fn from_loaded_bytes(
+        tokenizer: LoadedTokenizer,
+        model_bytes: &[u8],
+        config_bytes: &[u8],
+        normalize: Option<bool>,
+    ) -> Result<Self> {
         // Read normalize default from config.json
-        let cfg: Value = serde_json::from_slice(config_bytes.as_ref()).context("failed to parse config.json")?;
+        let cfg: Value = serde_json::from_slice(config_bytes).context("failed to parse config.json")?;
         let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
         let normalize = normalize.unwrap_or(cfg_norm);
 
         // Load the safetensors
-        let safet = SafeTensors::deserialize(model_bytes.as_ref()).context("failed to parse safetensors")?;
+        let safet = SafeTensors::deserialize(model_bytes).context("failed to parse safetensors")?;
         let tensor = safet
             .tensor("embeddings")
             .or_else(|_| safet.tensor("0"))
@@ -303,7 +391,7 @@ impl StaticModel {
         token_mapping: Option<Vec<usize>>,
     ) -> Result<Self> {
         Self::from_storage(
-            tokenizer,
+            LoadedTokenizer::from_tokenizer(tokenizer)?,
             Embeddings::F32(Cow::Owned(embeddings)),
             rows,
             cols,
@@ -333,7 +421,7 @@ impl StaticModel {
         token_mapping: Option<&'static [usize]>,
     ) -> Result<Self> {
         Self::from_storage(
-            tokenizer,
+            LoadedTokenizer::from_tokenizer(tokenizer)?,
             Embeddings::F32(Cow::Borrowed(embeddings)),
             rows,
             cols,
@@ -364,7 +452,7 @@ impl StaticModel {
         token_mapping: Option<Vec<usize>>,
     ) -> Result<Self> {
         Self::from_storage(
-            tokenizer,
+            LoadedTokenizer::from_tokenizer(tokenizer)?,
             Embeddings::I8(Cow::Owned(embeddings)),
             rows,
             cols,
@@ -395,7 +483,7 @@ impl StaticModel {
         token_mapping: Option<&'static [usize]>,
     ) -> Result<Self> {
         Self::from_storage(
-            tokenizer,
+            LoadedTokenizer::from_tokenizer(tokenizer)?,
             Embeddings::I8(Cow::Borrowed(embeddings)),
             rows,
             cols,
@@ -406,7 +494,7 @@ impl StaticModel {
     }
 
     fn from_storage(
-        tokenizer: Tokenizer,
+        tokenizer: LoadedTokenizer,
         embeddings: Embeddings,
         rows: usize,
         cols: usize,
@@ -425,9 +513,6 @@ impl StaticModel {
                 cols
             ));
         }
-        let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
-        let fast_tok = FastWordPiece::from_tokenizer(&tokenizer);
-        let fast_unigram = FastUnigram::from_tokenizer(&tokenizer, unk_token_id);
         Ok(Self {
             inner: Arc::new(StaticModelInner {
                 tokenizer,
@@ -437,10 +522,6 @@ impl StaticModel {
                 weights,
                 token_mapping,
                 normalize,
-                median_token_length,
-                unk_token_id,
-                fast_tok,
-                fast_unigram,
             }),
         })
     }
@@ -468,10 +549,6 @@ impl StaticModel {
                 weights: shared.weights.clone(),
                 token_mapping: shared.token_mapping.clone(),
                 normalize: shared.normalize,
-                median_token_length: shared.median_token_length,
-                unk_token_id: shared.unk_token_id,
-                fast_tok: shared.fast_tok.clone(),
-                fast_unigram: shared.fast_unigram.clone(),
             },
         };
         if inner.token_mapping.is_none()
@@ -483,33 +560,6 @@ impl StaticModel {
         }
         inner.row_scales = Some(scales);
         StaticModel { inner: Arc::new(inner) }
-    }
-
-    /// Compute median token length and unk_token_id from tokenizer.
-    fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
-        let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
-        lens.sort_unstable();
-        let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
-
-        let lookup = |tok: &str| {
-            tokenizer
-                .token_to_id(tok)
-                .map(|id| id as usize)
-                .ok_or_else(|| anyhow!("unk_token '{tok}' not found in vocabulary"))
-        };
-        let unk_token_id = match tokenizer.get_model() {
-            ModelWrapper::BPE(model) => model.unk_token.as_deref().map(lookup).transpose()?,
-            ModelWrapper::WordPiece(model) => Some(lookup(&model.unk_token)?),
-            ModelWrapper::WordLevel(model) => Some(lookup(&model.unk_token)?),
-            // `tokenizers` keeps Unigram's `unk_id` private, so read it from the serialized model.
-            ModelWrapper::Unigram(model) => serde_json::to_value(model)
-                .context("failed to serialize unigram model")?
-                .get("unk_id")
-                .and_then(Value::as_u64)
-                .map(|id| id as usize),
-        };
-
-        Ok((median_token_length, unk_token_id))
     }
 
     /// Char-level truncation to max_tokens * median_token_length
@@ -589,20 +639,20 @@ impl StaticModel {
     fn encode_into(&self, text: &str, max_length: Option<usize>, out: &mut [f32]) {
         let model = &self.inner;
         let text = max_length.map_or(text, |max_tok| {
-            Self::truncate_str(text, max_tok, model.median_token_length)
+            Self::truncate_str(text, max_tok, model.tokenizer.median_token_length)
         });
-        match (&model.fast_tok, &model.fast_unigram) {
-            (Some(ft), _) => TOKEN_IDS.with_borrow_mut(|ids| {
+        match &model.tokenizer.tokenization {
+            Tokenization::WordPiece(ft) => TOKEN_IDS.with_borrow_mut(|ids| {
                 ids.clear();
                 ft.encode_ids_into(text, ids);
                 self.pool_ids(ids, max_length, out)
             }),
-            (None, Some(fu)) => {
-                let ids = fu.encode_ids(&model.tokenizer, text).expect("tokenization failed");
+            Tokenization::Unigram(tokenizer, fu) => {
+                let ids = fu.encode_ids(tokenizer, text).expect("tokenization failed");
                 self.pool_ids(&ids, max_length, out)
             }
-            (None, None) => {
-                let encoding = model.tokenizer.encode_fast(text, false).expect("tokenization failed");
+            Tokenization::Crate(tokenizer) => {
+                let encoding = tokenizer.encode_fast(text, false).expect("tokenization failed");
                 self.pool_ids(encoding.get_ids(), max_length, out)
             }
         }
@@ -701,7 +751,7 @@ impl StaticModel {
         let tokens = ids
             .iter()
             .map(|&id| id as usize)
-            .filter(|&tok| Some(tok) != model.unk_token_id);
+            .filter(|&tok| Some(tok) != model.tokenizer.unk_token_id);
         match (&model.token_mapping, &model.weights, &model.row_scales) {
             (None, None, None) => {
                 for tok in tokens {
