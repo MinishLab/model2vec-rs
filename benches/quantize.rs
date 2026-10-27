@@ -78,8 +78,15 @@ fn main() {
         .expect("usage: quantize corpus=<file> [model=..] [int8=<dir>] [rounds=N]");
     let model_id = arg("model", "minishlab/potion-base-8M");
 
+    let orders = permutations(3 + usize::from(args.contains_key("int8")));
+    let rounds: usize = arg("rounds", &orders.len().to_string())
+        .parse()
+        .expect("rounds must be an integer");
+    assert!(rounds > 0, "rounds must be at least 1");
+
     let text = fs::read_to_string(corpus).unwrap_or_else(|e| panic!("failed to read {corpus}: {e}"));
     let words: Vec<&str> = text.split_whitespace().collect();
+    assert!(!words.is_empty(), "corpus {corpus} contains no words");
     let make = |n: usize, k: usize| -> Vec<String> { words.chunks(n).cycle().take(k).map(|c| c.join(" ")).collect() };
 
     let load = |id: &str| {
@@ -93,10 +100,6 @@ fn main() {
     if let Some(dir) = args.get("int8") {
         variants.push(("model2vec int8".to_string(), load(dir)));
     }
-    let orders = permutations(variants.len());
-    let rounds: usize = arg("rounds", &orders.len().to_string())
-        .parse()
-        .expect("rounds must be an integer");
 
     let accuracy_texts: Vec<String> = make(8, 20_000).into_iter().chain(make(256, 2_000)).collect();
     let reference = variants[0].1.encode(&accuracy_texts);
