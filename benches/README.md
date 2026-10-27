@@ -38,3 +38,16 @@ For trustworthy numbers:
    setting and isolates per-text cost from scheduling.
 4. Only claim a speedup for configurations marked `faster` whose output is
    `identical` (for changes that must not alter embeddings).
+
+## Int8 models
+
+To benchmark int8 storage, quantize models with Python model2vec and pass
+the output directories to `--models`:
+
+```python
+from model2vec import StaticModel
+
+for model_id in ["minishlab/potion-base-8M", "minishlab/potion-retrieval-32M"]:
+    model = StaticModel.from_pretrained(model_id, quantize_to="int8")
+    model.save_pretrained(f"target/bench-compare/int8-models/{model_id.split('/')[1]}")
+```
