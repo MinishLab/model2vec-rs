@@ -11,7 +11,11 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokenizers::{Tokenizer, models::ModelWrapper, parallelism::MaybeParallelRefIterator};
+use tokenizers::{
+    Tokenizer,
+    models::ModelWrapper,
+    parallelism::{MaybeParallelRefIterator, MaybeParallelRefMutIterator},
+};
 
 use crate::fast_unigram::FastUnigram;
 use crate::fast_wordpiece::FastWordPiece;
@@ -543,6 +547,9 @@ impl StaticModel {
         weights: Option<Cow<'static, [f32]>>,
         token_mapping: Option<Cow<'static, [usize]>>,
     ) -> Result<Self> {
+        if cols == 0 {
+            return Err(anyhow!("embedding dimension must be greater than 0"));
+        }
         if embeddings.len() != rows * cols {
             return Err(anyhow!(
                 "embeddings length {} != rows {} * cols {}",
@@ -630,9 +637,33 @@ impl StaticModel {
         embeddings
     }
 
-    /// Default encode: `max_length=512`, `batch_size=1024`
+    /// Default encode: `max_length=512`, all sentences in one batch
     pub fn encode(&self, sentences: &[String]) -> Vec<Vec<f32>> {
-        self.encode_with_args(sentences, Some(512), 1024)
+        self.encode_with_args(sentences, Some(512), sentences.len().max(1))
+    }
+
+    /// Embedding dimension of the vectors this model produces.
+    pub fn dim(&self) -> usize {
+        self.inner.dim
+    }
+
+    /// Encode texts into one row-major buffer of `sentences.len() * dim` floats.
+    ///
+    /// # Arguments
+    /// * `sentences` - the list of sentences to encode.
+    /// * `max_length` - max tokens per text.
+    pub fn encode_flat_with_args(&self, sentences: &[String], max_length: Option<usize>) -> Vec<f32> {
+        let dim = self.inner.dim;
+        let mut out = vec![0.0_f32; sentences.len() * dim];
+        let mut jobs: Vec<(&str, &mut [f32])> = sentences.iter().map(String::as_str).zip(out.chunks_mut(dim)).collect();
+        jobs.maybe_par_iter_mut()
+            .for_each(|(text, row)| self.encode_into(text, max_length, row));
+        out
+    }
+
+    /// Default flat encode: `max_length=512`
+    pub fn encode_flat(&self, sentences: &[String]) -> Vec<f32> {
+        self.encode_flat_with_args(sentences, Some(512))
     }
 
     /// Encode a single sentence into a vector.
@@ -644,6 +675,13 @@ impl StaticModel {
     /// Uses the custom WordPiece tokenizer or Unigram model when the model
     /// matches that pipeline; other pipelines use the `tokenizers` crate.
     fn encode_one(&self, text: &str, max_length: Option<usize>) -> Vec<f32> {
+        let mut out = vec![0.0_f32; self.inner.dim];
+        self.encode_into(text, max_length, &mut out);
+        out
+    }
+
+    /// Truncate, tokenize and pool one text into `out`, which must hold `dim` zeros.
+    fn encode_into(&self, text: &str, max_length: Option<usize>, out: &mut [f32]) {
         let model = &self.inner;
         let text = max_length.map_or(text, |max_tok| {
             Self::truncate_str(text, max_tok, model.tokenizer.median_token_length)
@@ -652,90 +690,106 @@ impl StaticModel {
             Tokenization::WordPiece(ft) => TOKEN_IDS.with_borrow_mut(|ids| {
                 ids.clear();
                 ft.encode_ids_into(text, ids);
-                self.pool_ids(ids, max_length)
+                self.pool_ids(ids, max_length, out)
             }),
             Tokenization::Unigram(tokenizer, fu) => {
                 let ids = fu.encode_ids(tokenizer, text).expect("tokenization failed");
-                self.pool_ids(&ids, max_length)
+                self.pool_ids(&ids, max_length, out)
             }
             Tokenization::Crate(tokenizer) => {
                 let encoding = tokenizer.encode_fast(text, false).expect("tokenization failed");
-                self.pool_ids(encoding.get_ids(), max_length)
+                self.pool_ids(encoding.get_ids(), max_length, out)
             }
         }
     }
 
     /// Mean-pool the first `max_length` token IDs, skipping the unk token.
-    fn pool_ids(&self, ids: &[u32], max_length: Option<usize>) -> Vec<f32> {
+    fn pool_ids(&self, ids: &[u32], max_length: Option<usize>, sum: &mut [f32]) {
         let model = &self.inner;
         let ids = &ids[..max_length.map_or(ids.len(), |max_tok| max_tok.min(ids.len()))];
-        let (mut sum, cnt) = match &model.embeddings {
-            Embeddings::F32(table) => self.sum_rows(table, ids),
-            Embeddings::I8(table) => self.sum_rows(table, ids),
+        let cnt = match &model.embeddings {
+            Embeddings::F32(table) => self.sum_rows(table, ids, sum),
+            Embeddings::I8(table) => self.sum_rows(table, ids, sum),
         };
         let denom = cnt.max(1) as f32;
-        for x in &mut sum {
-            *x /= denom;
-        }
         if model.normalize {
-            let norm = sum.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
-            for x in &mut sum {
+            let mut sq = 0.0_f32;
+            for x in sum.iter_mut() {
+                *x /= denom;
+                sq += *x * *x;
+            }
+            let norm = sq.sqrt().max(1e-12);
+            for x in sum.iter_mut() {
                 *x /= norm;
             }
+        } else {
+            for x in sum.iter_mut() {
+                *x /= denom;
+            }
         }
-        sum
     }
 
     /// Weighted row sum, using a compile-time dimension when one matches.
-    fn sum_rows<T: Copy>(&self, table: &[T], ids: &[u32]) -> (Vec<f32>, usize)
+    fn sum_rows<T: Copy>(&self, table: &[T], ids: &[u32], out: &mut [f32]) -> usize
     where
         f32: From<T>,
     {
         match self.inner.dim {
-            64 => self.sum_rows_fixed::<T, 64>(table, ids),
-            128 => self.sum_rows_fixed::<T, 128>(table, ids),
-            256 => self.sum_rows_fixed::<T, 256>(table, ids),
-            384 => self.sum_rows_fixed::<T, 384>(table, ids),
-            512 => self.sum_rows_fixed::<T, 512>(table, ids),
-            768 => self.sum_rows_fixed::<T, 768>(table, ids),
-            1024 => self.sum_rows_fixed::<T, 1024>(table, ids),
-            _ => self.sum_rows_dyn(table, ids),
+            64 => self.sum_rows_fixed::<T, 64>(table, ids, out),
+            128 => self.sum_rows_fixed::<T, 128>(table, ids, out),
+            256 => self.sum_rows_fixed::<T, 256>(table, ids, out),
+            384 => self.sum_rows_fixed::<T, 384>(table, ids, out),
+            512 => self.sum_rows_fixed::<T, 512>(table, ids, out),
+            768 => self.sum_rows_fixed::<T, 768>(table, ids, out),
+            1024 => self.sum_rows_fixed::<T, 1024>(table, ids, out),
+            _ => self.sum_rows_dyn(table, ids, out),
         }
     }
 
     /// Weighted row sum for a compile-time embedding dimension.
-    fn sum_rows_fixed<T: Copy, const D: usize>(&self, table: &[T], ids: &[u32]) -> (Vec<f32>, usize)
+    fn sum_rows_fixed<T: Copy, const D: usize>(&self, table: &[T], ids: &[u32], out: &mut [f32]) -> usize
     where
         f32: From<T>,
     {
-        let mut sum = [0.0_f32; D];
-        let cnt = self.for_each_row(table, ids, |row, scale| {
-            let row: &[T; D] = row.try_into().expect("embedding row has D columns");
-            for (s, &v) in sum.iter_mut().zip(row) {
-                *s += f32::from(v) * scale;
-            }
-        });
-        (sum.to_vec(), cnt)
+        let sum: &mut [f32; D] = out.try_into().expect("output has D columns");
+        self.sum_rows_blocked(table, ids, sum)
     }
 
     /// Weighted row sum for any embedding dimension.
-    fn sum_rows_dyn<T: Copy>(&self, table: &[T], ids: &[u32]) -> (Vec<f32>, usize)
+    fn sum_rows_dyn<T: Copy>(&self, table: &[T], ids: &[u32], sum: &mut [f32]) -> usize
     where
         f32: From<T>,
     {
-        let mut sum = vec![0.0_f32; self.inner.dim];
+        self.sum_rows_blocked(table, ids, sum)
+    }
+
+    /// Weighted row sum that adds `BLOCK` rows per pass over `sum`, in token
+    /// order, so the result matches adding one row at a time.
+    #[inline(always)]
+    fn sum_rows_blocked<T: Copy>(&self, table: &[T], ids: &[u32], sum: &mut [f32]) -> usize
+    where
+        f32: From<T>,
+    {
+        let mut pending: [(&[T], f32); BLOCK] = [(&[], 0.0); BLOCK];
+        let mut n = 0;
         let cnt = self.for_each_row(table, ids, |row, scale| {
-            for (s, &v) in sum.iter_mut().zip(row) {
-                *s += f32::from(v) * scale;
+            pending[n] = (row, scale);
+            n += 1;
+            if n == BLOCK {
+                add_rows(sum, &pending);
+                n = 0;
             }
         });
-        (sum, cnt)
+        for &(row, scale) in &pending[..n] {
+            add_row(sum, row, scale);
+        }
+        cnt
     }
 
     /// Call `f` with the embedding row and scale (token weight times row
     /// scale) of every non-unk token; returns the number of rows visited.
     #[inline(always)]
-    fn for_each_row<T>(&self, table: &[T], ids: &[u32], mut f: impl FnMut(&[T], f32)) -> usize {
+    fn for_each_row<'t, T>(&self, table: &'t [T], ids: &[u32], mut f: impl FnMut(&'t [T], f32)) -> usize {
         let model = &self.inner;
         let dim = model.dim;
         let mut cnt = 0;
@@ -769,6 +823,59 @@ impl StaticModel {
             }
         }
         cnt
+    }
+}
+
+/// `sum += row * scale`.
+#[inline(always)]
+fn add_row<T: Copy>(sum: &mut [f32], row: &[T], scale: f32)
+where
+    f32: From<T>,
+{
+    for (s, &v) in sum.iter_mut().zip(row) {
+        *s += f32::from(v) * scale;
+    }
+}
+
+const BLOCK: usize = 8;
+
+/// `sum += r0 * s0 + r1 * s1 + ...` over BLOCK rows, added left to right.
+#[inline(always)]
+fn add_rows<T: Copy>(sum: &mut [f32], rows: &[(&[T], f32); BLOCK])
+where
+    f32: From<T>,
+{
+    let n = sum.len();
+    let [
+        (r0, s0),
+        (r1, s1),
+        (r2, s2),
+        (r3, s3),
+        (r4, s4),
+        (r5, s5),
+        (r6, s6),
+        (r7, s7),
+    ] = *rows;
+    let (r0, r1, r2, r3, r4, r5, r6, r7) = (
+        &r0[..n],
+        &r1[..n],
+        &r2[..n],
+        &r3[..n],
+        &r4[..n],
+        &r5[..n],
+        &r6[..n],
+        &r7[..n],
+    );
+    for j in 0..n {
+        sum[j] = sum[j]
+            + f32::from(r0[j]) * s0
+            + f32::from(r1[j]) * s1
+            + f32::from(r2[j]) * s2
+            + f32::from(r3[j]) * s3
+            + f32::from(r4[j]) * s4
+            + f32::from(r5[j]) * s5
+            + f32::from(r6[j]) * s6
+            + f32::from(r7[j]) * s7;
     }
 }
 

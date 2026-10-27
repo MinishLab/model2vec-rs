@@ -14,7 +14,7 @@
 //! `normalized`/`single_word`/`lstrip`/`rstrip` set) return `None` from
 //! [`FastWordPiece::from_tokenizer`] so the caller falls back to the crate.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
 
 use tokenizers::{
     Tokenizer, models::ModelWrapper, normalizers::NormalizerWrapper, pre_tokenizers::PreTokenizerWrapper,
@@ -22,9 +22,15 @@ use tokenizers::{
 use unicode_categories::UnicodeCategories;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::trie::{DoubleArrayTrie, NONE};
+
+thread_local! {
+    static NORMALIZED: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
 /// Magic and format version of the binary cache; bump the version whenever
 /// the layout or the meaning of any field changes.
-const CACHE_MAGIC: &[u8; 8] = b"M2VWP\x00\x00\x01";
+const CACHE_MAGIC: &[u8; 8] = b"M2VWP\x00\x00\x02";
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -57,13 +63,14 @@ impl<'a> Reader<'a> {
 /// IDs-only WordPiece tokenizer for the BERT pipeline.
 #[derive(Debug, Clone)]
 pub(crate) struct FastWordPiece {
-    vocab: HashMap<String, u32>,
+    vocab: DoubleArrayTrie,
+    /// Trie node reached by the continuing-subword prefix, or `NONE`.
+    continuation: u32,
     /// Vocab IDs of single-ASCII-byte tokens (-1 when absent), so isolated
-    /// punctuation words skip the map lookup.
+    /// punctuation words skip the trie walk.
     single_byte: [i32; 128],
     unk_id: Option<u32>,
     max_input_chars_per_word: usize,
-    continuing_subword_prefix: String,
     // BertNormalizer settings
     clean_text: bool,
     handle_chinese_chars: bool,
@@ -106,11 +113,14 @@ impl FastWordPiece {
             added_tokens.push((t.content, id));
         }
 
+        let trie = DoubleArrayTrie::build(vocab.iter().map(|(k, &id)| (k.as_bytes(), id)).collect());
+        let continuation = trie.walk(model.continuing_subword_prefix.as_bytes());
+
         Some(Self::assemble(
-            vocab,
+            trie,
+            continuation,
             unk_id,
             model.max_input_chars_per_word,
-            model.continuing_subword_prefix.clone(),
             norm.clean_text,
             norm.handle_chinese_chars,
             // `strip_accents: None` follows the lowercase setting, matching HuggingFace.
@@ -122,10 +132,10 @@ impl FastWordPiece {
 
     #[allow(clippy::too_many_arguments)]
     fn assemble(
-        vocab: HashMap<String, u32>,
+        vocab: DoubleArrayTrie,
+        continuation: u32,
         unk_id: Option<u32>,
         max_input_chars_per_word: usize,
-        continuing_subword_prefix: String,
         clean_text: bool,
         handle_chinese_chars: bool,
         strip_accents: bool,
@@ -140,17 +150,18 @@ impl FastWordPiece {
 
         let mut single_byte = [-1_i32; 128];
         for (b, slot) in single_byte.iter_mut().enumerate() {
-            if let Some(&id) = vocab.get(&(b as u8 as char).to_string()) {
+            let id = vocab.get(&[b as u8]);
+            if id != NONE {
                 *slot = id as i32;
             }
         }
 
         FastWordPiece {
             vocab,
+            continuation,
             single_byte,
             unk_id,
             max_input_chars_per_word,
-            continuing_subword_prefix,
             clean_text,
             handle_chinese_chars,
             strip_accents,
@@ -163,11 +174,8 @@ impl FastWordPiece {
     /// Serialize to the binary cache format, tagged with the checksum of the
     /// `tokenizer.json` it was built from and the model's median token length.
     pub(crate) fn to_cache_bytes(&self, checksum: u64, median_token_length: usize) -> Vec<u8> {
-        let mut vocab: Vec<(&str, u32)> = self.vocab.iter().map(|(k, &v)| (k.as_str(), v)).collect();
-        vocab.sort_unstable_by_key(|&(_, id)| id);
-        let strings_len: usize = vocab.iter().map(|(k, _)| k.len() + 8).sum();
-
-        let mut out = Vec::with_capacity(64 + strings_len);
+        let added_len: usize = self.added_tokens.iter().map(|(k, _)| k.len() + 8).sum();
+        let mut out = Vec::with_capacity(64 + 12 * self.vocab.len() + added_len);
         out.extend_from_slice(CACHE_MAGIC);
         out.extend_from_slice(&checksum.to_le_bytes());
         out.extend_from_slice(&(median_token_length as u64).to_le_bytes());
@@ -178,13 +186,15 @@ impl FastWordPiece {
             | (self.strip_accents as u8) << 2
             | (self.lowercase as u8) << 3;
         out.push(flags);
-        put_str(&mut out, &self.continuing_subword_prefix);
-        for list in [vocab, self.added_tokens.iter().map(|(k, v)| (k.as_str(), *v)).collect()] {
-            out.extend_from_slice(&(list.len() as u32).to_le_bytes());
-            for (token, id) in list {
-                out.extend_from_slice(&id.to_le_bytes());
-                put_str(&mut out, token);
-            }
+        out.extend_from_slice(&self.continuation.to_le_bytes());
+        out.extend_from_slice(&(self.vocab.len() as u32).to_le_bytes());
+        for word in self.vocab.to_words().flatten() {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.added_tokens.len() as u32).to_le_bytes());
+        for (token, id) in &self.added_tokens {
+            out.extend_from_slice(&id.to_le_bytes());
+            put_str(&mut out, token);
         }
         out
     }
@@ -201,13 +211,16 @@ impl FastWordPiece {
         let unk_id = Some(r.u32()?).filter(|&id| id != u32::MAX);
         let max_input_chars_per_word = r.u64()? as usize;
         let flags = r.take(1)?[0];
-        let continuing_subword_prefix = r.str()?.to_string();
+        let continuation = r.u32()?;
 
         let n = r.u32()? as usize;
-        let mut vocab = HashMap::with_capacity(n);
-        for _ in 0..n {
-            let id = r.u32()?;
-            vocab.insert(r.str()?.to_string(), id);
+        let raw = r.take(n.checked_mul(12)?)?;
+        let vocab = DoubleArrayTrie::from_words(raw.as_chunks::<12>().0.iter().map(|node| {
+            let word = |i: usize| u32::from_le_bytes([node[i], node[i + 1], node[i + 2], node[i + 3]]);
+            [word(0), word(4), word(8)]
+        }))?;
+        if continuation != NONE && continuation as usize >= vocab.len() {
+            return None;
         }
         let n = r.u32()? as usize;
         let mut added_tokens = Vec::with_capacity(n);
@@ -225,9 +238,9 @@ impl FastWordPiece {
 
         let ft = Self::assemble(
             vocab,
+            continuation,
             unk_id,
             max_input_chars_per_word,
-            continuing_subword_prefix,
             flags & 1 != 0,
             flags & 2 != 0,
             flags & 4 != 0,
@@ -252,7 +265,10 @@ impl FastWordPiece {
 
     /// Like [`Self::encode_ids`], but appends to a caller-owned buffer.
     pub(crate) fn encode_ids_into(&self, text: &str, out: &mut Vec<u32>) {
-        let mut scratch = String::new();
+        NORMALIZED.with_borrow_mut(|scratch| self.encode_ids_with(text, out, scratch));
+    }
+
+    fn encode_ids_with(&self, text: &str, out: &mut Vec<u32>, scratch: &mut String) {
         // Split on added tokens (leftmost-longest), then run the BERT
         // pipeline on each span of ordinary text between them.
         let bytes = text.as_bytes();
@@ -268,7 +284,7 @@ impl FastWordPiece {
                 .flatten();
             match hit {
                 Some((content, id)) => {
-                    self.encode_span(&text[start..i], out, &mut scratch);
+                    self.encode_span(&text[start..i], out, scratch);
                     out.push(*id);
                     i += content.len();
                     start = i;
@@ -278,18 +294,17 @@ impl FastWordPiece {
                 None => i += text[i..].chars().next().map_or(1, char::len_utf8),
             }
         }
-        self.encode_span(&text[start..], out, &mut scratch);
+        self.encode_span(&text[start..], out, scratch);
     }
 
     /// Normalize, pre-tokenize and WordPiece a span with no added tokens.
-    fn encode_span(&self, span: &str, out: &mut Vec<u32>, scratch: &mut String) {
+    fn encode_span(&self, span: &str, out: &mut Vec<u32>, normalized: &mut String) {
         if span.is_empty() {
             return;
         }
-        let normalized = self.normalize(span);
-        for word in pre_tokenize(&normalized) {
-            self.word_to_ids(word, out, scratch);
-        }
+        normalized.clear();
+        self.normalize_into(span, normalized);
+        pre_tokenize(normalized, |word| self.word_to_ids(word, out));
     }
 
     // --- WordPiece ---------------------------------------------------------
@@ -302,16 +317,16 @@ impl FastWordPiece {
 
     /// Greedy longest-match-first. A word that cannot be fully tokenized (or
     /// exceeds `max_input_chars_per_word`) maps to a single unk token.
-    fn word_to_ids(&self, word: &str, out: &mut Vec<u32>, scratch: &mut String) {
+    fn word_to_ids(&self, word: &str, out: &mut Vec<u32>) {
         // Rune count never exceeds byte length, so short words skip the scan.
         if word.len() > self.max_input_chars_per_word && word.chars().count() > self.max_input_chars_per_word {
             self.push_unk(out);
             return;
         }
 
-        if word.len() == 1 {
-            let b = word.as_bytes()[0];
-            let id = self.single_byte[b as usize];
+        let bytes = word.as_bytes();
+        if bytes.len() == 1 {
+            let id = self.single_byte[bytes[0] as usize];
             if id >= 0 {
                 out.push(id as u32);
             } else {
@@ -320,32 +335,20 @@ impl FastWordPiece {
             return;
         }
 
+        // Vocab entries are valid UTF-8, so every match ends on a char boundary.
         let mark = out.len();
         let mut start = 0;
-        while start < word.len() {
-            let mut end = word.len();
-            let mut found = None;
-            while end > start {
-                let sub = &word[start..end];
-                let id = if start == 0 {
-                    self.vocab.get(sub).copied()
-                } else {
-                    scratch.clear();
-                    scratch.push_str(&self.continuing_subword_prefix);
-                    scratch.push_str(sub);
-                    self.vocab.get(scratch.as_str()).copied()
-                };
-                if let Some(id) = id {
-                    found = Some(id);
-                    break;
-                }
-                // Step back one char (start/end stay on char boundaries).
-                end -= sub.chars().next_back().unwrap().len_utf8();
-            }
+        while start < bytes.len() {
+            let node = if start == 0 { 0 } else { self.continuation };
+            let found = if node == NONE {
+                None
+            } else {
+                self.vocab.longest_prefix(node, &bytes[start..])
+            };
             match found {
-                Some(id) => {
+                Some((id, len)) => {
                     out.push(id);
-                    start = end;
+                    start += len;
                 }
                 None => {
                     out.truncate(mark);
@@ -358,21 +361,20 @@ impl FastWordPiece {
 
     // --- BertNormalizer ----------------------------------------------------
 
-    fn normalize(&self, input: &str) -> String {
-        if input.is_empty() {
-            return String::new();
-        }
+    /// Append the normalized `input` to `out`. Edge whitespace is kept, since
+    /// pre-tokenization drops it anyway.
+    fn normalize_into(&self, input: &str, out: &mut String) {
         if input.is_ascii() {
-            self.normalize_ascii(input)
+            self.normalize_ascii(input, out)
         } else {
-            self.normalize_unicode(input)
+            self.normalize_unicode(input, out)
         }
     }
 
-    /// Fused clean + lowercase + trim over ASCII bytes. Accent stripping (NFD
-    /// is identity below 0x80) and Chinese handling are no-ops for ASCII.
-    fn normalize_ascii(&self, input: &str) -> String {
-        let mut buf = Vec::with_capacity(input.len());
+    /// Fused clean + lowercase over ASCII bytes. Accent stripping (NFD is
+    /// identity below 0x80) and Chinese handling are no-ops for ASCII.
+    fn normalize_ascii(&self, input: &str, out: &mut String) {
+        out.reserve(input.len());
         for &orig in input.as_bytes() {
             let mut b = orig;
             if self.clean_text {
@@ -385,21 +387,11 @@ impl FastWordPiece {
             if self.lowercase && b.is_ascii_uppercase() {
                 b += b'a' - b'A';
             }
-            buf.push(b);
+            out.push(b as char);
         }
-        let mut start = 0;
-        let mut end = buf.len();
-        while start < end && is_ascii_space(buf[start]) {
-            start += 1;
-        }
-        while end > start && is_ascii_space(buf[end - 1]) {
-            end -= 1;
-        }
-        // Bytes stayed ASCII throughout, so this is valid UTF-8.
-        String::from_utf8(buf[start..end].to_vec()).unwrap()
     }
 
-    fn normalize_unicode(&self, input: &str) -> String {
+    fn normalize_unicode(&self, input: &str, out: &mut String) {
         // Fused clean + Chinese-char pass.
         let mut chars: Vec<char> = Vec::with_capacity(input.len());
         for c in input.chars() {
@@ -443,7 +435,7 @@ impl FastWordPiece {
             staged
         };
 
-        processed.trim_matches(|c: char| c.is_whitespace()).to_string()
+        out.push_str(&processed);
     }
 }
 
@@ -460,10 +452,9 @@ fn ascii_class(b: u8) -> u8 {
 }
 
 /// Split like HuggingFace's BertPreTokenizer: drop whitespace, isolate each
-/// punctuation char as its own word. Returned words are zero-copy substrings.
-fn pre_tokenize(s: &str) -> Vec<&str> {
+/// punctuation char as its own word, and call `emit` on each word in order.
+fn pre_tokenize<'a>(s: &'a str, mut emit: impl FnMut(&'a str)) {
     let bytes = s.as_bytes();
-    let mut words = Vec::with_capacity(s.len() / 4 + 1);
     let mut start: isize = -1;
     let mut i = 0;
     while i < s.len() {
@@ -483,16 +474,16 @@ fn pre_tokenize(s: &str) -> Vec<&str> {
         match class {
             1 => {
                 if start >= 0 {
-                    words.push(&s[start as usize..i]);
+                    emit(&s[start as usize..i]);
                     start = -1;
                 }
             }
             2 => {
                 if start >= 0 {
-                    words.push(&s[start as usize..i]);
+                    emit(&s[start as usize..i]);
                     start = -1;
                 }
-                words.push(&s[i..i + size]);
+                emit(&s[i..i + size]);
             }
             _ => {
                 if start < 0 {
@@ -503,16 +494,11 @@ fn pre_tokenize(s: &str) -> Vec<&str> {
         i += size;
     }
     if start >= 0 {
-        words.push(&s[start as usize..]);
+        emit(&s[start as usize..]);
     }
-    words
 }
 
 // --- Unicode predicates (match HuggingFace's bert normalizer) ----------------
-
-fn is_ascii_space(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
-}
 
 fn is_whitespace(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r') || c.is_whitespace()
@@ -540,6 +526,7 @@ fn is_chinese_char(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     fn corpus() -> Vec<&'static str> {
         vec![
@@ -626,6 +613,84 @@ mod tests {
             let want: Vec<u32> = tok.encode_fast(text, false).expect("crate encode").get_ids().to_vec();
             let got = ft.encode_ids(text);
             assert_eq!(got, want, "token-id mismatch for {text:?}");
+        }
+    }
+
+    /// Random lowercase words, so long subword splits and unknown words occur.
+    #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+    fn noise(n: usize) -> Vec<String> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        (0..n)
+            .map(|_| {
+                (0..1 + next(12))
+                    .map(|_| {
+                        (0..1 + next(14))
+                            .map(|_| (b'a' + next(26) as u8) as char)
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    fn assert_matches_crate(tok: &Tokenizer, texts: &[String]) {
+        let ft = FastWordPiece::from_tokenizer(tok).expect("WordPiece pipeline");
+        for text in texts {
+            let want: Vec<u32> = tok
+                .encode_fast(text.as_str(), false)
+                .expect("crate encode")
+                .get_ids()
+                .to_vec();
+            assert_eq!(ft.encode_ids(text), want, "token-id mismatch for {text:?}");
+        }
+    }
+
+    #[test]
+    fn duplicate_vocab_key_matches_crate() {
+        let json = r###"{
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": true,
+                           "strip_accents": null, "lowercase": true},
+            "pre_tokenizer": {"type": "BertPreTokenizer"},
+            "post_processor": null, "decoder": null,
+            "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##",
+                      "max_input_chars_per_word": 100,
+                      "vocab": {"[UNK]": 0, "play": 1, "##ing": 2, "play": 3, "##s": 4, "##ing": 5, "p": 6}}
+        }"###;
+        let tok = Tokenizer::from_str(json).expect("build tokenizer");
+        let texts: Vec<String> = ["play", "playing plays", "pplay", "ping"].map(String::from).into();
+        assert_matches_crate(&tok, &texts);
+    }
+
+    /// WordPiece tokenizers of models already in the local Hugging Face
+    /// cache (the test does not download them).
+    #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+    #[test]
+    fn fast_matches_crate_on_cached_models() {
+        let mut texts: Vec<String> = corpus().into_iter().map(String::from).collect();
+        texts.extend(noise(2000));
+        let cache = hf_hub::Cache::from_env();
+        for (repo, file) in [
+            ("minishlab/potion-base-8M", "tokenizer.json"),
+            ("minishlab/potion-retrieval-32M", "tokenizer.json"),
+            (
+                "sentence-transformers/static-retrieval-mrl-en-v1",
+                "0_StaticEmbedding/tokenizer.json",
+            ),
+        ] {
+            let Some(path) = cache.model(repo.to_string()).get(file) else {
+                eprintln!("skipped: {repo} is not in the local cache");
+                continue;
+            };
+            let tok = Tokenizer::from_file(path).expect("load cached tokenizer");
+            assert_matches_crate(&tok, &texts);
         }
     }
 
