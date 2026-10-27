@@ -186,6 +186,12 @@ fn check(tokenizer_path: &str, dim: usize, combo: (bool, bool, bool)) {
     }
     let singles = |m: &StaticModel| texts.iter().map(|t| m.encode_single(t)).collect::<Vec<_>>();
     assert_bit_identical(&case.label(), &singles(&quantized), &singles(&oracle));
+    let flat: Vec<Vec<f32>> = quantized
+        .encode_flat(&texts)
+        .chunks_exact(dim)
+        .map(<[f32]>::to_vec)
+        .collect();
+    assert_bit_identical(&format!("{} encode_flat", case.label()), &flat, &oracle.encode(&texts));
 
     let cos: Vec<f64> = quantized
         .encode(&texts)
