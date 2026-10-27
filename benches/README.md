@@ -1,6 +1,8 @@
 # Benchmarks
 
 - `encode.rs`: latency percentiles of `StaticModel::encode` for one revision.
+- `quantize.rs`: throughput and accuracy of `StaticModel::quantize_int8`
+  against the f32 model, in one process (see below).
 - `throughput.rs`: throughput of one (model, workload, mode) configuration.
   Uses only the public API, so it builds against any revision. Normally run
   through `scripts/bench_compare.py`, not directly.
@@ -38,3 +40,33 @@ For trustworthy numbers:
    setting and isolates per-text cost from scheduling.
 4. Only claim a speedup for configurations marked `faster` whose output is
    `identical` (for changes that must not alter embeddings).
+
+## Int8 models
+
+To benchmark int8 storage, quantize models with Python model2vec and pass
+the output directories to `--models`:
+
+```python
+from model2vec import StaticModel
+
+for model_id in ["minishlab/potion-base-8M", "minishlab/potion-retrieval-32M"]:
+    model = StaticModel.from_pretrained(model_id, quantize_to="int8")
+    model.save_pretrained(f"target/bench-compare/int8-models/{model_id.split('/')[1]}")
+```
+
+## Runtime int8 quantization
+
+`quantize.rs` compares the f32 model, a separately loaded copy of it (a
+control that should come out at 1.00x), the per-row quantized model, and
+optionally a model2vec int8 model, all in one process:
+
+```sh
+cargo bench --bench quantize -- corpus=target/bench-compare/big.txt \
+    model=minishlab/potion-base-8M int8=target/bench-compare/int8-models/potion-base-8M
+```
+
+Each round runs every variant once, cycling through all orderings so each
+variant follows every other equally often. It reports throughput, the
+speedup over f32 with a 95% bootstrap CI, and cosine similarity to the f32
+output. Set `RAYON_NUM_THREADS=1` for single-thread numbers.
+

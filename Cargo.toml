@@ -32,7 +32,6 @@ wasm         = ["local-only",
 [dependencies]
 tokenizers = { version = "0.21", default-features = false }
 safetensors = "0.5"
-ndarray = "0.15"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
 ureq = { version = "2", optional = true }
 clap = { version = "4.0", features = ["derive"], optional = true }
@@ -59,4 +58,8 @@ harness = false
 
 [[bench]]
 name = "throughput"
+harness = false
+
+[[bench]]
+name = "quantize"
 harness = false

@@ -108,6 +108,16 @@ let model = StaticModel::from_bytes(
 let embeddings = model.encode(&["Hello world".to_string()]);
 ```
 
+**Quantizing an f32 model to int8:**
+
+```rust
+use model2vec_rs::model::StaticModel;
+
+let model = StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?.quantize_int8();
+```
+
+`quantize_int8` stores the embeddings as int8 with one scale per row, using a quarter of the memory and encoding faster. Outputs stay very close to the f32 model (cosine similarity above 0.9998 on the potion models).
+
 See the [feature flags](#feature-flags) section for `wasm` and `local-only` build configurations.
 
 ---
@@ -143,8 +153,8 @@ The compiled binary installed via `cargo install` is significantly faster (often
 
 *   **Fast Inference:** Optimized Rust implementation for fast embedding generation.
 *   **Hugging Face Hub Integration:** Load pre-trained Model2Vec models directly from the Hugging Face Hub using model IDs, or use models from local paths.
-*   **Model Formats:** Supports models with f32, f16, and i8 weight types stored in `safetensors` files.
-*   **Flexible Loading:** Load models from the Hub (`from_pretrained`), raw bytes (`from_bytes`), or owned/borrowed data (`from_owned`, `from_borrowed`) for embedded and WASM use cases.
+*   **Model Formats:** Supports models with f32, f16, and i8 weight types stored in `safetensors` files. Int8 models (model2vec's `quantize_to="int8"`) stay int8 in memory, and f32 models can be quantized to int8 at load time with `quantize_int8`.
+*   **Flexible Loading:** Load models from the Hub (`from_pretrained`), raw bytes (`from_bytes`), or owned/borrowed data (`from_owned`, `from_borrowed`, and `from_owned_i8`, `from_borrowed_i8` for int8 embeddings) for embedded and WASM use cases.
 *   **Batch Processing:** Encodes multiple sentences in batches.
 *   **Configurable Encoding:** Allows customization of maximum sequence length and batch size during encoding.
 
