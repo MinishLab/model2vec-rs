@@ -7,7 +7,7 @@
 /// Marks an absent node, an absent token, or a free slot's parent.
 pub(crate) const NONE: u32 = u32::MAX;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Node {
     base: u32,
     parent: u32,
@@ -53,12 +53,30 @@ impl Candidates {
 }
 
 /// Double-array trie over byte strings. The root is node 0.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DoubleArrayTrie {
     nodes: Vec<Node>,
 }
 
 impl DoubleArrayTrie {
+    /// Every slot as `[base, parent, token]`.
+    pub(crate) fn to_words(&self) -> impl Iterator<Item = [u32; 3]> + '_ {
+        self.nodes.iter().map(|n| [n.base, n.parent, n.token])
+    }
+
+    /// Inverse of [`Self::to_words`], or `None` if a slot's children or
+    /// parent would fall outside the array.
+    pub(crate) fn from_words(words: impl Iterator<Item = [u32; 3]>) -> Option<DoubleArrayTrie> {
+        let nodes: Vec<Node> = words
+            .map(|[base, parent, token]| Node { base, parent, token })
+            .collect();
+        let len = nodes.len();
+        let in_bounds = |n: &Node| {
+            n.base as usize + 255 < len && (n.parent == NONE || (n.parent as usize) < len)
+        };
+        nodes.iter().all(in_bounds).then_some(DoubleArrayTrie { nodes })
+    }
+
     /// Build from `(key, id)` pairs. Empty keys are ignored; for duplicate
     /// keys the first pair in sorted order wins.
     pub(crate) fn build(mut pieces: Vec<(&[u8], u32)>) -> DoubleArrayTrie {
