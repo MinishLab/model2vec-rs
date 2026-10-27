@@ -617,13 +617,19 @@ impl StaticModel {
             Embeddings::I8(table) => self.sum_rows(table, ids, sum),
         };
         let denom = cnt.max(1) as f32;
-        for x in sum.iter_mut() {
-            *x /= denom;
-        }
         if model.normalize {
-            let norm = sum.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
+            let mut sq = 0.0_f32;
+            for x in sum.iter_mut() {
+                *x /= denom;
+                sq += *x * *x;
+            }
+            let norm = sq.sqrt().max(1e-12);
             for x in sum.iter_mut() {
                 *x /= norm;
+            }
+        } else {
+            for x in sum.iter_mut() {
+                *x /= denom;
             }
         }
     }
@@ -650,15 +656,8 @@ impl StaticModel {
     where
         f32: From<T>,
     {
-        let mut sum = [0.0_f32; D];
-        let cnt = self.for_each_row(table, ids, |row, scale| {
-            let row: &[T; D] = row.try_into().expect("embedding row has D columns");
-            for (s, &v) in sum.iter_mut().zip(row) {
-                *s += f32::from(v) * scale;
-            }
-        });
-        out.copy_from_slice(&sum);
-        cnt
+        let sum: &mut [f32; D] = out.try_into().expect("output has D columns");
+        self.sum_rows_blocked(table, ids, sum)
     }
 
     /// Weighted row sum for any embedding dimension.
@@ -666,17 +665,36 @@ impl StaticModel {
     where
         f32: From<T>,
     {
-        self.for_each_row(table, ids, |row, scale| {
-            for (s, &v) in sum.iter_mut().zip(row) {
-                *s += f32::from(v) * scale;
+        self.sum_rows_blocked(table, ids, sum)
+    }
+
+    /// Weighted row sum that adds `BLOCK` rows per pass over `sum`, in token
+    /// order, so the result matches adding one row at a time.
+    #[inline(always)]
+    fn sum_rows_blocked<T: Copy>(&self, table: &[T], ids: &[u32], sum: &mut [f32]) -> usize
+    where
+        f32: From<T>,
+    {
+        let mut pending: [(&[T], f32); BLOCK] = [(&[], 0.0); BLOCK];
+        let mut n = 0;
+        let cnt = self.for_each_row(table, ids, |row, scale| {
+            pending[n] = (row, scale);
+            n += 1;
+            if n == BLOCK {
+                add_rows(sum, &pending);
+                n = 0;
             }
-        })
+        });
+        for &(row, scale) in &pending[..n] {
+            add_row(sum, row, scale);
+        }
+        cnt
     }
 
     /// Call `f` with the embedding row and scale (token weight times row
     /// scale) of every non-unk token; returns the number of rows visited.
     #[inline(always)]
-    fn for_each_row<T>(&self, table: &[T], ids: &[u32], mut f: impl FnMut(&[T], f32)) -> usize {
+    fn for_each_row<'t, T>(&self, table: &'t [T], ids: &[u32], mut f: impl FnMut(&'t [T], f32)) -> usize {
         let model = &self.inner;
         let dim = model.dim;
         let mut cnt = 0;
@@ -710,6 +728,59 @@ impl StaticModel {
             }
         }
         cnt
+    }
+}
+
+/// `sum += row * scale`.
+#[inline(always)]
+fn add_row<T: Copy>(sum: &mut [f32], row: &[T], scale: f32)
+where
+    f32: From<T>,
+{
+    for (s, &v) in sum.iter_mut().zip(row) {
+        *s += f32::from(v) * scale;
+    }
+}
+
+const BLOCK: usize = 8;
+
+/// `sum += r0 * s0 + r1 * s1 + ...` over BLOCK rows, added left to right.
+#[inline(always)]
+fn add_rows<T: Copy>(sum: &mut [f32], rows: &[(&[T], f32); BLOCK])
+where
+    f32: From<T>,
+{
+    let n = sum.len();
+    let [
+        (r0, s0),
+        (r1, s1),
+        (r2, s2),
+        (r3, s3),
+        (r4, s4),
+        (r5, s5),
+        (r6, s6),
+        (r7, s7),
+    ] = *rows;
+    let (r0, r1, r2, r3, r4, r5, r6, r7) = (
+        &r0[..n],
+        &r1[..n],
+        &r2[..n],
+        &r3[..n],
+        &r4[..n],
+        &r5[..n],
+        &r6[..n],
+        &r7[..n],
+    );
+    for j in 0..n {
+        sum[j] = sum[j]
+            + f32::from(r0[j]) * s0
+            + f32::from(r1[j]) * s1
+            + f32::from(r2[j]) * s2
+            + f32::from(r3[j]) * s3
+            + f32::from(r4[j]) * s4
+            + f32::from(r5[j]) * s5
+            + f32::from(r6[j]) * s6
+            + f32::from(r7[j]) * s7;
     }
 }
 
