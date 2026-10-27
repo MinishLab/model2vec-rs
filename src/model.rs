@@ -31,19 +31,143 @@ pub struct StaticModel {
 
 #[derive(Debug)]
 struct StaticModelInner {
-    tokenizer: Tokenizer,
+    tokenizer: LoadedTokenizer,
     embeddings: CowArray<'static, f32, Ix2>,
     weights: Option<Cow<'static, [f32]>>,
     token_mapping: Option<Cow<'static, [usize]>>,
     normalize: bool,
+}
+
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+enum Tokenization {
+    /// Custom IDs-only WordPiece tokenizer, which needs no `Tokenizer`.
+    WordPiece(FastWordPiece),
+    /// Custom IDs-only Unigram model on top of the crate's pre-processing.
+    Unigram(Tokenizer, FastUnigram),
+    /// Pipelines neither custom tokenizer reproduces.
+    Crate(Tokenizer),
+}
+
+#[derive(Debug)]
+struct LoadedTokenizer {
+    tokenization: Tokenization,
     median_token_length: usize,
     unk_token_id: Option<usize>,
-    /// Custom IDs-only WordPiece tokenizer; `None` for non-WordPiece
-    /// pipelines, which fall back to the `tokenizers` crate.
-    fast_tok: Option<FastWordPiece>,
-    /// Custom IDs-only Unigram model; `None` for non-Unigram pipelines and
-    /// for those it does not reproduce, which fall back to the `tokenizers` crate.
-    fast_unigram: Option<FastUnigram>,
+}
+
+impl LoadedTokenizer {
+    fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
+        let (median_token_length, unk_token_id) = compute_metadata(&tokenizer)?;
+        let tokenization = if let Some(ft) = FastWordPiece::from_tokenizer(&tokenizer) {
+            Tokenization::WordPiece(ft)
+        } else if let Some(fu) = FastUnigram::from_tokenizer(&tokenizer, unk_token_id) {
+            Tokenization::Unigram(tokenizer, fu)
+        } else {
+            Tokenization::Crate(tokenizer)
+        };
+        Ok(Self {
+            tokenization,
+            median_token_length,
+            unk_token_id,
+        })
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let tokenizer = Tokenizer::from_bytes(bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+        Self::from_tokenizer(tokenizer)
+    }
+
+    /// Like [`Self::from_bytes`], but for WordPiece pipelines reads the
+    /// tokenizer from a binary cache in `cache_dir` keyed by the checksum of
+    /// `bytes`, writing that cache on a miss. Cache errors are ignored.
+    fn from_bytes_cached(bytes: &[u8], cache_dir: Option<&Path>) -> Result<Self> {
+        let Some(cache_dir) = cache_dir else {
+            return Self::from_bytes(bytes);
+        };
+        let checksum = checksum(bytes);
+        let path = cache_dir.join(format!("wordpiece-{checksum:016x}.bin"));
+        if let Some((ft, median_token_length)) = fs::read(&path)
+            .ok()
+            .and_then(|cached| FastWordPiece::from_cache_bytes(&cached, checksum))
+        {
+            return Ok(Self {
+                unk_token_id: ft.unk_id().map(|id| id as usize),
+                tokenization: Tokenization::WordPiece(ft),
+                median_token_length,
+            });
+        }
+        let loaded = Self::from_bytes(bytes)?;
+        if let Tokenization::WordPiece(ft) = &loaded.tokenization {
+            let _ = write_atomic(&path, &ft.to_cache_bytes(checksum, loaded.median_token_length));
+        }
+        Ok(loaded)
+    }
+}
+
+/// Stable 64-bit checksum (FNV-1a over little-endian words).
+fn checksum(bytes: &[u8]) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = 0xcbf2_9ce4_8422_2325 ^ bytes.len() as u64;
+    let (words, tail) = bytes.as_chunks::<8>();
+    for w in words {
+        h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(PRIME);
+    }
+    for &b in tail {
+        h = (h ^ u64::from(b)).wrapping_mul(PRIME);
+    }
+    h
+}
+
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    fs::write(&tmp, data)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// Directory for the binary tokenizer cache: `MODEL2VEC_CACHE_DIR` if set
+/// (empty disables the cache), else `model2vec-rs` in the user cache dir.
+fn tokenizer_cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("MODEL2VEC_CACHE_DIR") {
+        return (!dir.is_empty()).then(|| PathBuf::from(dir));
+    }
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))?;
+    Some(base.join("model2vec-rs"))
+}
+
+/// Compute median token length and unk_token_id from tokenizer.
+fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
+    let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
+    lens.sort_unstable();
+    let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
+
+    let lookup = |tok: &str| {
+        tokenizer
+            .token_to_id(tok)
+            .map(|id| id as usize)
+            .ok_or_else(|| anyhow!("unk_token '{tok}' not found in vocabulary"))
+    };
+    let unk_token_id = match tokenizer.get_model() {
+        ModelWrapper::BPE(model) => model.unk_token.as_deref().map(lookup).transpose()?,
+        ModelWrapper::WordPiece(model) => Some(lookup(&model.unk_token)?),
+        ModelWrapper::WordLevel(model) => Some(lookup(&model.unk_token)?),
+        // `tokenizers` keeps Unigram's `unk_id` private, so read it from the serialized model.
+        ModelWrapper::Unigram(model) => serde_json::to_value(model)
+            .context("failed to serialize unigram model")?
+            .get("unk_id")
+            .and_then(Value::as_u64)
+            .map(|id| id as usize),
+    };
+
+    Ok((median_token_length, unk_token_id))
 }
 
 #[derive(Debug, Clone)]
@@ -182,15 +306,23 @@ impl StaticModel {
         M: AsRef<[u8]>,
         C: AsRef<[u8]>,
     {
-        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
+        let tokenizer = LoadedTokenizer::from_bytes(tokenizer_bytes.as_ref())?;
+        Self::from_loaded_bytes(tokenizer, model_bytes.as_ref(), config_bytes.as_ref(), normalize)
+    }
 
+    fn from_loaded_bytes(
+        tokenizer: LoadedTokenizer,
+        model_bytes: &[u8],
+        config_bytes: &[u8],
+        normalize: Option<bool>,
+    ) -> Result<Self> {
         // Read normalize default from config.json
-        let cfg: Value = serde_json::from_slice(config_bytes.as_ref()).context("failed to parse config.json")?;
+        let cfg: Value = serde_json::from_slice(config_bytes).context("failed to parse config.json")?;
         let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
         let normalize = normalize.unwrap_or(cfg_norm);
 
         // Load the safetensors
-        let safet = SafeTensors::deserialize(model_bytes.as_ref()).context("failed to parse safetensors")?;
+        let safet = SafeTensors::deserialize(model_bytes).context("failed to parse safetensors")?;
         let tensor = safet
             .tensor("embeddings")
             .or_else(|_| safet.tensor("0"))
@@ -230,7 +362,15 @@ impl StaticModel {
             Err(_) => None,
         };
 
-        Self::from_owned(tokenizer, floats, rows, cols, normalize, weights, token_mapping)
+        Self::from_storage(
+            tokenizer,
+            Cow::Owned(floats),
+            rows,
+            cols,
+            normalize,
+            weights.map(Cow::Owned),
+            token_mapping.map(Cow::Owned),
+        )
     }
 
     /// Load a Model2Vec model from a local folder or the HuggingFace Hub.
@@ -250,7 +390,8 @@ impl StaticModel {
         let tokenizer_bytes = fs::read(&files.tokenizer).context("failed to read tokenizer.json")?;
         let model_bytes = fs::read(&files.model).context("failed to read model.safetensors")?;
         let config_bytes = fs::read(&files.config).context("failed to read config.json")?;
-        Self::from_bytes(tokenizer_bytes, model_bytes, config_bytes, normalize)
+        let tokenizer = LoadedTokenizer::from_bytes_cached(&tokenizer_bytes, tokenizer_cache_dir().as_deref())?;
+        Self::from_loaded_bytes(tokenizer, &model_bytes, &config_bytes, normalize)
     }
 
     /// Construct from owned data.
@@ -273,7 +414,7 @@ impl StaticModel {
         token_mapping: Option<Vec<usize>>,
     ) -> Result<Self> {
         Self::from_storage(
-            tokenizer,
+            LoadedTokenizer::from_tokenizer(tokenizer)?,
             Cow::Owned(embeddings),
             rows,
             cols,
@@ -303,7 +444,7 @@ impl StaticModel {
         token_mapping: Option<&'static [usize]>,
     ) -> Result<Self> {
         Self::from_storage(
-            tokenizer,
+            LoadedTokenizer::from_tokenizer(tokenizer)?,
             Cow::Borrowed(embeddings),
             rows,
             cols,
@@ -314,7 +455,7 @@ impl StaticModel {
     }
 
     fn from_storage(
-        tokenizer: Tokenizer,
+        tokenizer: LoadedTokenizer,
         embeddings: Cow<'static, [f32]>,
         rows: usize,
         cols: usize,
@@ -330,9 +471,6 @@ impl StaticModel {
                 cols
             ));
         }
-        let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
-        let fast_tok = FastWordPiece::from_tokenizer(&tokenizer);
-        let fast_unigram = FastUnigram::from_tokenizer(&tokenizer, unk_token_id);
         let embeddings = match embeddings {
             Cow::Owned(data) => {
                 CowArray::from(Array2::from_shape_vec((rows, cols), data).context("failed to build embeddings array")?)
@@ -348,39 +486,8 @@ impl StaticModel {
                 weights,
                 token_mapping,
                 normalize,
-                median_token_length,
-                unk_token_id,
-                fast_tok,
-                fast_unigram,
             }),
         })
-    }
-
-    /// Compute median token length and unk_token_id from tokenizer.
-    fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
-        let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
-        lens.sort_unstable();
-        let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
-
-        let lookup = |tok: &str| {
-            tokenizer
-                .token_to_id(tok)
-                .map(|id| id as usize)
-                .ok_or_else(|| anyhow!("unk_token '{tok}' not found in vocabulary"))
-        };
-        let unk_token_id = match tokenizer.get_model() {
-            ModelWrapper::BPE(model) => model.unk_token.as_deref().map(lookup).transpose()?,
-            ModelWrapper::WordPiece(model) => Some(lookup(&model.unk_token)?),
-            ModelWrapper::WordLevel(model) => Some(lookup(&model.unk_token)?),
-            // `tokenizers` keeps Unigram's `unk_id` private, so read it from the serialized model.
-            ModelWrapper::Unigram(model) => serde_json::to_value(model)
-                .context("failed to serialize unigram model")?
-                .get("unk_id")
-                .and_then(Value::as_u64)
-                .map(|id| id as usize),
-        };
-
-        Ok((median_token_length, unk_token_id))
     }
 
     /// Char-level truncation to max_tokens * median_token_length
@@ -429,20 +536,20 @@ impl StaticModel {
     fn encode_one(&self, text: &str, max_length: Option<usize>) -> Vec<f32> {
         let model = &self.inner;
         let text = max_length.map_or(text, |max_tok| {
-            Self::truncate_str(text, max_tok, model.median_token_length)
+            Self::truncate_str(text, max_tok, model.tokenizer.median_token_length)
         });
-        match (&model.fast_tok, &model.fast_unigram) {
-            (Some(ft), _) => TOKEN_IDS.with_borrow_mut(|ids| {
+        match &model.tokenizer.tokenization {
+            Tokenization::WordPiece(ft) => TOKEN_IDS.with_borrow_mut(|ids| {
                 ids.clear();
                 ft.encode_ids_into(text, ids);
                 self.pool_ids(ids, max_length)
             }),
-            (None, Some(fu)) => {
-                let ids = fu.encode_ids(&model.tokenizer, text).expect("tokenization failed");
+            Tokenization::Unigram(tokenizer, fu) => {
+                let ids = fu.encode_ids(tokenizer, text).expect("tokenization failed");
                 self.pool_ids(&ids, max_length)
             }
-            (None, None) => {
-                let encoding = model.tokenizer.encode_fast(text, false).expect("tokenization failed");
+            Tokenization::Crate(tokenizer) => {
+                let encoding = tokenizer.encode_fast(text, false).expect("tokenization failed");
                 self.pool_ids(encoding.get_ids(), max_length)
             }
         }
@@ -509,7 +616,7 @@ impl StaticModel {
         let tokens = ids
             .iter()
             .map(|&id| id as usize)
-            .filter(|&tok| Some(tok) != model.unk_token_id);
+            .filter(|&tok| Some(tok) != model.tokenizer.unk_token_id);
         match (&model.token_mapping, &model.weights) {
             (None, None) => {
                 for tok in tokens {
@@ -582,8 +689,48 @@ fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&s
 
 #[cfg(test)]
 mod tests {
-    use super::decode_token_mapping;
+    use super::{LoadedTokenizer, Tokenization, checksum, decode_token_mapping};
     use safetensors::tensor::Dtype;
+    use std::fs;
+
+    #[test]
+    fn cached_tokenizer_matches_uncached() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let bytes = fs::read(fixture).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cache_file = dir.path().join(format!("wordpiece-{:016x}.bin", checksum(&bytes)));
+
+        let miss = LoadedTokenizer::from_bytes_cached(&bytes, Some(dir.path())).unwrap();
+        assert!(cache_file.exists());
+        let hit = LoadedTokenizer::from_bytes_cached(&bytes, Some(dir.path())).unwrap();
+        let (Tokenization::WordPiece(a), Tokenization::WordPiece(b)) = (&miss.tokenization, &hit.tokenization) else {
+            panic!("fixture is a WordPiece pipeline");
+        };
+        assert_eq!(miss.median_token_length, hit.median_token_length);
+        assert_eq!(miss.unk_token_id, hit.unk_token_id);
+        for text in ["Hello, world!", "café [MASK] 你好", "supercalifragilistic"] {
+            assert_eq!(a.encode_ids(text), b.encode_ids(text));
+        }
+
+        // A cache file with another checksum is ignored and overwritten.
+        fs::write(&cache_file, a.to_cache_bytes(checksum(&bytes) ^ 1, 1)).unwrap();
+        let reloaded = LoadedTokenizer::from_bytes_cached(&bytes, Some(dir.path())).unwrap();
+        assert_eq!(reloaded.median_token_length, miss.median_token_length);
+        assert_eq!(
+            fs::read(&cache_file).unwrap(),
+            a.to_cache_bytes(checksum(&bytes), miss.median_token_length)
+        );
+    }
+
+    #[test]
+    fn checksum_changes_with_content() {
+        assert_ne!(checksum(b"abcdefgh"), checksum(b"abcdefgi"));
+        assert_ne!(checksum(b""), checksum(b"\0"));
+        assert_eq!(checksum(b"tokenizer"), checksum(b"tokenizer"));
+    }
 
     #[test]
     fn decode_token_mapping_supports_i32_and_i64() {

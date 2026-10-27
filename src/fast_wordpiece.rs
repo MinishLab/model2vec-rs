@@ -16,9 +16,43 @@
 
 use std::collections::HashMap;
 
-use tokenizers::Tokenizer;
+use tokenizers::{
+    Tokenizer, models::ModelWrapper, normalizers::NormalizerWrapper, pre_tokenizers::PreTokenizerWrapper,
+};
 use unicode_categories::UnicodeCategories;
 use unicode_normalization::UnicodeNormalization;
+
+/// Magic and format version of the binary cache; bump the version whenever
+/// the layout or the meaning of any field changes.
+const CACHE_MAGIC: &[u8; 8] = b"M2VWP\x00\x00\x01";
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let (head, tail) = self.0.split_at_checked(n)?;
+        self.0 = tail;
+        Some(head)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn str(&mut self) -> Option<&'a str> {
+        let n = self.u32()? as usize;
+        std::str::from_utf8(self.take(n)?).ok()
+    }
+}
 
 /// IDs-only WordPiece tokenizer for the BERT pipeline.
 #[derive(Debug, Clone)]
@@ -48,47 +82,19 @@ impl FastWordPiece {
     /// Build from a loaded tokenizer, or `None` if it is not the
     /// BertNormalizer + BertPreTokenizer + WordPiece pipeline.
     pub(crate) fn from_tokenizer(tok: &Tokenizer) -> Option<FastWordPiece> {
-        let json: serde_json::Value = serde_json::from_str(&tok.to_string(false).ok()?).ok()?;
-
         // Require the exact pipeline; anything else falls back to the crate.
-        let model = json.get("model")?;
-        if model.get("type")?.as_str()? != "WordPiece" {
+        let ModelWrapper::WordPiece(model) = tok.get_model() else {
+            return None;
+        };
+        if !matches!(tok.get_pre_tokenizer(), Some(PreTokenizerWrapper::BertPreTokenizer(_))) {
             return None;
         }
-        if json
-            .get("pre_tokenizer")
-            .and_then(|p| p.get("type"))
-            .and_then(|t| t.as_str())
-            != Some("BertPreTokenizer")
-        {
+        let Some(NormalizerWrapper::BertNormalizer(norm)) = tok.get_normalizer() else {
             return None;
-        }
-        let norm = json.get("normalizer")?;
-        if norm.get("type").and_then(|t| t.as_str()) != Some("BertNormalizer") {
-            return None;
-        }
-        let lowercase = norm.get("lowercase").and_then(|v| v.as_bool()).unwrap_or(true);
-        let clean_text = norm.get("clean_text").and_then(|v| v.as_bool()).unwrap_or(true);
-        let handle_chinese_chars = norm
-            .get("handle_chinese_chars")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        // `strip_accents: null` follows the lowercase setting, matching HuggingFace.
-        let strip_accents = norm.get("strip_accents").and_then(|v| v.as_bool()).unwrap_or(lowercase);
+        };
 
-        // Vocab from the tokenizer (avoids re-parsing ~30k JSON entries).
         let vocab = tok.get_vocab(true);
-        let unk_token = model.get("unk_token").and_then(|v| v.as_str()).unwrap_or("[UNK]");
-        let unk_id = vocab.get(unk_token).copied();
-        let continuing_subword_prefix = model
-            .get("continuing_subword_prefix")
-            .and_then(|v| v.as_str())
-            .unwrap_or("##")
-            .to_string();
-        let max_input_chars_per_word = model
-            .get("max_input_chars_per_word")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(100) as usize;
+        let unk_id = vocab.get(&model.unk_token).copied();
 
         // The crate matches added tokens with `normalized: false` against raw
         // text; the other flags change matching rules not implemented here.
@@ -99,6 +105,33 @@ impl FastWordPiece {
             }
             added_tokens.push((t.content, id));
         }
+
+        Some(Self::assemble(
+            vocab,
+            unk_id,
+            model.max_input_chars_per_word,
+            model.continuing_subword_prefix.clone(),
+            norm.clean_text,
+            norm.handle_chinese_chars,
+            // `strip_accents: None` follows the lowercase setting, matching HuggingFace.
+            norm.strip_accents.unwrap_or(norm.lowercase),
+            norm.lowercase,
+            added_tokens,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        vocab: HashMap<String, u32>,
+        unk_id: Option<u32>,
+        max_input_chars_per_word: usize,
+        continuing_subword_prefix: String,
+        clean_text: bool,
+        handle_chinese_chars: bool,
+        strip_accents: bool,
+        lowercase: bool,
+        mut added_tokens: Vec<(String, u32)>,
+    ) -> FastWordPiece {
         added_tokens.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         let mut added_token_first_bytes = [false; 256];
         for (content, _) in &added_tokens {
@@ -112,7 +145,7 @@ impl FastWordPiece {
             }
         }
 
-        Some(FastWordPiece {
+        FastWordPiece {
             vocab,
             single_byte,
             unk_id,
@@ -124,7 +157,88 @@ impl FastWordPiece {
             lowercase,
             added_tokens,
             added_token_first_bytes,
-        })
+        }
+    }
+
+    /// Serialize to the binary cache format, tagged with the checksum of the
+    /// `tokenizer.json` it was built from and the model's median token length.
+    pub(crate) fn to_cache_bytes(&self, checksum: u64, median_token_length: usize) -> Vec<u8> {
+        let mut vocab: Vec<(&str, u32)> = self.vocab.iter().map(|(k, &v)| (k.as_str(), v)).collect();
+        vocab.sort_unstable_by_key(|&(_, id)| id);
+        let strings_len: usize = vocab.iter().map(|(k, _)| k.len() + 8).sum();
+
+        let mut out = Vec::with_capacity(64 + strings_len);
+        out.extend_from_slice(CACHE_MAGIC);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out.extend_from_slice(&(median_token_length as u64).to_le_bytes());
+        out.extend_from_slice(&self.unk_id.unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&(self.max_input_chars_per_word as u64).to_le_bytes());
+        let flags = self.clean_text as u8
+            | (self.handle_chinese_chars as u8) << 1
+            | (self.strip_accents as u8) << 2
+            | (self.lowercase as u8) << 3;
+        out.push(flags);
+        put_str(&mut out, &self.continuing_subword_prefix);
+        for list in [vocab, self.added_tokens.iter().map(|(k, v)| (k.as_str(), *v)).collect()] {
+            out.extend_from_slice(&(list.len() as u32).to_le_bytes());
+            for (token, id) in list {
+                out.extend_from_slice(&id.to_le_bytes());
+                put_str(&mut out, token);
+            }
+        }
+        out
+    }
+
+    /// Inverse of [`Self::to_cache_bytes`]. Returns the tokenizer and the
+    /// median token length, or `None` if the bytes are malformed, from
+    /// another format version, or tagged with a different checksum.
+    pub(crate) fn from_cache_bytes(bytes: &[u8], checksum: u64) -> Option<(FastWordPiece, usize)> {
+        let mut r = Reader(bytes);
+        if r.take(CACHE_MAGIC.len())? != CACHE_MAGIC || r.u64()? != checksum {
+            return None;
+        }
+        let median_token_length = r.u64()? as usize;
+        let unk_id = Some(r.u32()?).filter(|&id| id != u32::MAX);
+        let max_input_chars_per_word = r.u64()? as usize;
+        let flags = r.take(1)?[0];
+        let continuing_subword_prefix = r.str()?.to_string();
+
+        let n = r.u32()? as usize;
+        let mut vocab = HashMap::with_capacity(n);
+        for _ in 0..n {
+            let id = r.u32()?;
+            vocab.insert(r.str()?.to_string(), id);
+        }
+        let n = r.u32()? as usize;
+        let mut added_tokens = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = r.u32()?;
+            let content = r.str()?;
+            if content.is_empty() {
+                return None;
+            }
+            added_tokens.push((content.to_string(), id));
+        }
+        if !r.0.is_empty() {
+            return None;
+        }
+
+        let ft = Self::assemble(
+            vocab,
+            unk_id,
+            max_input_chars_per_word,
+            continuing_subword_prefix,
+            flags & 1 != 0,
+            flags & 2 != 0,
+            flags & 4 != 0,
+            flags & 8 != 0,
+            added_tokens,
+        );
+        Some((ft, median_token_length))
+    }
+
+    pub(crate) fn unk_id(&self) -> Option<u32> {
+        self.unk_id
     }
 
     /// Encode text into token IDs, matching `encode_batch_fast(...).get_ids()`
@@ -513,6 +627,34 @@ mod tests {
             let got = ft.encode_ids(text);
             assert_eq!(got, want, "token-id mismatch for {text:?}");
         }
+    }
+
+    #[test]
+    fn cache_roundtrip_matches() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let tok = Tokenizer::from_file(path).expect("load fixture tokenizer");
+        let ft = FastWordPiece::from_tokenizer(&tok).expect("fixture is a WordPiece pipeline");
+        let bytes = ft.to_cache_bytes(42, 7);
+
+        let (cached, median) = FastWordPiece::from_cache_bytes(&bytes, 42).expect("valid cache");
+        assert_eq!(median, 7);
+        assert_eq!(cached.vocab, ft.vocab);
+        assert_eq!(cached.added_tokens, ft.added_tokens);
+        for text in corpus() {
+            assert_eq!(cached.encode_ids(text), ft.encode_ids(text), "mismatch for {text:?}");
+        }
+
+        assert!(FastWordPiece::from_cache_bytes(&bytes, 43).is_none());
+        assert!(FastWordPiece::from_cache_bytes(&bytes[..bytes.len() - 1], 42).is_none());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(FastWordPiece::from_cache_bytes(&trailing, 42).is_none());
+        let mut other_version = bytes;
+        other_version[7] ^= 0xff;
+        assert!(FastWordPiece::from_cache_bytes(&other_version, 42).is_none());
     }
 
     #[test]
