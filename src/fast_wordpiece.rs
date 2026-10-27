@@ -500,6 +500,7 @@ mod tests {
     }
 
     /// Random lowercase words, so long subword splits and unknown words occur.
+    #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
     fn noise(n: usize) -> Vec<String> {
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = |bound: u64| {
