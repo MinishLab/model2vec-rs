@@ -48,6 +48,7 @@ DEFAULT_MODELS = [
     "minishlab/potion-retrieval-32M",
     "sentence-transformers/static-retrieval-mrl-en-v1",
     "minishlab/potion-multilingual-128M",
+    "hotchpotch/bekko-static-embedding-v1",
     str(REPO / "tests" / "fixtures" / "test-model-vocab-quantized"),
 ]
 MIN_ROUNDS_FOR_CI = 5
