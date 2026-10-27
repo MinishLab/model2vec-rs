@@ -56,3 +56,7 @@ required-features = ["cli"]
 [[bench]]
 name = "encode"
 harness = false
+
+[[bench]]
+name = "throughput"
+harness = false

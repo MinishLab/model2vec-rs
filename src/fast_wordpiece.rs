@@ -129,8 +129,15 @@ impl FastWordPiece {
 
     /// Encode text into token IDs, matching `encode_batch_fast(...).get_ids()`
     /// (unknown words emit the unk id, which the caller filters out).
+    #[cfg(test)]
     pub(crate) fn encode_ids(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
+        self.encode_ids_into(text, &mut out);
+        out
+    }
+
+    /// Like [`Self::encode_ids`], but appends to a caller-owned buffer.
+    pub(crate) fn encode_ids_into(&self, text: &str, out: &mut Vec<u32>) {
         let mut scratch = String::new();
         // Split on added tokens (leftmost-longest), then run the BERT
         // pipeline on each span of ordinary text between them.
@@ -147,7 +154,7 @@ impl FastWordPiece {
                 .flatten();
             match hit {
                 Some((content, id)) => {
-                    self.encode_span(&text[start..i], &mut out, &mut scratch);
+                    self.encode_span(&text[start..i], out, &mut scratch);
                     out.push(*id);
                     i += content.len();
                     start = i;
@@ -157,8 +164,7 @@ impl FastWordPiece {
                 None => i += text[i..].chars().next().map_or(1, char::len_utf8),
             }
         }
-        self.encode_span(&text[start..], &mut out, &mut scratch);
-        out
+        self.encode_span(&text[start..], out, &mut scratch);
     }
 
     /// Normalize, pre-tokenize and WordPiece a span with no added tokens.
