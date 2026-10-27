@@ -6,19 +6,20 @@ use ndarray::{Array2, ArrayView2, CowArray, Ix2};
 use safetensors::{SafeTensors, tensor::Dtype};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokenizers::{
-    Tokenizer,
-    models::ModelWrapper,
-    parallelism::{MaybeParallelIterator, MaybeParallelRefIterator},
-};
+use tokenizers::{Tokenizer, models::ModelWrapper, parallelism::MaybeParallelRefIterator};
 
 use crate::fast_unigram::FastUnigram;
 use crate::fast_wordpiece::FastWordPiece;
+
+thread_local! {
+    static TOKEN_IDS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Static embedding model for Model2Vec.
 ///
@@ -401,56 +402,15 @@ impl StaticModel {
         max_length: Option<usize>,
         batch_size: usize,
     ) -> Vec<Vec<f32>> {
-        let model = &self.inner;
         let mut embeddings = Vec::with_capacity(sentences.len());
         for batch in sentences.chunks(batch_size) {
-            let truncated: Vec<&str> = batch
-                .iter()
-                .map(|text| {
-                    max_length
-                        .map(|max_tok| Self::truncate_str(text, max_tok, model.median_token_length))
-                        .unwrap_or(text.as_str())
-                })
-                .collect();
-            let pooled: Vec<Vec<f32>> = self
-                .tokenize_batch_ids(&truncated)
-                .into_maybe_par_iter()
-                .map(|mut token_ids| {
-                    if let Some(max_tok) = max_length {
-                        token_ids.truncate(max_tok);
-                    }
-                    if let Some(unk_id) = model.unk_token_id {
-                        token_ids.retain(|&id| id as usize != unk_id);
-                    }
-                    self.pool_ids(token_ids)
-                })
+            let pooled: Vec<Vec<f32>> = batch
+                .maybe_par_iter()
+                .map(|text| self.encode_one(text, max_length))
                 .collect();
             embeddings.extend(pooled);
         }
         embeddings
-    }
-
-    /// Tokenize a batch to raw ID lists (before UNK filtering / truncation).
-    /// Uses the custom WordPiece tokenizer or Unigram model when the model
-    /// matches that pipeline; other pipelines use the `tokenizers` crate.
-    fn tokenize_batch_ids(&self, texts: &[&str]) -> Vec<Vec<u32>> {
-        let model = &self.inner;
-        if let Some(ft) = &model.fast_tok {
-            return texts.maybe_par_iter().map(|t| ft.encode_ids(t)).collect();
-        }
-        if let Some(fu) = &model.fast_unigram {
-            return texts
-                .maybe_par_iter()
-                .map(|t| fu.encode_ids(&model.tokenizer, t).expect("tokenization failed"))
-                .collect();
-        }
-        model
-            .tokenizer
-            .encode_batch_fast::<String>(texts.iter().map(|s| (*s).to_string()).collect(), false)
-            .expect("tokenization failed")
-            .into_iter()
-            .map(|e| e.get_ids().to_vec())
-            .collect()
     }
 
     /// Default encode: `max_length=512`, `batch_size=1024`
@@ -460,35 +420,48 @@ impl StaticModel {
 
     /// Encode a single sentence into a vector.
     pub fn encode_single(&self, sentence: &str) -> Vec<f32> {
-        self.encode(&[sentence.to_string()])
-            .into_iter()
-            .next()
-            .unwrap_or_default()
+        self.encode_one(sentence, Some(512))
     }
 
-    /// Mean-pool a token-ID list into a single vector.
-    fn pool_ids(&self, ids: Vec<u32>) -> Vec<f32> {
+    /// Truncate, tokenize and pool one text.
+    /// Uses the custom WordPiece tokenizer or Unigram model when the model
+    /// matches that pipeline; other pipelines use the `tokenizers` crate.
+    fn encode_one(&self, text: &str, max_length: Option<usize>) -> Vec<f32> {
         let model = &self.inner;
-        let dim = model.embeddings.ncols();
-        let mut sum = vec![0.0_f32; dim];
-        let mut cnt = 0usize;
-        for &id in &ids {
-            let tok = id as usize;
-            let row_idx = model
-                .token_mapping
-                .as_ref()
-                .and_then(|m| m.get(tok))
-                .copied()
-                .unwrap_or(tok);
-            let scale = model.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
-            let row = model.embeddings.row(row_idx);
-            // Summing over a slice instead of a strided row lets the loop vectorize.
-            let row = row.as_slice().expect("embedding rows are contiguous");
-            for (s, &v) in sum.iter_mut().zip(row) {
-                *s += v * scale;
+        let text = max_length.map_or(text, |max_tok| {
+            Self::truncate_str(text, max_tok, model.median_token_length)
+        });
+        match (&model.fast_tok, &model.fast_unigram) {
+            (Some(ft), _) => TOKEN_IDS.with_borrow_mut(|ids| {
+                ids.clear();
+                ft.encode_ids_into(text, ids);
+                self.pool_ids(ids, max_length)
+            }),
+            (None, Some(fu)) => {
+                let ids = fu.encode_ids(&model.tokenizer, text).expect("tokenization failed");
+                self.pool_ids(&ids, max_length)
             }
-            cnt += 1;
+            (None, None) => {
+                let encoding = model.tokenizer.encode_fast(text, false).expect("tokenization failed");
+                self.pool_ids(encoding.get_ids(), max_length)
+            }
         }
+    }
+
+    /// Mean-pool the first `max_length` token IDs, skipping the unk token.
+    fn pool_ids(&self, ids: &[u32], max_length: Option<usize>) -> Vec<f32> {
+        let model = &self.inner;
+        let ids = &ids[..max_length.map_or(ids.len(), |max_tok| max_tok.min(ids.len()))];
+        let (mut sum, cnt) = match model.embeddings.ncols() {
+            64 => self.sum_rows_fixed::<64>(ids),
+            128 => self.sum_rows_fixed::<128>(ids),
+            256 => self.sum_rows_fixed::<256>(ids),
+            384 => self.sum_rows_fixed::<384>(ids),
+            512 => self.sum_rows_fixed::<512>(ids),
+            768 => self.sum_rows_fixed::<768>(ids),
+            1024 => self.sum_rows_fixed::<1024>(ids),
+            _ => self.sum_rows_dyn(ids),
+        };
         let denom = cnt.max(1) as f32;
         for x in &mut sum {
             *x /= denom;
@@ -500,6 +473,60 @@ impl StaticModel {
             }
         }
         sum
+    }
+
+    /// Weighted row sum for a compile-time embedding dimension.
+    fn sum_rows_fixed<const D: usize>(&self, ids: &[u32]) -> (Vec<f32>, usize) {
+        let mut sum = [0.0_f32; D];
+        let cnt = self.for_each_row(ids, |row, scale| {
+            let row: &[f32; D] = row.try_into().expect("embedding row has D columns");
+            for (s, &v) in sum.iter_mut().zip(row) {
+                *s += v * scale;
+            }
+        });
+        (sum.to_vec(), cnt)
+    }
+
+    /// Weighted row sum for any embedding dimension.
+    fn sum_rows_dyn(&self, ids: &[u32]) -> (Vec<f32>, usize) {
+        let mut sum = vec![0.0_f32; self.inner.embeddings.ncols()];
+        let cnt = self.for_each_row(ids, |row, scale| {
+            for (s, &v) in sum.iter_mut().zip(row) {
+                *s += v * scale;
+            }
+        });
+        (sum, cnt)
+    }
+
+    /// Call `f` with the embedding row and weight of every non-unk token;
+    /// returns the number of rows visited.
+    #[inline(always)]
+    fn for_each_row(&self, ids: &[u32], mut f: impl FnMut(&[f32], f32)) -> usize {
+        let model = &self.inner;
+        let table = model.embeddings.as_slice().expect("embeddings are contiguous");
+        let dim = model.embeddings.ncols();
+        let mut cnt = 0;
+        let tokens = ids
+            .iter()
+            .map(|&id| id as usize)
+            .filter(|&tok| Some(tok) != model.unk_token_id);
+        match (&model.token_mapping, &model.weights) {
+            (None, None) => {
+                for tok in tokens {
+                    f(&table[tok * dim..(tok + 1) * dim], 1.0);
+                    cnt += 1;
+                }
+            }
+            (mapping, weights) => {
+                for tok in tokens {
+                    let row_idx = mapping.as_ref().and_then(|m| m.get(tok)).copied().unwrap_or(tok);
+                    let scale = weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
+                    f(&table[row_idx * dim..(row_idx + 1) * dim], scale);
+                    cnt += 1;
+                }
+            }
+        }
+        cnt
     }
 }
 
