@@ -1,5 +1,7 @@
 # Benchmarks
 
+- `nanobeir.rs`: retrieval quality (NDCG@10) of one model on NanoBEIR.
+  Normally run through `scripts/nanobeir.py`, not directly.
 - `encode.rs`: latency percentiles of `StaticModel::encode` for one revision.
 - `quantize.rs`: throughput and accuracy of `StaticModel::quantize_int8`
   against the f32 model, in one process (see below).
@@ -70,3 +72,28 @@ variant follows every other equally often. It reports throughput, the
 speedup over f32 with a 95% bootstrap CI, and cosine similarity to the f32
 output. Set `RAYON_NUM_THREADS=1` for single-thread numbers.
 
+
+## Retrieval quality (NanoBEIR)
+
+Run this before every release:
+
+```sh
+uv run scripts/nanobeir.py
+```
+
+The script downloads the 13 NanoBEIR datasets (`zeta-alpha-ai/Nano*`) into
+`target/nanobeir/data/`, builds `nanobeir.rs`, and scores every model in
+`benches/nanobeir_baseline.json` (NDCG@10, cosine similarity, binary
+relevance, scored like `pytrec_eval`). It fails if a model's mean score
+drops by more than `--tolerance` (default 0.002) or any single dataset
+drops by more than `--dataset-tolerance` (default 0.01). Scoring all
+baseline models takes about fifteen seconds once the data and models are
+cached.
+
+A model suffixed with `:int8` is scored after `StaticModel::quantize_int8`;
+one suffixed with `:model2vec-int8` is first quantized to int8 by Python
+model2vec (pinned in the script) and saved under `target/nanobeir/models/`.
+To score other models, pass `--models`. When a change is meant to alter
+scores, review the deltas and record them with `--update-baseline`
+(optionally restricted with `--models`). The baseline scores match Python
+model2vec scored with `pytrec_eval` to within 2e-4.
