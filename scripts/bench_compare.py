@@ -97,7 +97,8 @@ def prepare_source(label: str, ref: str) -> tuple[Path, str]:
         manifest = cargo_toml.read_text()
         if not re.search(r'name\s*=\s*"throughput"', manifest):
             cargo_toml.write_text(manifest + BENCH_ENTRY)
-        return path, "dir-" + re.sub(r"[^A-Za-z0-9_.-]", "_", path.name)
+        digest = hashlib.sha256(str(path).encode()).hexdigest()[:12]
+        return path, f"dir-{re.sub(r'[^A-Za-z0-9_.-]', '_', path.name)}-{digest}"
     commit = run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=REPO, capture_output=True).stdout.strip()
     path = WORK / f"src-{label}"
     run(["git", "worktree", "prune"], cwd=REPO)
