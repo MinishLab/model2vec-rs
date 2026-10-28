@@ -358,7 +358,29 @@ impl FastWordPiece {
         if input.is_ascii() {
             self.normalize_ascii(input, out)
         } else {
-            self.normalize_unicode(input, out)
+            self.normalize_mixed(input, out)
+        }
+    }
+
+    /// Normalize runs of printable ASCII (plus `\t\n\r`) with the ASCII path
+    /// and everything in between with the Unicode path.
+    fn normalize_mixed(&self, input: &str, out: &mut String) {
+        out.reserve(input.len());
+        let bytes = input.as_bytes();
+        let mut start = 0;
+        while start < bytes.len() {
+            let plain = is_plain_ascii(bytes[start]);
+            let end = bytes[start..]
+                .iter()
+                .position(|&b| is_plain_ascii(b) != plain)
+                .map_or(bytes.len(), |n| start + n);
+            let run = &input[start..end];
+            if plain {
+                self.normalize_ascii(run, out);
+            } else {
+                self.normalize_unicode(run, out);
+            }
+            start = end;
         }
     }
 
@@ -382,33 +404,27 @@ impl FastWordPiece {
         }
     }
 
-    fn normalize_unicode(&self, input: &str, out: &mut String) {
-        // Fused clean + Chinese-char pass.
-        let mut chars: Vec<char> = Vec::with_capacity(input.len());
-        for c in input.chars() {
-            if self.clean_text {
-                if c == '\0' || c == '\u{fffd}' || is_control(c) {
-                    continue;
-                }
-                if is_whitespace(c) {
-                    chars.push(' ');
-                    continue;
-                }
+    /// Fused clean + Chinese-char step for one char.
+    fn stage(&self, c: char) -> [Option<char>; 3] {
+        if self.clean_text {
+            if c == '\0' || c == '\u{fffd}' || is_control(c) {
+                return [None; 3];
             }
-            if self.handle_chinese_chars && is_chinese_char(c) {
-                chars.push(' ');
-                chars.push(c);
-                chars.push(' ');
-                continue;
+            if is_whitespace(c) {
+                return [Some(' '), None, None];
             }
-            chars.push(c);
         }
-        let staged: String = chars.into_iter().collect();
+        if self.handle_chinese_chars && is_chinese_char(c) {
+            return [Some(' '), Some(c), Some(' ')];
+        }
+        [Some(c), None, None]
+    }
 
-        let processed: String = if self.strip_accents {
+    fn normalize_unicode(&self, input: &str, out: &mut String) {
+        let staged = input.chars().flat_map(|c| self.stage(c).into_iter().flatten());
+        if self.strip_accents {
             // NFD, drop nonspacing marks, then (optionally) lowercase; left
             // decomposed, matching HuggingFace.
-            let mut out = String::with_capacity(staged.len());
             for c in staged.nfd() {
                 if c.is_mark_nonspacing() {
                     continue;
@@ -419,14 +435,11 @@ impl FastWordPiece {
                     out.push(c);
                 }
             }
-            out
         } else if self.lowercase {
-            staged.chars().flat_map(|c| c.to_lowercase()).collect()
+            out.extend(staged.flat_map(char::to_lowercase));
         } else {
-            staged
-        };
-
-        out.push_str(&processed);
+            out.extend(staged);
+        }
     }
 }
 
@@ -491,6 +504,11 @@ fn pre_tokenize<'a>(s: &'a str, mut emit: impl FnMut(&'a str)) {
 
 // --- Unicode predicates (match HuggingFace's bert normalizer) ----------------
 
+/// Printable ASCII or `\t\n\r`: bytes the ASCII path keeps.
+fn is_plain_ascii(b: u8) -> bool {
+    matches!(b, b' '..=b'~' | b'\t' | b'\n' | b'\r')
+}
+
 fn is_whitespace(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r') || c.is_whitespace()
 }
@@ -518,6 +536,8 @@ fn is_chinese_char(c: char) -> bool {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use tokenizers::normalizers::BertNormalizer;
+    use tokenizers::{NormalizedString, Normalizer};
 
     fn corpus() -> Vec<&'static str> {
         vec![
@@ -554,6 +574,13 @@ mod tests {
             "é à ñ ü ç",                     // precomposed (NFD path)
             "Å Ω µ",                         // chars with compatibility/canonical quirks
             "क्षत्रि",                         // Devanagari combining (non-Latin marks)
+            // --- ASCII / non-ASCII run boundaries ---
+            "Zoë Saldaña, born in Passaic (NJ), 1978.",
+            "x\u{0323}\u{0301}y a\u{0301}\u{0323}b", // marks after ASCII, needing reorder
+            "x\u{0301}\u{0001}\u{0323}y",            // control between marks
+            "q\u{1D16D}\u{0001}\u{1D165}z",          // non-Mn marks with ccc across a control
+            "Ab\u{00C0}\u{0007}C\td\u{3000}E\u{00A0}f", // controls/NBSP/ideographic space between runs
+            "ÉCOLE\nÜBER\r\nСЛОВО 東京Tokyo",
             // --- CJK / handle_chinese_chars boundaries and non-CJK scripts ---
             "一鿿㐀䶿",                       // BMP CJK range endpoints
             "𠀀 𪛖 豈",                       // ext-B (U+20000) + compatibility (U+F900)
@@ -604,6 +631,148 @@ mod tests {
             let want: Vec<u32> = tok.encode_fast(text, false).expect("crate encode").get_ids().to_vec();
             let got = ft.encode_ids(text);
             assert_eq!(got, want, "token-id mismatch for {text:?}");
+        }
+    }
+
+    /// Every (clean_text, handle_chinese_chars, strip_accents, lowercase) combination.
+    fn flag_combinations() -> impl Iterator<Item = [bool; 4]> {
+        (0..16u8).map(|m| [m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0])
+    }
+
+    fn normalizer_with([clean, chinese, strip, lower]: [bool; 4]) -> FastWordPiece {
+        let vocab = HashMap::from([("[UNK]".to_string(), 0)]);
+        FastWordPiece::assemble(&vocab, "##", Some(0), 100, clean, chinese, strip, lower, Vec::new())
+    }
+
+    fn fast_normalized(ft: &FastWordPiece, text: &str) -> String {
+        let mut out = String::new();
+        ft.normalize_into(text, &mut out);
+        out
+    }
+
+    fn crate_normalized([clean, chinese, strip, lower]: [bool; 4], text: &str) -> String {
+        let mut normalized = NormalizedString::from(text);
+        BertNormalizer::new(clean, chinese, Some(strip), lower)
+            .normalize(&mut normalized)
+            .expect("crate normalize");
+        normalized.get().to_string()
+    }
+
+    /// Random strings mixing ASCII, controls, whitespace, combining marks of
+    /// several combining classes, and characters that decompose or change case.
+    fn mixed_noise(n: usize) -> Vec<String> {
+        const POOL: &[char] = &[
+            'a',
+            'Z',
+            'q',
+            ' ',
+            '.',
+            '\t',
+            '\n',
+            '\r',
+            '\u{0000}',
+            '\u{0001}',
+            '\u{0007}',
+            '\u{000b}',
+            '\u{001f}',
+            '\u{007f}',
+            '\u{fffd}',
+            '\u{0300}',
+            '\u{0301}',
+            '\u{0323}',
+            '\u{0327}',
+            '\u{1D165}',
+            '\u{1D16D}',
+            '\u{0F71}',
+            '\u{0F72}',
+            'é',
+            'À',
+            'İ',
+            'ß',
+            'Σ',
+            'Å',
+            'ﬁ',
+            '\u{00a0}',
+            '\u{3000}',
+            '\u{200b}',
+            '東',
+            '가',
+            'Ж',
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        (0..n)
+            .map(|_| {
+                (0..1 + next(24))
+                    .map(|_| POOL[next(POOL.len() as u64) as usize])
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn normalize_matches_crate_for_all_flags() {
+        let mut texts: Vec<String> = corpus().into_iter().map(String::from).collect();
+        texts.extend(mixed_noise(5000));
+        for flags in flag_combinations() {
+            let ft = normalizer_with(flags);
+            for text in &texts {
+                assert_eq!(
+                    fast_normalized(&ft, text),
+                    crate_normalized(flags, text),
+                    "normalized-text mismatch for {text:?} with [clean, chinese, strip, lower] = {flags:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_mark_order_and_controls() {
+        // [clean_text, strip_accents]; handle_chinese_chars on, lowercase off.
+        let cases: &[(&str, [bool; 2], &str)] = &[
+            // U+1D16D (ccc 226) and U+1D165 (ccc 216): spacing marks.
+            ("q\u{1D16D}\u{0001}\u{1D165}z", [true, true], "q\u{1D165}\u{1D16D}z"),
+            (
+                "q\u{1D16D}\u{0001}\u{1D165}z",
+                [false, true],
+                "q\u{1D16D}\u{0001}\u{1D165}z",
+            ),
+            ("q\u{1D16D}\u{0001}\u{1D165}z", [true, false], "q\u{1D16D}\u{1D165}z"),
+            (
+                "q\u{1D16D}\u{0001}\u{1D165}z",
+                [false, false],
+                "q\u{1D16D}\u{0001}\u{1D165}z",
+            ),
+            ("x\u{0301}\u{0323}y", [true, false], "x\u{0301}\u{0323}y"),
+            ("x\u{0301}\u{0323}y", [true, true], "xy"),
+            ("x\u{0301}\u{0001}\u{0323}y", [true, false], "x\u{0301}\u{0323}y"),
+            (
+                "x\u{0301}\u{0001}\u{0323}y",
+                [false, false],
+                "x\u{0301}\u{0001}\u{0323}y",
+            ),
+            ("x\u{0301}\u{0001}\u{0323}y", [false, true], "x\u{0001}y"),
+            ("Ab\u{00C0}\u{0007}C", [true, true], "AbAC"),
+            ("Ab\u{00C0}\u{0007}C", [false, false], "Ab\u{00C0}\u{0007}C"),
+            ("Ab\u{00C0}\u{0007}C", [false, true], "AbA\u{0007}C"),
+        ];
+        for &(text, [clean, strip], want) in cases {
+            let flags = [clean, true, strip, false];
+            assert_eq!(
+                fast_normalized(&normalizer_with(flags), text),
+                want,
+                "{text:?} {flags:?}"
+            );
+            assert_eq!(
+                crate_normalized(flags, text),
+                want,
+                "crate disagrees: {text:?} {flags:?}"
+            );
         }
     }
 

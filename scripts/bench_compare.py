@@ -87,6 +87,17 @@ def ensure_corpus() -> Path:
     return path
 
 
+def check_corpus(path: Path) -> None:
+    """Exit unless `path` is UTF-8 text with at least one word, as `throughput.rs` splits it."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit(f"cannot read corpus {path}: {e}")
+    # U+001C-U+001F count as whitespace for str.isspace but not for Rust's split_whitespace.
+    if not re.search(r"[^\s]|[\x1c-\x1f]", text):
+        sys.exit(f"corpus {path} has no words: it is empty or whitespace only")
+
+
 def prepare_source(label: str, ref: str) -> tuple[Path, str]:
     if ref == "WORKTREE":
         return REPO, "worktree"
@@ -187,6 +198,7 @@ def main() -> None:
     p.add_argument("--threads", default="all,1", help="comma-separated: 'all' and/or thread counts")
     p.add_argument("--rounds", type=int, default=10, help="alternating process launches per side")
     p.add_argument("--reps", type=int, default=5, help="timed passes per process launch")
+    p.add_argument("--corpus", type=Path, help="text file to build workloads from (default: big.txt, downloaded)")
     p.add_argument("--native", action="store_true", help="build with -Ctarget-cpu=native")
     p.add_argument("--quick", action="store_true", help="3 rounds x 3 reps, first model only")
     p.add_argument("--out", type=Path, help="write raw results as JSON (default: target/bench-compare/results-*.json)")
@@ -194,7 +206,8 @@ def main() -> None:
     if a.quick:
         a.rounds, a.reps, a.models = 3, 3, a.models.split(",")[0]
 
-    corpus = ensure_corpus()
+    corpus = a.corpus.resolve() if a.corpus else ensure_corpus()
+    check_corpus(corpus)
     sides = {
         "A": Side("A", a.baseline, *prepare_source("A", a.baseline)),
         "B": Side("B", a.candidate, *prepare_source("B", a.candidate)),
@@ -281,7 +294,7 @@ def main() -> None:
 
     out = a.out or WORK / f"results-{time.strftime('%Y%m%d-%H%M%S')}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    meta = {"baseline": a.baseline, "candidate": a.candidate, "rounds": a.rounds, "reps": a.reps, "native": a.native}
+    meta = {"corpus": str(corpus), "baseline": a.baseline, "candidate": a.candidate, "rounds": a.rounds, "reps": a.reps, "native": a.native}
     out.write_text(json.dumps({"meta": meta, "results": summary}, indent=2))
     print(f"raw results: {out}")
 
