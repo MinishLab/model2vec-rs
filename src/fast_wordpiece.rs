@@ -358,7 +358,29 @@ impl FastWordPiece {
         if input.is_ascii() {
             self.normalize_ascii(input, out)
         } else {
-            self.normalize_unicode(input, out)
+            self.normalize_mixed(input, out)
+        }
+    }
+
+    /// Normalize runs of printable ASCII (plus `\t\n\r`) with the ASCII path
+    /// and everything in between with the Unicode path.
+    fn normalize_mixed(&self, input: &str, out: &mut String) {
+        out.reserve(input.len());
+        let bytes = input.as_bytes();
+        let mut start = 0;
+        while start < bytes.len() {
+            let plain = is_plain_ascii(bytes[start]);
+            let end = bytes[start..]
+                .iter()
+                .position(|&b| is_plain_ascii(b) != plain)
+                .map_or(bytes.len(), |n| start + n);
+            let run = &input[start..end];
+            if plain {
+                self.normalize_ascii(run, out);
+            } else {
+                self.normalize_unicode(run, out);
+            }
+            start = end;
         }
     }
 
@@ -382,33 +404,27 @@ impl FastWordPiece {
         }
     }
 
-    fn normalize_unicode(&self, input: &str, out: &mut String) {
-        // Fused clean + Chinese-char pass.
-        let mut chars: Vec<char> = Vec::with_capacity(input.len());
-        for c in input.chars() {
-            if self.clean_text {
-                if c == '\0' || c == '\u{fffd}' || is_control(c) {
-                    continue;
-                }
-                if is_whitespace(c) {
-                    chars.push(' ');
-                    continue;
-                }
+    /// Fused clean + Chinese-char step for one char.
+    fn stage(&self, c: char) -> [Option<char>; 3] {
+        if self.clean_text {
+            if c == '\0' || c == '\u{fffd}' || is_control(c) {
+                return [None; 3];
             }
-            if self.handle_chinese_chars && is_chinese_char(c) {
-                chars.push(' ');
-                chars.push(c);
-                chars.push(' ');
-                continue;
+            if is_whitespace(c) {
+                return [Some(' '), None, None];
             }
-            chars.push(c);
         }
-        let staged: String = chars.into_iter().collect();
+        if self.handle_chinese_chars && is_chinese_char(c) {
+            return [Some(' '), Some(c), Some(' ')];
+        }
+        [Some(c), None, None]
+    }
 
-        let processed: String = if self.strip_accents {
+    fn normalize_unicode(&self, input: &str, out: &mut String) {
+        let staged = input.chars().flat_map(|c| self.stage(c).into_iter().flatten());
+        if self.strip_accents {
             // NFD, drop nonspacing marks, then (optionally) lowercase; left
             // decomposed, matching HuggingFace.
-            let mut out = String::with_capacity(staged.len());
             for c in staged.nfd() {
                 if c.is_mark_nonspacing() {
                     continue;
@@ -419,14 +435,11 @@ impl FastWordPiece {
                     out.push(c);
                 }
             }
-            out
         } else if self.lowercase {
-            staged.chars().flat_map(|c| c.to_lowercase()).collect()
+            out.extend(staged.flat_map(char::to_lowercase));
         } else {
-            staged
-        };
-
-        out.push_str(&processed);
+            out.extend(staged);
+        }
     }
 }
 
@@ -491,6 +504,11 @@ fn pre_tokenize<'a>(s: &'a str, mut emit: impl FnMut(&'a str)) {
 
 // --- Unicode predicates (match HuggingFace's bert normalizer) ----------------
 
+/// Printable ASCII or `\t\n\r`: bytes the ASCII path keeps.
+fn is_plain_ascii(b: u8) -> bool {
+    matches!(b, b' '..=b'~' | b'\t' | b'\n' | b'\r')
+}
+
 fn is_whitespace(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r') || c.is_whitespace()
 }
@@ -554,6 +572,13 @@ mod tests {
             "é à ñ ü ç",                     // precomposed (NFD path)
             "Å Ω µ",                         // chars with compatibility/canonical quirks
             "क्षत्रि",                         // Devanagari combining (non-Latin marks)
+            // --- ASCII / non-ASCII run boundaries ---
+            "Zoë Saldaña, born in Passaic (NJ), 1978.",
+            "x\u{0323}\u{0301}y a\u{0301}\u{0323}b",  // marks after ASCII, needing reorder
+            "x\u{0301}\u{0001}\u{0323}y",             // control between marks
+            "q\u{1D16D}\u{0001}\u{1D165}z",           // non-Mn marks with ccc across a control
+            "Ab\u{00C0}\u{0007}C\td\u{3000}E\u{00A0}f", // controls/NBSP/ideographic space between runs
+            "ÉCOLE\nÜBER\r\nСЛОВО 東京Tokyo",
             // --- CJK / handle_chinese_chars boundaries and non-CJK scripts ---
             "一鿿㐀䶿",                       // BMP CJK range endpoints
             "𠀀 𪛖 豈",                       // ext-B (U+20000) + compatibility (U+F900)
