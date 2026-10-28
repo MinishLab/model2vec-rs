@@ -574,9 +574,9 @@ mod tests {
             "क्षत्रि",                         // Devanagari combining (non-Latin marks)
             // --- ASCII / non-ASCII run boundaries ---
             "Zoë Saldaña, born in Passaic (NJ), 1978.",
-            "x\u{0323}\u{0301}y a\u{0301}\u{0323}b",  // marks after ASCII, needing reorder
-            "x\u{0301}\u{0001}\u{0323}y",             // control between marks
-            "q\u{1D16D}\u{0001}\u{1D165}z",           // non-Mn marks with ccc across a control
+            "x\u{0323}\u{0301}y a\u{0301}\u{0323}b", // marks after ASCII, needing reorder
+            "x\u{0301}\u{0001}\u{0323}y",            // control between marks
+            "q\u{1D16D}\u{0001}\u{1D165}z",          // non-Mn marks with ccc across a control
             "Ab\u{00C0}\u{0007}C\td\u{3000}E\u{00A0}f", // controls/NBSP/ideographic space between runs
             "ÉCOLE\nÜBER\r\nСЛОВО 東京Tokyo",
             // --- CJK / handle_chinese_chars boundaries and non-CJK scripts ---
