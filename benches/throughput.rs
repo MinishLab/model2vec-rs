@@ -51,6 +51,7 @@ fn main() {
     };
     let text = fs::read_to_string(corpus).unwrap_or_else(|e| panic!("failed to read {corpus}: {e}"));
     let words: Vec<&str> = text.split_whitespace().collect();
+    assert!(!words.is_empty(), "corpus {corpus} has no words");
     let texts: Vec<String> = words
         .chunks(words_per_text)
         .cycle()

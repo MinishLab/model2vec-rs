@@ -87,6 +87,17 @@ def ensure_corpus() -> Path:
     return path
 
 
+def check_corpus(path: Path) -> None:
+    """Exit unless `path` is UTF-8 text with at least one word, as `throughput.rs` splits it."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit(f"cannot read corpus {path}: {e}")
+    # U+001C-U+001F count as whitespace for str.isspace but not for Rust's split_whitespace.
+    if not re.search(r"[^\s]|[\x1c-\x1f]", text):
+        sys.exit(f"corpus {path} has no words: it is empty or whitespace only")
+
+
 def prepare_source(label: str, ref: str) -> tuple[Path, str]:
     if ref == "WORKTREE":
         return REPO, "worktree"
@@ -196,6 +207,7 @@ def main() -> None:
         a.rounds, a.reps, a.models = 3, 3, a.models.split(",")[0]
 
     corpus = a.corpus.resolve() if a.corpus else ensure_corpus()
+    check_corpus(corpus)
     sides = {
         "A": Side("A", a.baseline, *prepare_source("A", a.baseline)),
         "B": Side("B", a.candidate, *prepare_source("B", a.candidate)),

@@ -536,6 +536,8 @@ fn is_chinese_char(c: char) -> bool {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use tokenizers::normalizers::BertNormalizer;
+    use tokenizers::{NormalizedString, Normalizer};
 
     fn corpus() -> Vec<&'static str> {
         vec![
@@ -629,6 +631,148 @@ mod tests {
             let want: Vec<u32> = tok.encode_fast(text, false).expect("crate encode").get_ids().to_vec();
             let got = ft.encode_ids(text);
             assert_eq!(got, want, "token-id mismatch for {text:?}");
+        }
+    }
+
+    /// Every (clean_text, handle_chinese_chars, strip_accents, lowercase) combination.
+    fn flag_combinations() -> impl Iterator<Item = [bool; 4]> {
+        (0..16u8).map(|m| [m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0])
+    }
+
+    fn normalizer_with([clean, chinese, strip, lower]: [bool; 4]) -> FastWordPiece {
+        let vocab = HashMap::from([("[UNK]".to_string(), 0)]);
+        FastWordPiece::assemble(&vocab, "##", Some(0), 100, clean, chinese, strip, lower, Vec::new())
+    }
+
+    fn fast_normalized(ft: &FastWordPiece, text: &str) -> String {
+        let mut out = String::new();
+        ft.normalize_into(text, &mut out);
+        out
+    }
+
+    fn crate_normalized([clean, chinese, strip, lower]: [bool; 4], text: &str) -> String {
+        let mut normalized = NormalizedString::from(text);
+        BertNormalizer::new(clean, chinese, Some(strip), lower)
+            .normalize(&mut normalized)
+            .expect("crate normalize");
+        normalized.get().to_string()
+    }
+
+    /// Random strings mixing ASCII, controls, whitespace, combining marks of
+    /// several combining classes, and characters that decompose or change case.
+    fn mixed_noise(n: usize) -> Vec<String> {
+        const POOL: &[char] = &[
+            'a',
+            'Z',
+            'q',
+            ' ',
+            '.',
+            '\t',
+            '\n',
+            '\r',
+            '\u{0000}',
+            '\u{0001}',
+            '\u{0007}',
+            '\u{000b}',
+            '\u{001f}',
+            '\u{007f}',
+            '\u{fffd}',
+            '\u{0300}',
+            '\u{0301}',
+            '\u{0323}',
+            '\u{0327}',
+            '\u{1D165}',
+            '\u{1D16D}',
+            '\u{0F71}',
+            '\u{0F72}',
+            'é',
+            'À',
+            'İ',
+            'ß',
+            'Σ',
+            'Å',
+            'ﬁ',
+            '\u{00a0}',
+            '\u{3000}',
+            '\u{200b}',
+            '東',
+            '가',
+            'Ж',
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        (0..n)
+            .map(|_| {
+                (0..1 + next(24))
+                    .map(|_| POOL[next(POOL.len() as u64) as usize])
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn normalize_matches_crate_for_all_flags() {
+        let mut texts: Vec<String> = corpus().into_iter().map(String::from).collect();
+        texts.extend(mixed_noise(5000));
+        for flags in flag_combinations() {
+            let ft = normalizer_with(flags);
+            for text in &texts {
+                assert_eq!(
+                    fast_normalized(&ft, text),
+                    crate_normalized(flags, text),
+                    "normalized-text mismatch for {text:?} with [clean, chinese, strip, lower] = {flags:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_mark_order_and_controls() {
+        // [clean_text, strip_accents]; handle_chinese_chars on, lowercase off.
+        let cases: &[(&str, [bool; 2], &str)] = &[
+            // U+1D16D (ccc 226) and U+1D165 (ccc 216): spacing marks.
+            ("q\u{1D16D}\u{0001}\u{1D165}z", [true, true], "q\u{1D165}\u{1D16D}z"),
+            (
+                "q\u{1D16D}\u{0001}\u{1D165}z",
+                [false, true],
+                "q\u{1D16D}\u{0001}\u{1D165}z",
+            ),
+            ("q\u{1D16D}\u{0001}\u{1D165}z", [true, false], "q\u{1D16D}\u{1D165}z"),
+            (
+                "q\u{1D16D}\u{0001}\u{1D165}z",
+                [false, false],
+                "q\u{1D16D}\u{0001}\u{1D165}z",
+            ),
+            ("x\u{0301}\u{0323}y", [true, false], "x\u{0301}\u{0323}y"),
+            ("x\u{0301}\u{0323}y", [true, true], "xy"),
+            ("x\u{0301}\u{0001}\u{0323}y", [true, false], "x\u{0301}\u{0323}y"),
+            (
+                "x\u{0301}\u{0001}\u{0323}y",
+                [false, false],
+                "x\u{0301}\u{0001}\u{0323}y",
+            ),
+            ("x\u{0301}\u{0001}\u{0323}y", [false, true], "x\u{0001}y"),
+            ("Ab\u{00C0}\u{0007}C", [true, true], "AbAC"),
+            ("Ab\u{00C0}\u{0007}C", [false, false], "Ab\u{00C0}\u{0007}C"),
+            ("Ab\u{00C0}\u{0007}C", [false, true], "AbA\u{0007}C"),
+        ];
+        for &(text, [clean, strip], want) in cases {
+            let flags = [clean, true, strip, false];
+            assert_eq!(
+                fast_normalized(&normalizer_with(flags), text),
+                want,
+                "{text:?} {flags:?}"
+            );
+            assert_eq!(
+                crate_normalized(flags, text),
+                want,
+                "crate disagrees: {text:?} {flags:?}"
+            );
         }
     }
 
