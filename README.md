@@ -209,18 +209,29 @@ A variety of pre-trained Model2Vec models are available on the [HuggingFace Hub 
 
 ## Performance
 
-We compared the performance of the Rust implementation with the Python version of Model2Vec. The benchmark was run single-threaded on a CPU.
+We compared `model2vec-rs` with the Python version of Model2Vec by encoding the same texts with [`potion-base-8M`](https://huggingface.co/minishlab/potion-base-8M) in both.
 
-| Implementation | Throughput                                         |
-| -------------- | -------------------------------------------------- |
-| **Rust**       | 8000 samples/second |
-| **Python**     | 4650 samples/second |
+| Implementation | Single thread       | All cores             | Model load |
+| -------------- | ------------------- | --------------------- | ---------- |
+| **Rust**       | 642K texts/second   | 2.97M texts/second    | 16 ms      |
+| **Python**     | 41K texts/second    | 123K texts/second     | 315 ms     |
+| **Speedup**    | **15.8×**           | **24.1×**             | **~20×**   |
 
-The Rust version is roughly **1.7×** faster than the Python version.
+On a single thread, the Rust version is roughly **16×** faster than the Python version, and about **24×** faster when using all cores.
+
+Benchmark details:
+
+*   **Corpus:** English Wikipedia text, 64,738 non-empty lines (paragraphs and section headings, 17 words and 108 bytes per line on average). Each line is one text, and every pass encodes all of them in a single `encode` call with the default `max_length` of 512.
+*   **Hardware:** Apple M3 Pro (12 cores), 18 GB RAM.
+*   **Software:** `model2vec-rs` 0.3.0 (release build, Rust 1.99.1); Python 3.14.3 with `model2vec` 0.10.0, `tokenizers` 0.23.3 and `numpy` 2.5.4.
+*   **Single thread:** `RAYON_NUM_THREADS=1` and `TOKENIZERS_PARALLELISM=false` for both; Python with `use_multiprocessing=False`.
+*   **All cores:** Rust with default Rayon parallelism; Python with tokenizer parallelism enabled and `use_multiprocessing=False`.
+*   **Method:** 5 alternating rounds of Rust and Python processes, 5 timed passes each after one warm-up pass; the table reports the median over the 25 passes. Both implementations produce the same embeddings up to floating-point rounding.
+*   **Model load:** median time to load the model from the local Hugging Face cache; for Python this includes importing `model2vec`.
 
 ## Relation to Python `model2vec`
 
-*   **`model2vec-rs` (This Crate):** High-performance Rust engine for 1.7x faster **Model2Vec inference**.
+*   **`model2vec-rs` (This Crate):** High-performance Rust engine for up to 24x faster **Model2Vec inference**.
 *   **[`model2vec`](https://github.com/MinishLab/model2vec) (Python-based):** Handles model **distillation, training, fine-tuning**, and slower Python-based inference.
 
 ## License
