@@ -120,7 +120,7 @@ impl FastWordPiece {
             return None;
         };
 
-        let vocab = tok.get_vocab(true);
+        let vocab = tok.get_vocab(false);
         let unk_id = vocab.get(&model.unk_token).copied();
 
         // The crate matches added tokens with `normalized: false` against raw
@@ -631,6 +631,22 @@ mod tests {
             let want: Vec<u32> = tok.encode_fast(text, false).expect("crate encode").get_ids().to_vec();
             let got = ft.encode_ids(text);
             assert_eq!(got, want, "token-id mismatch for {text:?}");
+        }
+    }
+
+    #[test]
+    fn added_token_outside_vocab_is_not_a_wordpiece() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let mut tok = Tokenizer::from_file(path).expect("load fixture tokenizer");
+        tok.add_special_tokens(&[tokenizers::AddedToken::from("zzqx", true)]);
+        let ft = FastWordPiece::from_tokenizer(&tok).expect("fixture is a WordPiece pipeline");
+
+        for text in ["ZZQX", "zzqx", "a ZzQx b zzqxs"] {
+            let want: Vec<u32> = tok.encode_fast(text, false).expect("crate encode").get_ids().to_vec();
+            assert_eq!(ft.encode_ids(text), want, "token-id mismatch for {text:?}");
         }
     }
 

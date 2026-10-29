@@ -19,8 +19,8 @@
 //! which then resolves as `Unigram::tokenize` resolves it (a piece if it spells
 //! one, else its bytes under byte fallback, else the unknown id).
 //!
-//! Tokenizers whose output this module would not reproduce (truncation or
-//! padding configured, or no `unk_id`) return `None` from
+//! Tokenizers whose output this module would not reproduce (no `unk_id`)
+//! return `None` from
 //! [`FastUnigram::from_tokenizer`] so the caller falls back to the crate.
 
 use crate::trie::{DoubleArrayTrie, NONE};
@@ -76,11 +76,7 @@ impl FastUnigram {
         let ModelWrapper::Unigram(model) = tok.get_model() else {
             return None;
         };
-        // Truncation and padding change the IDs after the model; without an
-        // `unk_id` the crate fails on an unknown character.
-        if tok.get_truncation().is_some() || tok.get_padding().is_some() {
-            return None;
-        }
+        // Without an `unk_id` the crate fails on an unknown character.
         let unk_id = u32::try_from(unk_id?).ok()?;
 
         // A piece listed twice resolves to its last ID, as the crate's
@@ -435,15 +431,6 @@ mod tests {
     fn fast_matches_crate_with_byte_fallback() {
         let texts = corpus();
         assert_matches_crate(&small_unigram(&texts, true), &texts);
-    }
-
-    #[test]
-    fn truncation_falls_back() {
-        let texts = corpus();
-        let mut tok = small_unigram(&texts, false);
-        tok.with_truncation(Some(tokenizers::TruncationParams::default()))
-            .unwrap();
-        assert!(FastUnigram::from_tokenizer(&tok, Some(0)).is_none());
     }
 
     #[test]

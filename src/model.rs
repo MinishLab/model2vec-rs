@@ -63,7 +63,11 @@ struct LoadedTokenizer {
 }
 
 impl LoadedTokenizer {
-    fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
+    fn from_tokenizer(mut tokenizer: Tokenizer) -> Result<Self> {
+        tokenizer
+            .with_truncation(None)
+            .map_err(|e| anyhow!("failed to disable truncation: {e}"))?;
+        tokenizer.with_padding(None);
         let (median_token_length, unk_token_id) = compute_metadata(&tokenizer)?;
         let tokenization = if let Some(ft) = FastWordPiece::from_tokenizer(&tokenizer) {
             Tokenization::WordPiece(ft)
@@ -505,7 +509,7 @@ impl StaticModel {
         if cols == 0 {
             return Err(anyhow!("embedding dimension must be greater than 0"));
         }
-        if embeddings.len() != rows * cols {
+        if rows.checked_mul(cols) != Some(embeddings.len()) {
             return Err(anyhow!(
                 "embeddings length {} != rows {} * cols {}",
                 embeddings.len(),
@@ -904,9 +908,12 @@ fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&s
 
 #[cfg(test)]
 mod tests {
-    use super::{Embeddings, StaticModel, decode_token_mapping};
+    use super::{Embeddings, StaticModel, Tokenization, decode_token_mapping};
     use safetensors::tensor::Dtype;
     use std::borrow::Cow;
+    use tokenizers::{
+        PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, pre_tokenizers::whitespace::Whitespace,
+    };
 
     #[test]
     fn decode_token_mapping_supports_i32_and_i64() {
@@ -949,5 +956,48 @@ mod tests {
         assert!(matches!(&inner.embeddings, Embeddings::I8(Cow::Owned(_))));
         assert_eq!(inner.row_scales.as_ref().map(Vec::len), Some(rows));
         assert_eq!(inner.weights.is_none(), inner.token_mapping.is_none());
+    }
+
+    #[test]
+    fn tokenizer_truncation_and_padding_are_ignored() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let mut plain = Tokenizer::from_file(path).unwrap();
+        plain.with_pre_tokenizer(Some(Whitespace {}));
+        let mut configured = plain.clone();
+        configured
+            .with_truncation(Some(TruncationParams {
+                max_length: 2,
+                ..Default::default()
+            }))
+            .unwrap();
+        configured.with_padding(Some(PaddingParams {
+            strategy: PaddingStrategy::Fixed(64),
+            ..Default::default()
+        }));
+
+        let rows = plain.get_vocab_size(false);
+        let embeddings: Vec<f32> = (0..rows * 2).map(|i| (i % 97) as f32).collect();
+        let load = |tok| StaticModel::from_owned(tok, embeddings.clone(), rows, 2, false, None, None).unwrap();
+        let (plain, configured) = (load(plain), load(configured));
+        assert!(matches!(
+            configured.inner.tokenizer.tokenization,
+            Tokenization::Crate(_)
+        ));
+
+        let text = "the quick brown fox jumps over the lazy dog";
+        assert_eq!(configured.encode_single(text), plain.encode_single(text));
+    }
+
+    #[test]
+    fn overflowing_shape_is_rejected() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let tok = Tokenizer::from_file(path).unwrap();
+        assert!(StaticModel::from_owned(tok, Vec::new(), usize::MAX / 2 + 1, 2, false, None, None).is_err());
     }
 }
