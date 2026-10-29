@@ -209,18 +209,39 @@ A variety of pre-trained Model2Vec models are available on the [HuggingFace Hub 
 
 ## Performance
 
-We compared the performance of the Rust implementation with the Python version of Model2Vec. The benchmark was run single-threaded on a CPU.
+We compared `model2vec-rs` with the Python version of Model2Vec by encoding the same texts with [`potion-base-8M`](https://huggingface.co/minishlab/potion-base-8M) in both.
 
-| Implementation | Throughput                                         |
-| -------------- | -------------------------------------------------- |
-| **Rust**       | 8000 samples/second |
-| **Python**     | 4650 samples/second |
+| Implementation | Single thread       | All cores             | Model load |
+| -------------- | ------------------- | --------------------- | ---------- |
+| **Rust**       | 671K texts/second   | 3.06M texts/second    | 15 ms      |
+| **Python**     | 40K texts/second    | 134K texts/second     | 312 ms     |
+| **Speedup**    | **16.6×**           | **22.9×**             | **~20×**   |
 
-The Rust version is roughly **1.7×** faster than the Python version.
+On a single thread, the Rust version is roughly **17×** faster than the Python version, and about **23×** faster when using all cores.
+
+To reproduce these numbers, run this from the repository root (it needs Rust and [`uv`](https://docs.astral.sh/uv/)):
+
+```sh
+uv run scripts/python_compare.py
+```
+
+The script downloads the corpus, builds [`benches/python_compare.rs`](benches/python_compare.rs), runs both implementations and prints the table above. See [`scripts/python_compare.py`](scripts/python_compare.py) for the options.
+
+Benchmark details:
+
+*   **Corpus:** 2,644 random articles from English Wikipedia: shard [`20231101.en/train-00017-of-00041.parquet`](https://huggingface.co/datasets/wikimedia/wikipedia/blob/b04c8d1ceb2f5cd4588862100d08de323dccfbaa/20231101.en/train-00017-of-00041.parquet) of [`wikimedia/wikipedia`](https://huggingface.co/datasets/wikimedia/wikipedia), shuffled with seed 0 and taken until they reach 1.1M words, joined by blank lines (7.0 MB, SHA-256 `c23440073f72900784a3f56a2318742ff055506b7a136f1e473edb4ef190d9e7`). The script rebuilds it byte for byte.
+*   **Texts:** each of the 64,738 non-empty lines (paragraphs and section headings, 17 words and 108 bytes on average) is one text. Every timed pass encodes all of them in a single `encode` call with the default `max_length` of 512.
+*   **Hardware:** Apple M3 Pro (12 cores), 18 GB RAM.
+*   **Software:** `model2vec-rs` 0.3.0 (release build, Rust 1.99.1); Python 3.14.3 with `model2vec` 0.10.0, `tokenizers` 0.23.3 and `numpy` 2.5.4.
+*   **Single thread:** `RAYON_NUM_THREADS=1` and `TOKENIZERS_PARALLELISM=false` for both; Python with `use_multiprocessing=False`.
+*   **All cores:** both with their defaults: Rust with Rayon parallelism; Python with tokenizer parallelism and `use_multiprocessing=True`, which spreads the texts over a process pool.
+*   **Method:** 5 alternating rounds of Rust and Python processes, 5 timed passes each after one warm-up pass; the table reports the median over the 25 passes.
+*   **Output:** the Rust and Python embeddings differ by at most 2.7e-7 per value (minimum cosine similarity 0.9999999).
+*   **Model load:** median time to load the model from the local Hugging Face cache; for Python this includes importing `model2vec`.
 
 ## Relation to Python `model2vec`
 
-*   **`model2vec-rs` (This Crate):** High-performance Rust engine for 1.7x faster **Model2Vec inference**.
+*   **`model2vec-rs` (This Crate):** High-performance Rust engine for up to 23x faster **Model2Vec inference**.
 *   **[`model2vec`](https://github.com/MinishLab/model2vec) (Python-based):** Handles model **distillation, training, fine-tuning**, and slower Python-based inference.
 
 ## License
