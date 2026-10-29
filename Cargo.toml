@@ -67,3 +67,7 @@ harness = false
 [[bench]]
 name = "nanobeir"
 harness = false
+
+[[bench]]
+name = "python_compare"
+harness = false

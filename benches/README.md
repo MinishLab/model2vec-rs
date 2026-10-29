@@ -8,6 +8,8 @@
 - `throughput.rs`: throughput of one (model, workload, mode) configuration.
   Uses only the public API, so it builds against any revision. Normally run
   through `scripts/bench_compare.py`, not directly.
+- `python_compare.rs`: Rust side of the comparison with Python model2vec
+  in the main README. Normally run through `scripts/python_compare.py`.
 
 ## Comparing two revisions
 
@@ -42,6 +44,21 @@ For trustworthy numbers:
    setting and isolates per-text cost from scheduling.
 4. Only claim a speedup for configurations marked `faster` whose output is
    `identical` (for changes that must not alter embeddings).
+
+## Comparing with Python model2vec
+
+```sh
+uv run scripts/python_compare.py
+```
+
+Reproduces the Performance table in the main README. The script rebuilds
+the pinned Wikipedia corpus under `target/python-compare/` (checked against
+a SHA-256 digest), uses each non-empty line as one text, and runs Rust and
+Python in alternating processes for `--threads 1,all`. Python uses its
+default process pool (`use_multiprocessing=True`) only for `all`; pass
+`--no-python-multiprocessing` to turn it off there too. It also reports how
+far the Rust embeddings are from the Python ones. Pass `--corpus` and
+`--model` to compare on other data or models.
 
 ## Int8 models
 
