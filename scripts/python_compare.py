@@ -15,13 +15,16 @@ The default corpus is the one used for the README numbers: 2,644 random
 articles from English Wikipedia (`wikimedia/wikipedia`, config `20231101.en`,
 shard 17, pinned revision), shuffled with seed 0 and taken until they reach
 1.1M words. It is downloaded once to `target/python-compare/wiki-en.txt` and
-checked against a SHA-256 digest.
+checked against a SHA-256 digest. `--words` takes a larger or smaller sample
+from the same shuffled shard; the default size and 11M words are checked against
+a digest.
 
 Usage (from the repository root):
 
     uv run scripts/python_compare.py
     uv run scripts/python_compare.py --threads 1 --rounds 3
     uv run scripts/python_compare.py --corpus my-texts.txt --model minishlab/potion-retrieval-32M
+    uv run scripts/python_compare.py --quantize int8
 
 `--threads 1` sets `RAYON_NUM_THREADS=1` and `TOKENIZERS_PARALLELISM=false`
 for both sides; `all` leaves both at their default parallelism. Python runs
@@ -29,6 +32,8 @@ with its default `use_multiprocessing=True` for `all`, which spreads large
 inputs over a process pool; `--no-python-multiprocessing` turns that off.
 Every other thread count runs Python with `use_multiprocessing=False`, since
 the process pool ignores the thread limit.
+`--quantize int8` quantizes the model to int8 at load time on both sides
+(`quantize_int8` in Rust, `quantize_to="int8"` in Python).
 The script also reports how far the Rust embeddings are from the Python ones.
 """
 
@@ -51,16 +56,20 @@ WIKI_REPO = "wikimedia/wikipedia"
 WIKI_REVISION = "b04c8d1ceb2f5cd4588862100d08de323dccfbaa"
 WIKI_SHARD = "20231101.en/train-00017-of-00041.parquet"
 WIKI_WORDS = 1_100_000
-WIKI_SHA256 = "c23440073f72900784a3f56a2318742ff055506b7a136f1e473edb4ef190d9e7"
+WIKI_SHA256 = {
+    1_100_000: "c23440073f72900784a3f56a2318742ff055506b7a136f1e473edb4ef190d9e7",
+    11_000_000: "b6535c025aca457f71ef010b7c4d06f54f564981cb6db5683437ccc8e1ae9710",
+}
 
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def ensure_corpus() -> Path:
-    path = WORK / "wiki-en.txt"
-    if path.exists() and sha256(path) == WIKI_SHA256:
+def ensure_corpus(words: int = WIKI_WORDS) -> Path:
+    digest = WIKI_SHA256.get(words)
+    path = WORK / ("wiki-en.txt" if words == WIKI_WORDS else f"wiki-en-{words}.txt")
+    if path.exists() and (digest is None or sha256(path) == digest):
         return path
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
@@ -69,16 +78,18 @@ def ensure_corpus() -> Path:
     shard = hf_hub_download(WIKI_REPO, WIKI_SHARD, repo_type="dataset", revision=WIKI_REVISION)
     articles = pq.read_table(shard, columns=["text"]).column("text").to_pylist()
     random.Random(0).shuffle(articles)
-    sample, words = [], 0
+    sample, total = [], 0
     for article in articles:
         sample.append(article)
-        words += len(article.split())
-        if words >= WIKI_WORDS:
+        total += len(article.split())
+        if total >= words:
             break
+    if total < words:
+        sys.exit(f"the shard has only {total} words, fewer than --words {words}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes("\n\n".join(sample).encode("utf-8"))
-    if sha256(path) != WIKI_SHA256:
-        sys.exit(f"corpus {path} does not match the expected SHA-256 {WIKI_SHA256}")
+    if digest is not None and sha256(path) != digest:
+        sys.exit(f"corpus {path} does not match the expected SHA-256 {digest}")
     return path
 
 
@@ -88,11 +99,11 @@ def read_texts(corpus: Path) -> list[str]:
     return [line.removesuffix("\r") for line in lines if line.strip()]
 
 
-def python_worker(corpus: Path, model_id: str, reps: int, multiprocessing: bool, out: Path | None) -> None:
+def python_worker(corpus: Path, model_id: str, reps: int, multiprocessing: bool, out: Path | None, quantize: str | None) -> None:
     start = time.perf_counter()
     from model2vec import StaticModel
 
-    model = StaticModel.from_pretrained(model_id)
+    model = StaticModel.from_pretrained(model_id, quantize_to=quantize)
     print(f"LOAD {time.perf_counter() - start:.6f}")
     texts = read_texts(corpus)
     print(f"TEXTS {len(texts)}")
@@ -174,9 +185,11 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default="minishlab/potion-base-8M")
     p.add_argument("--corpus", type=Path, help="text file, one text per line (default: the pinned Wikipedia sample)")
+    p.add_argument("--words", type=int, default=WIKI_WORDS, help="size of the Wikipedia sample in words (ignored with --corpus)")
     p.add_argument("--threads", default="1,all", help="comma-separated: 'all' and/or thread counts")
     p.add_argument("--rounds", type=int, default=5, help="alternating process launches per side")
     p.add_argument("--reps", type=int, default=5, help="timed passes per process launch")
+    p.add_argument("--quantize", choices=["int8"], help="quantize the model at load time on both sides")
     p.add_argument("--no-python-multiprocessing", action="store_true", help="use_multiprocessing=False in Python for 'all' too")
     p.add_argument("--python-multiprocessing", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--out", type=Path, help="write raw results as JSON (default: target/python-compare/results-*.json)")
@@ -185,14 +198,17 @@ def main() -> None:
     a = p.parse_args()
 
     if a.python_worker:
-        python_worker(a.corpus, a.model, a.reps, a.python_multiprocessing, a.embeddings)
+        python_worker(a.corpus, a.model, a.reps, a.python_multiprocessing, a.embeddings, a.quantize)
         return
 
-    corpus = a.corpus.resolve() if a.corpus else ensure_corpus()
+    corpus = a.corpus.resolve() if a.corpus else ensure_corpus(a.words)
     binary = build()
     WORK.mkdir(parents=True, exist_ok=True)
     rust_base = [str(binary), f"corpus={corpus}", f"model={a.model}"]
     python_base = [sys.executable, str(Path(__file__).resolve()), "--python-worker", "--corpus", str(corpus), "--model", a.model]
+    if a.quantize:
+        rust_base.append(f"quantize={a.quantize}")
+        python_base += ["--quantize", a.quantize]
     python_mp = not a.no_python_multiprocessing
     rust_cmd = [*rust_base, f"reps={a.reps}"]
 
@@ -217,7 +233,7 @@ def main() -> None:
                 res[side]["load"].append(load)
                 res[side]["seconds"].extend(samples)
 
-    print(f"\nmodel={a.model} corpus={corpus} texts={n} rounds={a.rounds} reps={a.reps}")
+    print(f"\nmodel={a.model} quantize={a.quantize} corpus={corpus} texts={n} rounds={a.rounds} reps={a.reps}")
     print(f"python use_multiprocessing={python_mp} for threads=all   elapsed {time.time() - started:.0f}s\n")
     header = f"{'threads':>7} {'Rust texts/s':>14} {'Python texts/s':>15} {'speedup':>8} {'Rust load':>10} {'Python load':>12}"
     print(header)
@@ -237,7 +253,7 @@ def main() -> None:
     print("Throughput is the median over all timed passes; Python load time includes importing model2vec.")
 
     out = a.out or WORK / f"results-{time.strftime('%Y%m%d-%H%M%S')}.json"
-    meta = {"model": a.model, "corpus": str(corpus), "texts": n, "rounds": a.rounds, "reps": a.reps, "python_multiprocessing_for_all": python_mp}
+    meta = {"model": a.model, "quantize": a.quantize, "corpus": str(corpus), "texts": n, "rounds": a.rounds, "reps": a.reps, "python_multiprocessing_for_all": python_mp}
     out.write_text(json.dumps({"meta": meta, "output": output, "results": results}, indent=2))
     print(f"raw results: {out}")
 

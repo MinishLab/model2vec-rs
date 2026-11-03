@@ -2,13 +2,13 @@
 // `scripts/python_compare.py`.
 //
 //   cargo bench --bench python_compare -- corpus=wiki-en.txt model=minishlab/potion-base-8M \
-//       reps=5 out=embeddings.f32
+//       reps=5 out=embeddings.f32 quantize=int8
 //
 // Every non-empty line of the corpus is one text, and each timed pass encodes
 // all of them with one `encode` call. Prints one `LOAD <seconds>` line, one
 // `TEXTS <n>` line and one `SAMPLE <seconds>` line per timed pass. With
 // `out=`, writes the embeddings of the warm-up pass as little-endian f32,
-// row-major.
+// row-major. With `quantize=int8`, quantizes the model to int8 after loading.
 
 use std::collections::HashMap;
 use std::env;
@@ -25,7 +25,7 @@ fn main() {
         .collect();
     let corpus = args
         .get("corpus")
-        .expect("usage: python_compare corpus=<file> [model=..] [reps=N] [out=<file>]");
+        .expect("usage: python_compare corpus=<file> [model=..] [reps=N] [out=<file>] [quantize=int8]");
     let model_id = args.get("model").map_or("minishlab/potion-base-8M", String::as_str);
     let reps: usize = args
         .get("reps")
@@ -40,8 +40,13 @@ fn main() {
     assert!(!texts.is_empty(), "corpus {corpus} has no non-empty lines");
 
     let start = Instant::now();
-    let model = StaticModel::from_pretrained(model_id, None, None, None)
+    let mut model = StaticModel::from_pretrained(model_id, None, None, None)
         .unwrap_or_else(|e| panic!("failed to load {model_id}: {e}"));
+    match args.get("quantize").map(String::as_str) {
+        None => {}
+        Some("int8") => model = model.quantize_int8(),
+        Some(other) => panic!("unsupported quantize={other}, expected int8"),
+    }
     println!("LOAD {:.6}", start.elapsed().as_secs_f64());
     println!("TEXTS {}", texts.len());
 
