@@ -1,7 +1,7 @@
 // Rust side of the comparison with Python model2vec, driven by
 // `scripts/python_compare.py`.
 //
-//   cargo bench --bench python_compare -- corpus=wiki-en.txt model=minishlab/potion-base-8M \
+//   cargo bench --bench python_compare -- corpus=wiki-en-11000000.txt model=minishlab/potion-base-8M \
 //       reps=5 out=embeddings.f32 quantize=int8
 //
 // Every non-empty line of the corpus is one text, and each timed pass encodes

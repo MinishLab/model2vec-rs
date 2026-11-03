@@ -11,13 +11,12 @@ Python (R P, P R, ...) so slow drift hits both sides equally. Every non-empty
 line of the corpus is one text; each timed pass encodes all of them in one
 `encode` call with the default `max_length` of 512.
 
-The default corpus is the one used for the README numbers: 2,644 random
+The default corpus is the one used for the README numbers: 28,721 random
 articles from English Wikipedia (`wikimedia/wikipedia`, config `20231101.en`,
 shard 17, pinned revision), shuffled with seed 0 and taken until they reach
-1.1M words. It is downloaded once to `target/python-compare/wiki-en.txt` and
-checked against a SHA-256 digest. `--words` takes a larger or smaller sample
-from the same shuffled shard; the default size and 11M words are checked against
-a digest.
+11M words. It is downloaded once to `target/python-compare/wiki-en-11000000.txt`
+and checked against a SHA-256 digest. `--words` takes a larger or smaller sample
+from the same shuffled shard; only the default size is checked against a digest.
 
 Usage (from the repository root):
 
@@ -55,9 +54,8 @@ WORK = REPO / "target" / "python-compare"
 WIKI_REPO = "wikimedia/wikipedia"
 WIKI_REVISION = "b04c8d1ceb2f5cd4588862100d08de323dccfbaa"
 WIKI_SHARD = "20231101.en/train-00017-of-00041.parquet"
-WIKI_WORDS = 1_100_000
+WIKI_WORDS = 11_000_000
 WIKI_SHA256 = {
-    1_100_000: "c23440073f72900784a3f56a2318742ff055506b7a136f1e473edb4ef190d9e7",
     11_000_000: "b6535c025aca457f71ef010b7c4d06f54f564981cb6db5683437ccc8e1ae9710",
 }
 
@@ -68,7 +66,7 @@ def sha256(path: Path) -> str:
 
 def ensure_corpus(words: int = WIKI_WORDS) -> Path:
     digest = WIKI_SHA256.get(words)
-    path = WORK / ("wiki-en.txt" if words == WIKI_WORDS else f"wiki-en-{words}.txt")
+    path = WORK / f"wiki-en-{words}.txt"
     if path.exists() and (digest is None or sha256(path) == digest):
         return path
     import pyarrow.parquet as pq

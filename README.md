@@ -209,17 +209,15 @@ A variety of pre-trained Model2Vec models are available on the [HuggingFace Hub 
 
 ## Performance
 
-We compared `model2vec-rs` with the Python version of Model2Vec by encoding the same texts with [`potion-base-8M`](https://huggingface.co/minishlab/potion-base-8M) in both.
+We compared `model2vec-rs` with the Python version of Model2Vec by encoding the same 666,808 texts with [`potion-base-8M`](https://huggingface.co/minishlab/potion-base-8M) in both.
 
 | Implementation | Single thread       | All cores             | Model load |
 | -------------- | ------------------- | --------------------- | ---------- |
-| **Rust**       | 671K texts/second   | 3.06M texts/second    | 15 ms      |
-| **Python**     | 40K texts/second    | 134K texts/second     | 312 ms     |
-| **Speedup**    | **16.6×**           | **22.9×**             | **~20×**   |
+| **Rust**       | 575K texts/second   | 2.60M texts/second    | 24 ms      |
+| **Python**     | 38K texts/second    | 110K texts/second     | 436 ms     |
+| **Speedup**    | **15.2×**           | **23.6×**             | **18.2×**  |
 
-On a single thread, the Rust version is roughly **17×** faster than the Python version, and about **23×** faster when using all cores.
-
-On a ten times larger sample of the same shard (666,808 texts, 11M words), the speedup holds for both float32 and int8 models:
+On a single thread, the Rust version is roughly **15×** faster than the Python version, and about **24×** faster when using all cores. With int8 models the speedup is larger:
 
 <div align="center">
   <img width="85%" alt="model2vec-rs speedup over Python model2vec" src="assets/images/speedup.png">
@@ -231,23 +229,24 @@ To reproduce these numbers, run this from the repository root (it needs Rust and
 uv run scripts/python_compare.py --no-python-multiprocessing
 ```
 
-The script downloads the corpus, builds [`benches/python_compare.rs`](benches/python_compare.rs), runs both implementations and prints the table above. For the chart, add `--words 11000000`, and `--quantize int8` for the int8 bars, then pass both results to [`scripts/speedup_chart.py`](scripts/speedup_chart.py). See [`scripts/python_compare.py`](scripts/python_compare.py) for the options.
+The script downloads the corpus, builds [`benches/python_compare.rs`](benches/python_compare.rs), runs both implementations and prints the table above. For the int8 bars of the chart, add `--quantize int8`, then pass both results to [`scripts/speedup_chart.py`](scripts/speedup_chart.py). See [`scripts/python_compare.py`](scripts/python_compare.py) for the options.
 
 Benchmark details:
 
-*   **Corpus:** 2,644 random articles from English Wikipedia: shard [`20231101.en/train-00017-of-00041.parquet`](https://huggingface.co/datasets/wikimedia/wikipedia/blob/b04c8d1ceb2f5cd4588862100d08de323dccfbaa/20231101.en/train-00017-of-00041.parquet) of [`wikimedia/wikipedia`](https://huggingface.co/datasets/wikimedia/wikipedia), shuffled with seed 0 and taken until they reach 1.1M words, joined by blank lines (7.0 MB, SHA-256 `c23440073f72900784a3f56a2318742ff055506b7a136f1e473edb4ef190d9e7`). The script rebuilds it byte for byte.
-*   **Texts:** each of the 64,738 non-empty lines (paragraphs and section headings, 17 words and 108 bytes on average) is one text. Every timed pass encodes all of them in a single `encode` call with the default `max_length` of 512.
+*   **Corpus:** 28,721 random articles from English Wikipedia: shard [`20231101.en/train-00017-of-00041.parquet`](https://huggingface.co/datasets/wikimedia/wikipedia/blob/b04c8d1ceb2f5cd4588862100d08de323dccfbaa/20231101.en/train-00017-of-00041.parquet) of [`wikimedia/wikipedia`](https://huggingface.co/datasets/wikimedia/wikipedia), shuffled with seed 0 and taken until they reach 11M words, joined by blank lines (70.0 MB, SHA-256 `b6535c025aca457f71ef010b7c4d06f54f564981cb6db5683437ccc8e1ae9710`).
+*   **Texts:** each of the 666,808 non-empty lines (paragraphs and section headings, 16.5 words and 104 bytes on average) is one text. Every timed pass encodes all of them in a single `encode` call with the default `max_length` of 512.
 *   **Hardware:** Apple M3 Pro (12 cores), 18 GB RAM.
-*   **Software:** `model2vec-rs` 0.3.0 (release build, Rust 1.99.1); Python 3.14.3 with `model2vec` 0.10.0, `tokenizers` 0.23.3 and `numpy` 2.5.4.
+*   **Software:** `model2vec-rs` 0.4.0 (release build, Rust 1.99.1); Python 3.14.3 with `model2vec` 0.10.0, `tokenizers` 0.23.3 and `numpy` 2.5.4.
 *   **Single thread:** `RAYON_NUM_THREADS=1` and `TOKENIZERS_PARALLELISM=false` for both; Python with `use_multiprocessing=False`.
-*   **All cores:** Rust with Rayon parallelism; Python with tokenizer parallelism and `use_multiprocessing=False`. Python's default `use_multiprocessing=True` spreads the texts over a process pool, which makes it slower on this corpus (about 39K texts/second).
-*   **Method:** 5 alternating rounds of Rust and Python processes, 5 timed passes each after one warm-up pass; the table reports the median over the 25 passes.
-*   **Output:** the Rust and Python embeddings differ by at most 2.7e-7 per value (minimum cosine similarity 0.9999999).
-*   **Model load:** median time to load the model from the local Hugging Face cache; for Python this includes importing `model2vec`.
+*   **All cores:** Rust with Rayon parallelism; Python with tokenizer parallelism and `use_multiprocessing=False`. Python's default `use_multiprocessing=True` spreads the texts over a process pool, which makes it slower.
+*   **Method:** 5 alternating rounds of Rust and Python processes, 5 timed passes each after one warm-up pass; throughput is the median over the 25 passes.
+*   **Model load:** median time over all 10 process launches per side to load the model from the local Hugging Face cache; for Python this includes importing `model2vec`.
+*   **Output:** for float32, the Rust and Python embeddings differ by at most 3.0e-7 per value (minimum cosine similarity 0.9999998).
+*   **int8:** the model is quantized at load time on both sides, with `quantize_int8` in Rust and `quantize_to="int8"` in Python. Rust keeps one scale per row and Python one scale for the whole table, so the int8 embeddings differ between the two (minimum cosine similarity 0.27); these bars compare speed only.
 
 ## Relation to Python `model2vec`
 
-*   **`model2vec-rs` (This Crate):** High-performance Rust engine for up to 23x faster **Model2Vec inference**.
+*   **`model2vec-rs` (This Crate):** High-performance Rust engine for up to 28x faster **Model2Vec inference**.
 *   **[`model2vec`](https://github.com/MinishLab/model2vec) (Python-based):** Handles model **distillation, training, fine-tuning**, and slower Python-based inference.
 
 ## License

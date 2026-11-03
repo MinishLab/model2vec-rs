@@ -11,8 +11,8 @@ median over every process launch of a run, across both thread settings.
 
 Usage (from the repository root):
 
-    uv run scripts/python_compare.py --words 11000000 --no-python-multiprocessing --out f32.json
-    uv run scripts/python_compare.py --words 11000000 --no-python-multiprocessing --quantize int8 --out int8.json
+    uv run scripts/python_compare.py --no-python-multiprocessing --out f32.json
+    uv run scripts/python_compare.py --no-python-multiprocessing --quantize int8 --out int8.json
     uv run scripts/speedup_chart.py f32.json int8.json
 """
 
