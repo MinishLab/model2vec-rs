@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "model2vec-rs-python"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "model2vec-rs",
  "ndarray",
