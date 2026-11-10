@@ -12,7 +12,7 @@ repository = "https://github.com/MinishLab/model2vec-rs"
 keywords = ["embeddings", "model2vec", "nlp", "rust"]
 categories = ["science", "text-processing"]
 
-exclude = ["tests/*", "assets/*", "local/*"]
+exclude = ["tests/*", "assets/*", "local/*", "python/*"]
 
 [features]
 default      = ["onig", "hf-hub"]
