@@ -1,13 +1,16 @@
+import os
 from collections.abc import Sequence
 from typing import overload
 
 import numpy as np
 import numpy.typing as npt
 
+__version__: str
+
 class StaticModel:
     @staticmethod
     def from_pretrained(
-        path: str,
+        path: str | os.PathLike[str],
         token: str | None = None,
         normalize: bool | None = None,
         subfolder: str | None = None,

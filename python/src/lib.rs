@@ -1,7 +1,8 @@
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use model2vec_rs::model::StaticModel as RustStaticModel;
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -26,7 +27,7 @@ impl StaticModel {
     /// Load a Model2Vec model from a local folder or the Hugging Face Hub.
     ///
     /// Args:
-    ///     path: Hugging Face repo id or path to a local model folder.
+    ///     path: Hugging Face repo id or path to a local model folder, as a string or path-like object.
     ///     token: Optional Hugging Face token for private models.
     ///     normalize: Override the normalization setting from the model config.
     ///     subfolder: Optional subfolder within the repo or folder.
@@ -34,7 +35,7 @@ impl StaticModel {
     #[pyo3(signature = (path, token=None, normalize=None, subfolder=None))]
     fn from_pretrained(
         py: Python<'_>,
-        path: &str,
+        path: PathBuf,
         token: Option<&str>,
         normalize: Option<bool>,
         subfolder: Option<&str>,
@@ -64,6 +65,11 @@ impl StaticModel {
             .map_err(|e| PyValueError::new_err(format!("failed to load tokenizer: {e}")))?;
         let embeddings = embeddings.as_array();
         let (rows, cols) = embeddings.dim();
+        let vocab_size = tokenizer
+            .get_vocab(true)
+            .values()
+            .max()
+            .map_or(0, |&id| id as usize + 1);
         let token_mapping = token_mapping
             .map(|mapping| {
                 mapping
@@ -78,6 +84,20 @@ impl StaticModel {
                     .collect::<PyResult<Vec<_>>>()
             })
             .transpose()?;
+        match &token_mapping {
+            Some(mapping) if mapping.len() < vocab_size => {
+                return Err(PyValueError::new_err(format!(
+                    "token_mapping has {} entries, but the tokenizer has {vocab_size} tokens",
+                    mapping.len()
+                )));
+            }
+            None if rows < vocab_size => {
+                return Err(PyValueError::new_err(format!(
+                    "embeddings has {rows} rows, but the tokenizer has {vocab_size} tokens"
+                )));
+            }
+            _ => {}
+        }
         let model = RustStaticModel::from_owned(
             tokenizer,
             embeddings.iter().copied().collect(),
@@ -115,17 +135,20 @@ impl StaticModel {
             Sentences::Single(sentence) => {
                 let embedding = py.detach(|| {
                     self.model
-                        .encode_with_args(&[sentence], max_length, batch_size)
-                        .pop()
-                        .unwrap_or_default()
+                        .encode_flat_with_args(std::slice::from_ref(&sentence), max_length)
                 });
-                Ok(Array1::from_vec(embedding).into_pyarray(py).into_any())
+                Ok(embedding.into_pyarray(py).into_any())
             }
             Sentences::Many(sentences) => {
-                let flat = py.detach(|| self.model.encode_with_args(&sentences, max_length, batch_size).concat());
-                let rows = flat.len() / dim;
-                let array =
-                    Array2::from_shape_vec((rows, dim), flat).map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let flat = py.detach(|| {
+                    let mut flat = Vec::with_capacity(sentences.len() * dim);
+                    for batch in sentences.chunks(batch_size) {
+                        flat.extend(self.model.encode_flat_with_args(batch, max_length));
+                    }
+                    flat
+                });
+                let array = Array2::from_shape_vec((sentences.len(), dim), flat)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
                 Ok(array.into_pyarray(py).into_any())
             }
         }
@@ -154,6 +177,7 @@ fn _disable_parallelism_after_fork() {
 #[pyo3(name = "model2vec_rs")]
 fn model2vec_rs_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StaticModel>()?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     let os = m.py().import("os")?;
     if os.hasattr("register_at_fork")? {
         let kwargs = PyDict::new(m.py());

@@ -1,4 +1,5 @@
 import json
+from importlib.metadata import version
 import multiprocessing
 import sys
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import model2vec_rs
 from model2vec_rs import StaticModel
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
@@ -19,6 +21,12 @@ def model() -> StaticModel:
 @pytest.fixture(scope="module")
 def quantized_model() -> StaticModel:
     return StaticModel.from_pretrained(str(FIXTURES / "test-model-vocab-quantized"))
+
+
+def tokenizers_vocab_size(tokenizer: str) -> int:
+    parsed = json.loads(tokenizer)
+    ids = list(parsed["model"]["vocab"].values()) + [token["id"] for token in parsed["added_tokens"]]
+    return max(ids) + 1
 
 
 def load_fixture(name: str) -> np.ndarray:
@@ -87,6 +95,35 @@ def test_normalize_override() -> None:
 
 def test_repr(model: StaticModel) -> None:
     assert repr(model).startswith("StaticModel(dim=")
+
+
+def test_from_pretrained_path(model: StaticModel) -> None:
+    from_path = StaticModel.from_pretrained(FIXTURES / "test-model-float32")
+    np.testing.assert_array_equal(from_path.encode(["hello world"]), model.encode(["hello world"]))
+
+
+def test_version() -> None:
+    assert model2vec_rs.__version__ == version("model2vec-rs")
+
+
+def test_from_arrays() -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text()
+    vocab_size = tokenizers_vocab_size(tokenizer)
+    embeddings = np.random.default_rng(0).random((vocab_size, 4), dtype=np.float32)
+    assert StaticModel.from_arrays(tokenizer, embeddings).encode(["hello world"]).shape == (1, 4)
+    mapping = np.arange(vocab_size, dtype=np.int64) % 10
+    model = StaticModel.from_arrays(tokenizer, embeddings[:10], token_mapping=mapping)
+    assert model.encode(["hello world"]).shape == (1, 4)
+
+
+def test_from_arrays_too_few_rows() -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text()
+    with pytest.raises(ValueError, match="rows"):
+        StaticModel.from_arrays(tokenizer, np.zeros((10, 4), dtype=np.float32))
+    with pytest.raises(ValueError, match="token_mapping"):
+        StaticModel.from_arrays(
+            tokenizer, np.zeros((10, 4), dtype=np.float32), token_mapping=np.zeros(5, dtype=np.int64)
+        )
 
 
 def test_missing_model() -> None:
