@@ -1,4 +1,6 @@
 import json
+import multiprocessing
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +59,25 @@ def test_encode_args(model: StaticModel) -> None:
         model.encode(texts, batch_size=0)
     with pytest.raises(TypeError):
         model.encode([1, 2])
+
+
+def encode_batch(model: StaticModel) -> None:
+    model.encode(["hello world"] * 1000)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fork is not available on Windows")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_encode_after_fork(model: StaticModel) -> None:
+    encode_batch(model)
+    process = multiprocessing.get_context("fork").Process(target=encode_batch, args=(model,))
+    process.start()
+    process.join(timeout=30)
+    if process.is_alive():
+        process.kill()
+        process.join()
+        pytest.fail("encode hung in a forked child")
+    assert process.exitcode == 0
+    encode_batch(model)
 
 
 def test_normalize_override() -> None:

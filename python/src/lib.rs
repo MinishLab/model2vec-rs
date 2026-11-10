@@ -5,7 +5,9 @@ use ndarray::{Array1, Array2};
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use tokenizers::Tokenizer;
+use tokenizers::utils::parallelism;
 
 #[derive(FromPyObject)]
 enum Sentences {
@@ -140,9 +142,23 @@ impl StaticModel {
     }
 }
 
+/// Disable parallel encoding in a forked child, whose copy of the thread pool has no threads.
+#[pyfunction]
+fn _disable_parallelism_after_fork() {
+    if parallelism::has_parallelism_been_used() {
+        parallelism::set_parallelism(false);
+    }
+}
+
 #[pymodule]
 #[pyo3(name = "model2vec_rs")]
 fn model2vec_rs_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StaticModel>()?;
+    let os = m.py().import("os")?;
+    if os.hasattr("register_at_fork")? {
+        let kwargs = PyDict::new(m.py());
+        kwargs.set_item("after_in_child", wrap_pyfunction!(_disable_parallelism_after_fork, m)?)?;
+        os.call_method("register_at_fork", (), Some(&kwargs))?;
+    }
     Ok(())
 }
