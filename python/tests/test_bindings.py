@@ -30,7 +30,7 @@ def tokenizers_vocab_size(tokenizer: str) -> int:
 
 
 def load_fixture(name: str) -> np.ndarray:
-    return np.asarray(json.loads((FIXTURES / name).read_text()), dtype=np.float32)
+    return np.asarray(json.loads((FIXTURES / name).read_text(encoding="utf-8")), dtype=np.float32)
 
 
 def test_encode_matches_python(model: StaticModel) -> None:
@@ -108,7 +108,7 @@ def test_version() -> None:
 
 
 def test_from_arrays() -> None:
-    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text()
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
     vocab_size = tokenizers_vocab_size(tokenizer)
     embeddings = np.random.default_rng(0).random((vocab_size, 4), dtype=np.float32)
     assert StaticModel.from_arrays(tokenizer, embeddings).encode(["hello world"]).shape == (1, 4)
@@ -118,13 +118,29 @@ def test_from_arrays() -> None:
 
 
 def test_from_arrays_too_few_rows() -> None:
-    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text()
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
     with pytest.raises(ValueError, match="rows"):
         StaticModel.from_arrays(tokenizer, np.zeros((10, 4), dtype=np.float32))
     with pytest.raises(ValueError, match="token_mapping"):
         StaticModel.from_arrays(
             tokenizer, np.zeros((10, 4), dtype=np.float32), token_mapping=np.zeros(5, dtype=np.int64)
         )
+
+
+def test_from_arrays_too_few_weights() -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
+    vocab_size = tokenizers_vocab_size(tokenizer)
+    embeddings = np.zeros((vocab_size, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="weights"):
+        StaticModel.from_arrays(tokenizer, embeddings, weights=np.ones(vocab_size - 1, dtype=np.float32))
+    with pytest.raises(ValueError, match="weights"):
+        StaticModel.from_arrays(
+            tokenizer,
+            embeddings[:10],
+            weights=np.ones(3, dtype=np.float32),
+            token_mapping=np.zeros(vocab_size, dtype=np.int64),
+        )
+    StaticModel.from_arrays(tokenizer, embeddings, weights=np.ones(vocab_size, dtype=np.float32))
 
 
 def test_missing_model() -> None:

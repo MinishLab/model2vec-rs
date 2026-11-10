@@ -98,6 +98,14 @@ impl StaticModel {
             }
             _ => {}
         }
+        if let Some(weights) = &weights
+            && weights.as_array().len() < vocab_size
+        {
+            return Err(PyValueError::new_err(format!(
+                "weights has {} entries, but the tokenizer has {vocab_size} tokens",
+                weights.as_array().len()
+            )));
+        }
         let model = RustStaticModel::from_owned(
             tokenizer,
             embeddings.iter().copied().collect(),
