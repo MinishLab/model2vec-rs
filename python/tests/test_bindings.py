@@ -62,6 +62,7 @@ def test_encode_shapes(model: StaticModel) -> None:
 def test_encode_args(model: StaticModel) -> None:
     texts = ["hello world"] * 5
     np.testing.assert_array_equal(model.encode(texts, batch_size=2), model.encode(texts))
+    np.testing.assert_array_equal(model.encode(texts, batch_size=None), model.encode(texts))
     assert model.encode(texts, max_length=None).shape == (5, model.dim)
     with pytest.raises(ValueError):
         model.encode(texts, batch_size=0)

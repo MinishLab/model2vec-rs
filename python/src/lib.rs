@@ -115,19 +115,19 @@ impl StaticModel {
     /// Args:
     ///     sentences: A single string or a sequence of strings.
     ///     max_length: Maximum number of tokens per sentence, or None for no limit.
-    ///     batch_size: Number of sentences tokenized at once.
+    ///     batch_size: Number of sentences encoded per parallel pass, or None to encode all at once.
     ///
     /// Returns:
     ///     A float32 array of shape (dim,) for a single string, or (n, dim) for a sequence.
-    #[pyo3(signature = (sentences, max_length=Some(512), batch_size=1024))]
+    #[pyo3(signature = (sentences, max_length=Some(512), batch_size=None))]
     fn encode<'py>(
         &self,
         py: Python<'py>,
         sentences: Sentences,
         max_length: Option<usize>,
-        batch_size: usize,
+        batch_size: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if batch_size == 0 {
+        if batch_size == Some(0) {
             return Err(PyValueError::new_err("batch_size must be greater than 0"));
         }
         let dim = self.model.dim();
@@ -140,12 +140,15 @@ impl StaticModel {
                 Ok(embedding.into_pyarray(py).into_any())
             }
             Sentences::Many(sentences) => {
-                let flat = py.detach(|| {
-                    let mut flat = Vec::with_capacity(sentences.len() * dim);
-                    for batch in sentences.chunks(batch_size) {
-                        flat.extend(self.model.encode_flat_with_args(batch, max_length));
+                let flat = py.detach(|| match batch_size {
+                    None => self.model.encode_flat_with_args(&sentences, max_length),
+                    Some(batch_size) => {
+                        let mut flat = Vec::with_capacity(sentences.len() * dim);
+                        for batch in sentences.chunks(batch_size) {
+                            flat.extend(self.model.encode_flat_with_args(batch, max_length));
+                        }
+                        flat
                     }
-                    flat
                 });
                 let array = Array2::from_shape_vec((sentences.len(), dim), flat)
                     .map_err(|e| PyValueError::new_err(e.to_string()))?;
