@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 model2vec-rs = { path = ".." }
-pyo3 = { version = "0.29", features = ["abi3-py39", "anyhow"] }
+pyo3 = { version = "0.29", features = ["abi3-py310", "anyhow"] }
 numpy = "0.29"
 ndarray = "0.15"
 tokenizers = { version = "0.21", default-features = false }
