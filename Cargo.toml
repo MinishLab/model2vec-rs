@@ -1,6 +1,6 @@
 [package]
 name = "model2vec-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Official Rust Implementation of Model2Vec"
@@ -32,14 +32,15 @@ wasm         = ["local-only",
 [dependencies]
 tokenizers = { version = "0.21", default-features = false }
 safetensors = "0.5"
-ndarray = "0.15"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
 ureq = { version = "2", optional = true }
 clap = { version = "4.0", features = ["derive"], optional = true }
 anyhow = "1.0"
-serde_json = "1.0"
-serde = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
+serde = { version = "1.0", features = ["derive"] }
 half = "2.0"
+unicode-normalization = "0.1"
+unicode_categories = "0.1"
 
 [dev-dependencies]
 approx = "0.5"
@@ -50,3 +51,23 @@ tempfile = "3"
 name = "model2vec-rs"
 path = "src/main.rs"
 required-features = ["cli"]
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "quantize"
+harness = false
+
+[[bench]]
+name = "nanobeir"
+harness = false
+
+[[bench]]
+name = "python_compare"
+harness = false

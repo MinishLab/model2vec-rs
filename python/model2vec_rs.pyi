@@ -3,7 +3,6 @@ from typing import overload
 
 import numpy as np
 import numpy.typing as npt
-import tokenizers
 
 class StaticModel:
     @staticmethod
@@ -27,15 +26,5 @@ class StaticModel:
     def encode(
         self, sentences: Sequence[str], max_length: int | None = 512, batch_size: int = 1024
     ) -> npt.NDArray[np.float32]: ...
-    @property
-    def embedding(self) -> npt.NDArray[np.float32]: ...
-    @property
-    def weights(self) -> npt.NDArray[np.float32] | None: ...
-    @property
-    def token_mapping(self) -> npt.NDArray[np.int64] | None: ...
-    @property
-    def tokenizer(self) -> tokenizers.Tokenizer: ...
-    @property
-    def normalize(self) -> bool: ...
     @property
     def dim(self) -> int: ...

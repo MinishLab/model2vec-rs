@@ -3,7 +3,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import tokenizers
 
 from model2vec_rs import StaticModel
 
@@ -60,53 +59,13 @@ def test_encode_args(model: StaticModel) -> None:
         model.encode([1, 2])
 
 
-def test_embedding(model: StaticModel) -> None:
-    embedding = model.embedding
-    assert embedding.dtype == np.float32
-    assert embedding.shape == (model.tokenizer.get_vocab_size(), model.dim)
-    assert not embedding.flags.writeable
-    with pytest.raises(ValueError):
-        embedding[0, 0] = 1.0
-    assert np.shares_memory(embedding, model.embedding)
-
-
-def test_embedding_outlives_model() -> None:
-    embedding = StaticModel.from_pretrained(str(FIXTURES / "test-model-float32")).embedding
-    expected = StaticModel.from_pretrained(str(FIXTURES / "test-model-float32")).embedding
-    np.testing.assert_array_equal(embedding, expected)
-
-
-def test_embedding_matches_encode(model: StaticModel) -> None:
-    token_id = model.tokenizer.token_to_id("hello")
-    expected = model.embedding[token_id]
-    if model.normalize:
-        expected = expected / np.linalg.norm(expected)
-    np.testing.assert_allclose(model.encode("hello"), expected, rtol=1e-5)
-
-
-def test_tokenizer(model: StaticModel) -> None:
-    tokenizer = model.tokenizer
-    assert isinstance(tokenizer, tokenizers.Tokenizer)
-    assert model.tokenizer is tokenizer
-    assert tokenizer.encode("hello world", add_special_tokens=False).ids
-
-
-def test_quantized_attributes(model: StaticModel, quantized_model: StaticModel) -> None:
-    assert model.token_mapping is None
-    mapping = quantized_model.token_mapping
-    assert mapping is not None
-    assert mapping.dtype == np.int64
-    assert mapping.max() < quantized_model.embedding.shape[0]
-
-
 def test_normalize_override() -> None:
     model = StaticModel.from_pretrained(str(FIXTURES / "test-model-float32"), normalize=True)
-    assert model.normalize
     np.testing.assert_allclose(np.linalg.norm(model.encode(["hello world", "foo"]), axis=1), 1.0, atol=1e-5)
 
 
 def test_repr(model: StaticModel) -> None:
-    assert repr(model).startswith("StaticModel(vocab_size=")
+    assert repr(model).startswith("StaticModel(dim=")
 
 
 def test_missing_model() -> None:

@@ -241,3 +241,14 @@ fn test_unigram_unknown_token_is_not_pooled() {
 
     assert_eq!(model.encode_single("axb"), model.encode_single("ab"));
 }
+
+#[test]
+fn test_zero_dim_model_is_rejected() {
+    use tokenizers::Tokenizer;
+
+    let tokenizer = Tokenizer::from_file("tests/fixtures/test-model-float32/tokenizer.json").unwrap();
+    let rows = tokenizer.get_vocab_size(true);
+    let result = StaticModel::from_owned(tokenizer, Vec::new(), rows, 0, true, None, None);
+    let msg = result.err().unwrap().to_string();
+    assert!(msg.contains("dimension"), "error should mention dimension: {msg}");
+}

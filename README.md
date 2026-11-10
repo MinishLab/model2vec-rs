@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     ];
 
     // Generate embeddings using default parameters
-    // (Default max_length: Some(512), Default batch_size: 1024)
+    // (Default max_length: Some(512), all sentences in one batch)
     let embeddings = model.encode(&sentences);
     // `embeddings` is a Vec<Vec<f32>>
     println!("Generated {} embeddings.", embeddings.len());
@@ -86,6 +86,15 @@ fn main() -> Result<()> {
         512,       // Custom batch size for processing
     );
     println!("Generated {} custom embeddings.", custom_embeddings.len());
+
+    // `encode_flat` returns one row-major `Vec<f32>` of
+    // `sentences.len() * model.dim()` values. Use it when you want contiguous
+    // output or only read the rows; prefer `encode` if you need an owned
+    // `Vec<f32>` per sentence.
+    let flat = model.encode_flat(&sentences);
+    for row in flat.chunks_exact(model.dim()) {
+        println!("First value: {}", row[0]);
+    }
 
     Ok(())
 }
@@ -107,6 +116,16 @@ let model = StaticModel::from_bytes(
 
 let embeddings = model.encode(&["Hello world".to_string()]);
 ```
+
+**Quantizing an f32 model to int8:**
+
+```rust
+use model2vec_rs::model::StaticModel;
+
+let model = StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?.quantize_int8();
+```
+
+`quantize_int8` stores the embeddings as int8 with one scale per row, using a quarter of the memory and encoding faster. Outputs stay very close to the f32 model (cosine similarity above 0.9998 on the potion models).
 
 See the [feature flags](#feature-flags) section for `wasm` and `local-only` build configurations.
 
@@ -143,8 +162,8 @@ The compiled binary installed via `cargo install` is significantly faster (often
 
 *   **Fast Inference:** Optimized Rust implementation for fast embedding generation.
 *   **Hugging Face Hub Integration:** Load pre-trained Model2Vec models directly from the Hugging Face Hub using model IDs, or use models from local paths.
-*   **Model Formats:** Supports models with f32, f16, and i8 weight types stored in `safetensors` files.
-*   **Flexible Loading:** Load models from the Hub (`from_pretrained`), raw bytes (`from_bytes`), or owned/borrowed data (`from_owned`, `from_borrowed`) for embedded and WASM use cases.
+*   **Model Formats:** Supports models with f32, f16, and i8 weight types stored in `safetensors` files. Int8 models (model2vec's `quantize_to="int8"`) stay int8 in memory, and f32 models can be quantized to int8 at load time with `quantize_int8`.
+*   **Flexible Loading:** Load models from the Hub (`from_pretrained`), raw bytes (`from_bytes`), or owned/borrowed data (`from_owned`, `from_borrowed`, and `from_owned_i8`, `from_borrowed_i8` for int8 embeddings) for embedded and WASM use cases.
 *   **Batch Processing:** Encodes multiple sentences in batches.
 *   **Configurable Encoding:** Allows customization of maximum sequence length and batch size during encoding.
 
@@ -190,18 +209,44 @@ A variety of pre-trained Model2Vec models are available on the [HuggingFace Hub 
 
 ## Performance
 
-We compared the performance of the Rust implementation with the Python version of Model2Vec. The benchmark was run single-threaded on a CPU.
+We compared `model2vec-rs` with the Python version of Model2Vec by encoding the same 666,808 texts with [`potion-base-8M`](https://huggingface.co/minishlab/potion-base-8M) in both.
 
-| Implementation | Throughput                                         |
-| -------------- | -------------------------------------------------- |
-| **Rust**       | 8000 samples/second |
-| **Python**     | 4650 samples/second |
+| Implementation | Single thread       | All cores             | Model load |
+| -------------- | ------------------- | --------------------- | ---------- |
+| **Rust**       | 575K texts/second   | 2.60M texts/second    | 24 ms      |
+| **Python**     | 38K texts/second    | 110K texts/second     | 436 ms     |
+| **Speedup**    | **15.2×**           | **23.6×**             | **18.2×**  |
 
-The Rust version is roughly **1.7×** faster than the Python version.
+On a single thread, the Rust version is roughly **15×** faster than the Python version, and about **24×** faster when using all cores. With int8 models the speedup is larger:
+
+<div align="center">
+  <img width="85%" alt="model2vec-rs speedup over Python model2vec" src="assets/images/speedup.png">
+</div>
+
+To reproduce these numbers, run this from the repository root (it needs Rust and [`uv`](https://docs.astral.sh/uv/)):
+
+```sh
+uv run scripts/python_compare.py --no-python-multiprocessing
+```
+
+The script downloads the corpus, builds [`benches/python_compare.rs`](benches/python_compare.rs), runs both implementations and prints the table above. For the int8 bars of the chart, add `--quantize int8`, then pass both results to [`scripts/speedup_chart.py`](scripts/speedup_chart.py). See [`scripts/python_compare.py`](scripts/python_compare.py) for the options.
+
+Benchmark details:
+
+*   **Corpus:** 28,721 random articles from English Wikipedia: shard [`20231101.en/train-00017-of-00041.parquet`](https://huggingface.co/datasets/wikimedia/wikipedia/blob/b04c8d1ceb2f5cd4588862100d08de323dccfbaa/20231101.en/train-00017-of-00041.parquet) of [`wikimedia/wikipedia`](https://huggingface.co/datasets/wikimedia/wikipedia), shuffled with seed 0 and taken until they reach 11M words, joined by blank lines (70.0 MB, SHA-256 `b6535c025aca457f71ef010b7c4d06f54f564981cb6db5683437ccc8e1ae9710`).
+*   **Texts:** each of the 666,808 non-empty lines (paragraphs and section headings, 16.5 words and 104 bytes on average) is one text. Every timed pass encodes all of them in a single `encode` call with the default `max_length` of 512.
+*   **Hardware:** Apple M3 Pro (12 cores), 18 GB RAM.
+*   **Software:** `model2vec-rs` 0.4.0 (release build, Rust 1.99.1); Python 3.14.3 with `model2vec` 0.10.0, `tokenizers` 0.23.3 and `numpy` 2.5.4.
+*   **Single thread:** `RAYON_NUM_THREADS=1` and `TOKENIZERS_PARALLELISM=false` for both; Python with `use_multiprocessing=False`.
+*   **All cores:** Rust with Rayon parallelism; Python with tokenizer parallelism and `use_multiprocessing=False`. Python's default `use_multiprocessing=True` spreads the texts over a process pool, which makes it slower.
+*   **Method:** 5 alternating rounds of Rust and Python processes, 5 timed passes each after one warm-up pass; throughput is the median over the 25 passes.
+*   **Model load:** median time over all 10 process launches per side to load the model from the local Hugging Face cache; for Python this includes importing `model2vec`.
+*   **Output:** for float32, the Rust and Python embeddings differ by at most 3.0e-7 per value (minimum cosine similarity 0.9999998).
+*   **int8:** the model is quantized at load time on both sides, with `quantize_int8` in Rust and `quantize_to="int8"` in Python. Rust keeps one scale per row and Python one scale for the whole table, so the int8 embeddings differ between the two (minimum cosine similarity 0.27); these bars compare speed only.
 
 ## Relation to Python `model2vec`
 
-*   **`model2vec-rs` (This Crate):** High-performance Rust engine for 1.7x faster **Model2Vec inference**.
+*   **`model2vec-rs` (This Crate):** High-performance Rust engine for up to 28x faster **Model2Vec inference**.
 *   **[`model2vec`](https://github.com/MinishLab/model2vec) (Python-based):** Handles model **distillation, training, fine-tuning**, and slower Python-based inference.
 
 ## License
