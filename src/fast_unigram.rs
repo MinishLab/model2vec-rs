@@ -22,13 +22,32 @@
 //! Tokenizers whose output this module would not reproduce (no `unk_id`)
 //! return `None` from
 //! [`FastUnigram::from_tokenizer`] so the caller falls back to the crate.
+//!
+//! The crate's Unigram model is only needed to build this one, and it is
+//! large: its trie keeps a hash map per node. [`FastUnigram::from_json`]
+//! builds the trie straight from `tokenizer.json` instead, for the common
+//! layout where every added token is one of the first pieces of the
+//! vocabulary, so the crate's model is never built.
 
+use crate::model::median_token_length;
 use crate::trie::{DoubleArrayTrie, NONE};
+use serde::Deserialize;
+use serde_json::value::RawValue;
+use std::collections::HashMap;
 use tokenizers::{Model, OffsetReferential, OffsetType, PreTokenizer, Tokenizer, models::ModelWrapper};
 
 /// `tokenizers`' `K_UNK_PENALTY`: an unknown character scores this much below
 /// the lowest-scoring piece.
 const UNK_PENALTY: f64 = 10.0;
+
+/// The most pieces the tokenizer returned by [`FastUnigram::from_json`] keeps.
+const MAX_KEPT_PIECES: usize = 4096;
+
+/// The part of an `added_tokens` entry that [`FastUnigram::from_json`] reads.
+#[derive(Deserialize)]
+struct AddedTokenJson {
+    content: String,
+}
 
 /// The best path ending at a byte position of a pre-token.
 #[derive(Clone, Copy)]
@@ -105,6 +124,99 @@ impl FastUnigram {
             byte_fallback: model.byte_fallback(),
             byte_ids,
         })
+    }
+
+    /// Build from `tokenizer.json` bytes without the crate's Unigram model, or
+    /// `None` when [`FastUnigram::from_tokenizer`] has to do it. Returns the
+    /// tokenizer to pass to `encode_ids`, the fast model and the median token
+    /// length of the vocabulary.
+    ///
+    /// `encode_ids` takes the added vocabulary, the normalizer and the
+    /// pre-tokenizer from its tokenizer, never the model. So the vocabulary
+    /// goes straight into the trie, and the returned tokenizer is built from
+    /// the same JSON with the vocabulary cut to its first pieces: enough for
+    /// every added token to get the ID it has in the full vocabulary. That
+    /// tokenizer is of no use for anything but `encode_ids`.
+    ///
+    /// Applies to a Unigram model with an `unk_id` when the unknown piece and
+    /// every added token are among the first `MAX_KEPT_PIECES` pieces.
+    pub(crate) fn from_json(bytes: &[u8]) -> Option<(Tokenizer, FastUnigram, usize)> {
+        // Fields stay unparsed until the model is known to be Unigram, so
+        // other tokenizers only pay for a scan, and of the model only the
+        // vocabulary is parsed.
+        let mut json: HashMap<&str, &RawValue> = serde_json::from_slice(bytes).ok()?;
+        let mut model: HashMap<&str, &RawValue> = serde_json::from_str(json.get("model")?.get()).ok()?;
+        if serde_json::from_str::<String>(model.get("type")?.get()).ok()? != "Unigram" {
+            return None;
+        }
+        // Without an `unk_id` the crate fails on an unknown character.
+        let unk_id: u32 = serde_json::from_str(model.get("unk_id")?.get()).ok()?;
+        let byte_fallback = match model.get("byte_fallback") {
+            Some(raw) => serde_json::from_str(raw.get()).ok()?,
+            None => false,
+        };
+        let pieces: Vec<(String, f64)> = serde_json::from_str(model.get("vocab")?.get()).ok()?;
+        let added_tokens: Vec<AddedTokenJson> = match json.get("added_tokens") {
+            Some(raw) => serde_json::from_str::<Option<_>>(raw.get()).ok()?.unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        // A piece listed twice resolves to its last ID, as in `from_tokenizer`.
+        let mut ids: HashMap<&str, u32> = HashMap::with_capacity(pieces.len());
+        for (id, (piece, _)) in pieces.iter().enumerate() {
+            ids.insert(piece.as_str(), u32::try_from(id).ok()?);
+        }
+
+        // The crate gives an added token that is in the vocabulary its
+        // vocabulary ID, and any other token the next ID past the vocabulary.
+        // With every added token in the kept pieces, the cut vocabulary
+        // resolves them all as the full one does.
+        let mut keep = unk_id as usize + 1;
+        for token in &added_tokens {
+            keep = keep.max(*ids.get(token.content.as_str())? as usize + 1);
+        }
+        if keep > MAX_KEPT_PIECES || keep > pieces.len() {
+            return None;
+        }
+
+        let scores: Vec<f64> = pieces.iter().map(|(_, score)| *score).collect();
+        let min_score = scores.iter().copied().fold(f64::INFINITY, f64::min);
+        let trie = DoubleArrayTrie::build(
+            pieces
+                .iter()
+                .map(|(piece, _)| (piece.as_bytes(), ids[piece.as_str()]))
+                .collect(),
+        );
+        let mut byte_ids = [NONE; 256];
+        for (byte, slot) in byte_ids.iter_mut().enumerate() {
+            if let Some(id) = ids.get(format!("<0x{byte:02X}>").as_str()) {
+                *slot = *id;
+            }
+        }
+        let median = median_token_length(ids.keys().copied());
+        drop(ids);
+
+        let kept_vocab = RawValue::from_string(serde_json::to_string(&pieces[..keep]).ok()?).ok()?;
+        drop(pieces);
+        model.insert("vocab", &kept_vocab);
+        let kept_model = RawValue::from_string(serde_json::to_string(&model).ok()?).ok()?;
+        json.insert("model", &kept_model);
+        let tokenizer = Tokenizer::from_bytes(serde_json::to_vec(&json).ok()?).ok()?;
+
+        let fast = FastUnigram {
+            trie,
+            scores,
+            unk_id,
+            unk_score: min_score - UNK_PENALTY,
+            byte_fallback,
+            byte_ids,
+        };
+        Some((tokenizer, fast, median))
+    }
+
+    /// ID of the unknown token.
+    pub(crate) fn unk_id(&self) -> u32 {
+        self.unk_id
     }
 
     /// Encode text into token IDs, matching `encode_batch_fast(...).get_ids()`
@@ -243,7 +355,7 @@ fn utf8_len(lead: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::str::FromStr;
 
     fn corpus() -> Vec<String> {
@@ -367,9 +479,52 @@ mod tests {
         }
     }
 
+    /// Checks `from_json` against the crate's tokenizer on `texts`, and
+    /// returns the tokenizer `from_json` kept.
+    fn assert_from_json_matches_crate(bytes: &[u8], texts: &[String]) -> Tokenizer {
+        let full = Tokenizer::from_bytes(bytes).expect("load tokenizer");
+        let unk_id = match full.get_model() {
+            ModelWrapper::Unigram(model) => serde_json::to_value(model).unwrap()["unk_id"].as_u64(),
+            _ => panic!("not a Unigram tokenizer"),
+        };
+        let (kept, fast, median) = FastUnigram::from_json(bytes).expect("from_json applies");
+        assert_eq!(Some(fast.unk_id() as u64), unk_id);
+        assert_eq!(
+            median,
+            median_token_length(full.get_vocab(false).keys().map(String::as_str))
+        );
+        for text in texts {
+            let want = full
+                .encode_fast(text.as_str(), false)
+                .expect("crate encode")
+                .get_ids()
+                .to_vec();
+            let got = fast.encode_ids(&kept, text).expect("fast encode");
+            assert_eq!(got, want, "token-id mismatch for {text:?}");
+        }
+        kept
+    }
+
     /// A small Unigram tokenizer over pieces cut from `texts`, with scores
     /// drawn from a handful of values so that tied paths are common.
     fn small_unigram(texts: &[String], byte_fallback: bool) -> Tokenizer {
+        Tokenizer::from_str(&small_unigram_json(texts, byte_fallback).to_string()).expect("build tokenizer")
+    }
+
+    /// `small_unigram_json` with only the added tokens that are pieces of the
+    /// vocabulary, which is the layout `from_json` applies to.
+    fn small_unigram_json_with_added_pieces(texts: &[String], byte_fallback: bool) -> Value {
+        let mut json = small_unigram_json(texts, byte_fallback);
+        json["added_tokens"].as_array_mut().unwrap().truncate(3);
+        json
+    }
+
+    fn added_piece(id: usize, content: &str) -> Value {
+        json!({"id": id, "content": content, "single_word": false, "lstrip": false,
+               "rstrip": false, "normalized": false, "special": true})
+    }
+
+    fn small_unigram_json(texts: &[String], byte_fallback: bool) -> Value {
         let mut vocab = vec![json!(["<unk>", 0.0]), json!(["<s>", 0.0]), json!(["</s>", 0.0])];
         let mut seen = std::collections::HashSet::new();
         let mut i = 0u64;
@@ -401,7 +556,7 @@ mod tests {
                    "rstrip": false, "normalized": normalized, "special": special})
         };
         let n = vocab.len();
-        let json = json!({
+        json!({
             "version": "1.0",
             "truncation": null,
             "padding": null,
@@ -417,8 +572,7 @@ mod tests {
             "post_processor": null,
             "decoder": null,
             "model": {"type": "Unigram", "unk_id": 0, "vocab": vocab, "byte_fallback": byte_fallback},
-        });
-        Tokenizer::from_str(&json.to_string()).expect("build tokenizer")
+        })
     }
 
     #[test]
@@ -439,6 +593,82 @@ mod tests {
         assert!(FastUnigram::from_tokenizer(&tok, None).is_none());
     }
 
+    #[test]
+    fn from_json_matches_crate() {
+        let texts = corpus();
+        for byte_fallback in [false, true] {
+            let json = small_unigram_json_with_added_pieces(&texts, byte_fallback);
+            let kept = assert_from_json_matches_crate(json.to_string().as_bytes(), &texts);
+            // Only the pieces that carry the added tokens' IDs.
+            assert_eq!(kept.get_vocab_size(false), 3);
+        }
+    }
+
+    #[test]
+    fn from_json_keeps_the_pieces_up_to_the_last_added_token() {
+        let texts = corpus();
+        let mut json = small_unigram_json_with_added_pieces(&texts, false);
+        // An added token that is a piece listed twice takes its last ID.
+        let vocab = json["model"]["vocab"].as_array_mut().unwrap();
+        let piece = vocab[5][0].as_str().unwrap().to_string();
+        vocab.insert(20, json!([piece, -0.5]));
+        assert_eq!(vocab.iter().rposition(|listed| listed[0] == piece.as_str()), Some(20));
+        json["added_tokens"]
+            .as_array_mut()
+            .unwrap()
+            .push(added_piece(20, &piece));
+        let kept = assert_from_json_matches_crate(json.to_string().as_bytes(), &texts);
+        assert_eq!(kept.get_vocab_size(false), 21);
+    }
+
+    #[test]
+    fn from_json_matches_crate_on_unigram_fixture() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-vocab-quantized/tokenizer.json"
+        );
+        let kept = assert_from_json_matches_crate(&std::fs::read(path).unwrap(), &corpus());
+        assert_eq!(kept.get_vocab_size(false), 2);
+    }
+
+    #[test]
+    fn from_json_falls_back_when_an_added_token_is_not_a_piece() {
+        // "hello world" and "and" get IDs past the vocabulary.
+        let json = small_unigram_json(&corpus(), false);
+        assert!(FastUnigram::from_json(json.to_string().as_bytes()).is_none());
+    }
+
+    #[test]
+    fn from_json_falls_back_when_an_added_token_is_a_late_piece() {
+        let mut json = small_unigram_json_with_added_pieces(&corpus(), false);
+        let vocab = json["model"]["vocab"].as_array_mut().unwrap();
+        while vocab.len() <= MAX_KEPT_PIECES {
+            vocab.push(json!([format!("piece{}", vocab.len()), -30.0]));
+        }
+        let late = format!("piece{MAX_KEPT_PIECES}");
+        json["added_tokens"]
+            .as_array_mut()
+            .unwrap()
+            .push(added_piece(MAX_KEPT_PIECES, &late));
+        assert!(FastUnigram::from_json(json.to_string().as_bytes()).is_none());
+    }
+
+    #[test]
+    fn from_json_falls_back_without_unk_id() {
+        let mut json = small_unigram_json_with_added_pieces(&corpus(), false);
+        json["model"]["unk_id"] = Value::Null;
+        assert!(FastUnigram::from_json(json.to_string().as_bytes()).is_none());
+    }
+
+    #[test]
+    fn from_json_falls_back_for_other_models() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        assert!(FastUnigram::from_json(&std::fs::read(path).unwrap()).is_none());
+    }
+
     /// The multilingual POTION tokenizer, when it is already in the local
     /// Hugging Face cache (the test does not download it).
     #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
@@ -452,7 +682,9 @@ mod tests {
             eprintln!("skipped: minishlab/potion-multilingual-128M is not in the local cache");
             return;
         };
-        let tok = Tokenizer::from_file(path).expect("load cached tokenizer");
+        let tok = Tokenizer::from_file(&path).expect("load cached tokenizer");
         assert_matches_crate(&tok, &corpus());
+        drop(tok);
+        assert_from_json_matches_crate(&std::fs::read(path).expect("read cached tokenizer"), &corpus());
     }
 }
