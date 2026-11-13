@@ -84,12 +84,20 @@ impl LoadedTokenizer {
     }
 
     /// Load from `tokenizer.json` bytes. WordPiece pipelines are read
-    /// directly from the JSON without building a [`Tokenizer`].
+    /// directly from the JSON without building a [`Tokenizer`], and Unigram
+    /// pipelines without building the crate's Unigram model.
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if let Some((ft, median_token_length)) = FastWordPiece::from_json(bytes) {
             return Ok(Self {
                 unk_token_id: ft.unk_id().map(|id| id as usize),
                 tokenization: Tokenization::WordPiece(ft),
+                median_token_length,
+            });
+        }
+        if let Some((tokenizer, fu, median_token_length)) = FastUnigram::from_json(bytes) {
+            return Ok(Self {
+                unk_token_id: Some(fu.unk_id() as usize),
+                tokenization: Tokenization::Unigram(tokenizer, fu),
                 median_token_length,
             });
         }
@@ -908,7 +916,7 @@ fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&s
 
 #[cfg(test)]
 mod tests {
-    use super::{Embeddings, StaticModel, Tokenization, decode_token_mapping};
+    use super::{Embeddings, LoadedTokenizer, StaticModel, Tokenization, decode_token_mapping};
     use safetensors::tensor::Dtype;
     use std::borrow::Cow;
     use tokenizers::{
@@ -956,6 +964,24 @@ mod tests {
         assert!(matches!(&inner.embeddings, Embeddings::I8(Cow::Owned(_))));
         assert_eq!(inner.row_scales.as_ref().map(Vec::len), Some(rows));
         assert_eq!(inner.weights.is_none(), inner.token_mapping.is_none());
+    }
+
+    #[test]
+    fn unigram_json_loads_without_the_crate_model() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-vocab-quantized/tokenizer.json"
+        );
+        let bytes = std::fs::read(path).unwrap();
+        let from_json = LoadedTokenizer::from_bytes(&bytes).unwrap();
+        let from_tokenizer = LoadedTokenizer::from_tokenizer(Tokenizer::from_bytes(&bytes).unwrap()).unwrap();
+        // `[PAD]` and `[UNK]`, the added tokens, are the first two pieces.
+        assert!(matches!(&from_json.tokenization, Tokenization::Unigram(kept, _) if kept.get_vocab_size(false) == 2));
+        assert!(
+            matches!(&from_tokenizer.tokenization, Tokenization::Unigram(kept, _) if kept.get_vocab_size(false) > 2)
+        );
+        assert_eq!(from_json.median_token_length, from_tokenizer.median_token_length);
+        assert_eq!(from_json.unk_token_id, from_tokenizer.unk_token_id);
     }
 
     #[test]
