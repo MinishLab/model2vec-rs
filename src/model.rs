@@ -49,8 +49,9 @@ struct StaticModelInner {
 enum Tokenization {
     /// Custom IDs-only WordPiece tokenizer, which needs no `Tokenizer`.
     WordPiece(FastWordPiece),
-    /// Custom IDs-only Unigram model on top of the crate's pre-processing.
-    Unigram(Tokenizer, FastUnigram),
+    /// Custom IDs-only Unigram model on top of the crate's pre-processing,
+    /// which needs no `Tokenizer` either.
+    Unigram(FastUnigram),
     /// Pipelines neither custom tokenizer reproduces.
     Crate(Tokenizer),
 }
@@ -72,7 +73,7 @@ impl LoadedTokenizer {
         let tokenization = if let Some(ft) = FastWordPiece::from_tokenizer(&tokenizer) {
             Tokenization::WordPiece(ft)
         } else if let Some(fu) = FastUnigram::from_tokenizer(&tokenizer, unk_token_id) {
-            Tokenization::Unigram(tokenizer, fu)
+            Tokenization::Unigram(fu)
         } else {
             Tokenization::Crate(tokenizer)
         };
@@ -83,13 +84,20 @@ impl LoadedTokenizer {
         })
     }
 
-    /// Load from `tokenizer.json` bytes. WordPiece pipelines are read
-    /// directly from the JSON without building a [`Tokenizer`].
+    /// Load from `tokenizer.json` bytes. WordPiece and Unigram pipelines are
+    /// read directly from the JSON without building a [`Tokenizer`].
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if let Some((ft, median_token_length)) = FastWordPiece::from_json(bytes) {
             return Ok(Self {
                 unk_token_id: ft.unk_id().map(|id| id as usize),
                 tokenization: Tokenization::WordPiece(ft),
+                median_token_length,
+            });
+        }
+        if let Some((fu, median_token_length)) = FastUnigram::from_json(bytes) {
+            return Ok(Self {
+                unk_token_id: Some(fu.unk_id() as usize),
+                tokenization: Tokenization::Unigram(fu),
                 median_token_length,
             });
         }
@@ -651,8 +659,8 @@ impl StaticModel {
                 ft.encode_ids_into(text, ids);
                 self.pool_ids(ids, max_length, out)
             }),
-            Tokenization::Unigram(tokenizer, fu) => {
-                let ids = fu.encode_ids(tokenizer, text).expect("tokenization failed");
+            Tokenization::Unigram(fu) => {
+                let ids = fu.encode_ids(text).expect("tokenization failed");
                 self.pool_ids(&ids, max_length, out)
             }
             Tokenization::Crate(tokenizer) => {
@@ -908,7 +916,7 @@ fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&s
 
 #[cfg(test)]
 mod tests {
-    use super::{Embeddings, StaticModel, Tokenization, decode_token_mapping};
+    use super::{Embeddings, LoadedTokenizer, StaticModel, Tokenization, decode_token_mapping};
     use safetensors::tensor::Dtype;
     use std::borrow::Cow;
     use tokenizers::{
@@ -956,6 +964,40 @@ mod tests {
         assert!(matches!(&inner.embeddings, Embeddings::I8(Cow::Owned(_))));
         assert_eq!(inner.row_scales.as_ref().map(Vec::len), Some(rows));
         assert_eq!(inner.weights.is_none(), inner.token_mapping.is_none());
+    }
+
+    #[test]
+    fn unigram_loads_alike_from_json_and_from_a_tokenizer() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-vocab-quantized/tokenizer.json"
+        );
+        let bytes = std::fs::read(path).unwrap();
+        let from_json = LoadedTokenizer::from_bytes(&bytes).unwrap();
+        let from_tokenizer = LoadedTokenizer::from_tokenizer(Tokenizer::from_bytes(&bytes).unwrap()).unwrap();
+        let (Tokenization::Unigram(a), Tokenization::Unigram(b)) =
+            (&from_json.tokenization, &from_tokenizer.tokenization)
+        else {
+            panic!("both loads should take the Unigram path");
+        };
+        let text = "[PAD]Both loads [UNK] tokenize alike.[UNK]";
+        assert_eq!(a.encode_ids(text).unwrap(), b.encode_ids(text).unwrap());
+        assert_eq!(from_json.median_token_length, from_tokenizer.median_token_length);
+        assert_eq!(from_json.unk_token_id, from_tokenizer.unk_token_id);
+    }
+
+    #[test]
+    fn unigram_with_an_unknown_key_fails_as_in_the_crate() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-vocab-quantized/tokenizer.json"
+        );
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        json["extra"] = 1.into();
+        let bytes = json.to_string().into_bytes();
+        let crate_error = Tokenizer::from_bytes(&bytes).unwrap_err();
+        let error = LoadedTokenizer::from_bytes(&bytes).unwrap_err();
+        assert_eq!(error.to_string(), format!("failed to load tokenizer: {crate_error}"));
     }
 
     #[test]
