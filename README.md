@@ -36,10 +36,11 @@
 
 ## Quickstart
 
-You can utilize `model2vec-rs` in two ways:
+You can utilize `model2vec-rs` in three ways:
 
 1.  **As a library** in your Rust projects 
 2.  **As a standalone Command-Line Interface (CLI) tool** for quick terminal-based inferencing
+3.  **From Python**, through the [Python bindings](python/README.md)
 
 ---
 
@@ -156,6 +157,19 @@ The compiled binary installed via `cargo install` is significantly faster (often
     echo -e "This is the first sentence.\nThis is another sentence." > my_texts.txt
     model2vec-rs encode my_texts.txt "minishlab/potion-base-8M" --output embeddings_output.json
     ```
+
+### 3. Using `model2vec-rs` from Python
+
+The [`python/`](python/README.md) directory contains Python bindings that expose the Rust encoder to Python as `model2vec_rs.StaticModel`:
+
+```python
+from model2vec_rs import StaticModel
+
+model = StaticModel.from_pretrained("minishlab/potion-base-8M")
+embeddings = model.encode(["Hello world", "Rust is awesome"])  # np.ndarray, shape (2, dim)
+```
+
+See the [bindings README](python/README.md) for installation, the API and benchmarks.
 
 
 ## Features

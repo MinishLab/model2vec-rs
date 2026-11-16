@@ -34,6 +34,12 @@ the process pool ignores the thread limit.
 `--quantize int8` quantizes the model to int8 at load time on both sides
 (`quantize_int8` in Rust, `quantize_to="int8"` in Python).
 The script also reports how far the Rust embeddings are from the Python ones.
+
+`--bindings` adds a third side: the `model2vec_rs` Python bindings from
+`python/`, called with their default `encode` arguments. Install them into the
+script's environment with `uv run --with ./python scripts/python_compare.py --bindings`.
+It cannot be combined with `--quantize`, which the bindings do not expose.
+`--rust-api flat` times `encode_flat` on the Rust side instead of `encode`.
 """
 
 from __future__ import annotations
@@ -115,6 +121,24 @@ def python_worker(corpus: Path, model_id: str, reps: int, multiprocessing: bool,
         print(f"SAMPLE {time.perf_counter() - start:.9f}")
 
 
+def bindings_worker(corpus: Path, model_id: str, reps: int, out: Path | None) -> None:
+    start = time.perf_counter()
+    from model2vec_rs import StaticModel
+
+    model = StaticModel.from_pretrained(model_id)
+    print(f"LOAD {time.perf_counter() - start:.6f}")
+    texts = read_texts(corpus)
+    print(f"TEXTS {len(texts)}")
+    warm = model.encode(texts)
+    if out:
+        warm.astype("<f4").tofile(out)
+    del warm
+    for _ in range(reps):
+        start = time.perf_counter()
+        model.encode(texts)
+        print(f"SAMPLE {time.perf_counter() - start:.9f}")
+
+
 def build() -> Path:
     print("building benches/python_compare.rs", file=sys.stderr)
     out = subprocess.run(
@@ -191,19 +215,29 @@ def main() -> None:
     p.add_argument("--no-python-multiprocessing", action="store_true", help="use_multiprocessing=False in Python for 'all' too")
     p.add_argument("--python-multiprocessing", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--out", type=Path, help="write raw results as JSON (default: target/python-compare/results-*.json)")
+    p.add_argument("--rust-api", choices=["encode", "flat"], default="encode", help="Rust method to time: encode or encode_flat")
+    p.add_argument("--bindings", action="store_true", help="also benchmark the model2vec_rs Python bindings")
     p.add_argument("--python-worker", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--bindings-worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--embeddings", type=Path, help=argparse.SUPPRESS)
     a = p.parse_args()
 
     if a.python_worker:
         python_worker(a.corpus, a.model, a.reps, a.python_multiprocessing, a.embeddings, a.quantize)
         return
+    if a.bindings_worker:
+        bindings_worker(a.corpus, a.model, a.reps, a.embeddings)
+        return
+    if a.bindings and a.quantize:
+        sys.exit("--bindings cannot be combined with --quantize")
 
     corpus = a.corpus.resolve() if a.corpus else ensure_corpus(a.words)
     binary = build()
     WORK.mkdir(parents=True, exist_ok=True)
     rust_base = [str(binary), f"corpus={corpus}", f"model={a.model}"]
     python_base = [sys.executable, str(Path(__file__).resolve()), "--python-worker", "--corpus", str(corpus), "--model", a.model]
+    if a.rust_api == "flat":
+        rust_base.append("api=flat")
     if a.quantize:
         rust_base.append(f"quantize={a.quantize}")
         python_base += ["--quantize", a.quantize]
@@ -214,44 +248,69 @@ def main() -> None:
         mp = ["--python-multiprocessing"] if python_mp and threads == "all" else []
         return [*python_base, *mp, "--reps", str(a.reps)]
 
-    rust_emb, python_emb = WORK / "rust.f32", WORK / "python.f32"
+    bindings_base = [sys.executable, str(Path(__file__).resolve()), "--bindings-worker", "--corpus", str(corpus), "--model", a.model]
+    sides = ["rust", "python", *(["bindings"] if a.bindings else [])]
+
+    def side_cmd(side: str, threads: str) -> list[str]:
+        if side == "rust":
+            return rust_cmd
+        if side == "python":
+            return python_cmd(threads)
+        return [*bindings_base, "--reps", str(a.reps)]
+
+    rust_emb, python_emb, bindings_emb = WORK / "rust.f32", WORK / "python.f32", WORK / "bindings.f32"
     _, n, _ = run_side([*rust_base, "reps=0", f"out={rust_emb}"], "all")
     run_side([*python_base, "--reps", "0", "--embeddings", str(python_emb)], "all")
     output = compare_embeddings(rust_emb, python_emb, n)
+    if a.bindings:
+        run_side([*bindings_base, "--reps", "0", "--embeddings", str(bindings_emb)], "all")
+        output["bindings_vs_rust"] = compare_embeddings(bindings_emb, rust_emb, n)
 
     results = {}
     started = time.time()
     for threads in a.threads.split(","):
-        res = results[threads] = {"rust": {"load": [], "seconds": []}, "python": {"load": [], "seconds": []}}
+        res = results[threads] = {side: {"load": [], "seconds": []} for side in sides}
         for r in range(a.rounds):
             print(f"threads={threads} round {r + 1}/{a.rounds}", file=sys.stderr)
-            order = ("rust", "python") if r % 2 == 0 else ("python", "rust")
+            shift = r % len(sides)
+            order = sides[shift:] + sides[:shift]
+            if r // len(sides) % 2:
+                order.reverse()
             for side in order:
-                load, _, samples = run_side(rust_cmd if side == "rust" else python_cmd(threads), threads)
+                load, _, samples = run_side(side_cmd(side, threads), threads)
                 res[side]["load"].append(load)
                 res[side]["seconds"].extend(samples)
 
-    print(f"\nmodel={a.model} quantize={a.quantize} corpus={corpus} texts={n} rounds={a.rounds} reps={a.reps}")
+    print(f"\nmodel={a.model} quantize={a.quantize} rust_api={a.rust_api} corpus={corpus} texts={n} rounds={a.rounds} reps={a.reps}")
     print(f"python use_multiprocessing={python_mp} for threads=all   elapsed {time.time() - started:.0f}s\n")
-    header = f"{'threads':>7} {'Rust texts/s':>14} {'Python texts/s':>15} {'speedup':>8} {'Rust load':>10} {'Python load':>12}"
+    names = {"rust": "Rust", "python": "Python", "bindings": "Bindings"}
+    header = f"{'threads':>7}" + "".join(f" {names[side] + ' texts/s':>16}" for side in sides) + f" {'Rust/Py':>8}"
+    if a.bindings:
+        header += f" {'Bind/Py':>8} {'Bind/Rust':>10}"
+    header += "".join(f" {names[side] + ' load':>14}" for side in sides)
     print(header)
     print("-" * len(header))
     for threads, res in results.items():
-        rate = {side: statistics.median(n / s for s in res[side]["seconds"]) for side in res}
-        load = {side: statistics.median(res[side]["load"]) for side in res}
+        rate = {side: statistics.median(n / s for s in res[side]["seconds"]) for side in sides}
+        load = {side: statistics.median(res[side]["load"]) for side in sides}
         res["median_texts_per_second"], res["median_load_seconds"] = rate, load
-        print(
-            f"{threads:>7} {fmt_rate(rate['rust']):>14} {fmt_rate(rate['python']):>15} "
-            f"{rate['rust'] / rate['python']:>7.1f}x {load['rust'] * 1e3:>8.0f}ms {load['python'] * 1e3:>10.0f}ms"
-        )
+        row = f"{threads:>7}" + "".join(f" {fmt_rate(rate[side]):>16}" for side in sides)
+        row += f" {rate['rust'] / rate['python']:>7.1f}x"
+        if a.bindings:
+            row += f" {rate['bindings'] / rate['python']:>7.1f}x {rate['bindings'] / rate['rust']:>9.2f}x"
+        row += "".join(f" {load[side] * 1e3:>12.0f}ms" for side in sides)
+        print(row)
     print(
         f"\nRust vs Python embeddings ({output['dim']} dims): max abs diff {output['max_abs_diff']:.2e}, "
         f"min cosine {output['min_cosine']:.7f}, {output['identical_rows']}/{n} rows bit-identical"
     )
-    print("Throughput is the median over all timed passes; Python load time includes importing model2vec.")
+    if a.bindings:
+        b = output["bindings_vs_rust"]
+        print(f"Bindings vs Rust embeddings: max abs diff {b['max_abs_diff']:.2e}, {b['identical_rows']}/{n} rows bit-identical")
+    print("Throughput is the median over all timed passes; Python and bindings load times include the import.")
 
     out = a.out or WORK / f"results-{time.strftime('%Y%m%d-%H%M%S')}.json"
-    meta = {"model": a.model, "quantize": a.quantize, "corpus": str(corpus), "texts": n, "rounds": a.rounds, "reps": a.reps, "python_multiprocessing_for_all": python_mp}
+    meta = {"model": a.model, "quantize": a.quantize, "corpus": str(corpus), "texts": n, "rounds": a.rounds, "reps": a.reps, "python_multiprocessing_for_all": python_mp, "bindings": a.bindings, "rust_api": a.rust_api}
     out.write_text(json.dumps({"meta": meta, "output": output, "results": results}, indent=2))
     print(f"raw results: {out}")
 

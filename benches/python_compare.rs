@@ -2,13 +2,14 @@
 // `scripts/python_compare.py`.
 //
 //   cargo bench --bench python_compare -- corpus=wiki-en-11000000.txt model=minishlab/potion-base-8M \
-//       reps=5 out=embeddings.f32 quantize=int8
+//       reps=5 out=embeddings.f32 quantize=int8 api=flat
 //
 // Every non-empty line of the corpus is one text, and each timed pass encodes
 // all of them with one `encode` call. Prints one `LOAD <seconds>` line, one
 // `TEXTS <n>` line and one `SAMPLE <seconds>` line per timed pass. With
 // `out=`, writes the embeddings of the warm-up pass as little-endian f32,
 // row-major. With `quantize=int8`, quantizes the model to int8 after loading.
+// With `api=flat`, encodes with `encode_flat` instead of `encode`.
 
 use std::collections::HashMap;
 use std::env;
@@ -25,7 +26,7 @@ fn main() {
         .collect();
     let corpus = args
         .get("corpus")
-        .expect("usage: python_compare corpus=<file> [model=..] [reps=N] [out=<file>] [quantize=int8]");
+        .expect("usage: python_compare corpus=<file> [model=..] [reps=N] [out=<file>] [quantize=int8] [api=flat]");
     let model_id = args.get("model").map_or("minishlab/potion-base-8M", String::as_str);
     let reps: usize = args
         .get("reps")
@@ -50,16 +51,30 @@ fn main() {
     println!("LOAD {:.6}", start.elapsed().as_secs_f64());
     println!("TEXTS {}", texts.len());
 
-    let warm = model.encode(&texts);
+    let flat = match args.get("api").map(String::as_str) {
+        None => false,
+        Some("flat") => true,
+        Some(other) => panic!("unsupported api={other}, expected flat"),
+    };
+
+    let warm = if flat {
+        model.encode_flat(&texts)
+    } else {
+        model.encode(&texts).concat()
+    };
     if let Some(out) = args.get("out") {
-        let bytes: Vec<u8> = warm.iter().flatten().flat_map(|x| x.to_le_bytes()).collect();
+        let bytes: Vec<u8> = warm.iter().flat_map(|x| x.to_le_bytes()).collect();
         fs::write(out, bytes).unwrap_or_else(|e| panic!("failed to write {out}: {e}"));
     }
     drop(warm);
 
     for _ in 0..reps {
         let start = Instant::now();
-        black_box(model.encode(&texts));
+        if flat {
+            black_box(model.encode_flat(&texts));
+        } else {
+            black_box(model.encode(&texts));
+        }
         println!("SAMPLE {:.9}", start.elapsed().as_secs_f64());
     }
 }
