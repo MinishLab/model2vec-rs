@@ -94,6 +94,19 @@ def test_normalize_override() -> None:
     np.testing.assert_allclose(np.linalg.norm(model.encode(["hello world", "foo"]), axis=1), 1.0, atol=1e-5)
 
 
+def test_encode_normalize() -> None:
+    texts = ["hello world", "foo", ""]
+    normalized = StaticModel.from_pretrained(str(FIXTURES / "test-model-float32"), normalize=True)
+    unnormalized = StaticModel.from_pretrained(str(FIXTURES / "test-model-float32"), normalize=False)
+    assert normalized.normalize is True
+    assert unnormalized.normalize is False
+    for model, other, flag in [(normalized, unnormalized, False), (unnormalized, normalized, True)]:
+        np.testing.assert_array_equal(model.encode(texts, normalize=None), model.encode(texts))
+        np.testing.assert_array_equal(model.encode(texts, normalize=flag), other.encode(texts))
+        np.testing.assert_array_equal(model.encode(texts, normalize=flag, batch_size=2), other.encode(texts))
+        np.testing.assert_array_equal(model.encode("hello world", normalize=flag), other.encode("hello world"))
+
+
 def test_repr(model: StaticModel) -> None:
     assert repr(model).startswith("StaticModel(dim=")
 
@@ -115,6 +128,31 @@ def test_from_arrays() -> None:
     mapping = np.arange(vocab_size, dtype=np.int64) % 10
     model = StaticModel.from_arrays(tokenizer, embeddings[:10], token_mapping=mapping)
     assert model.encode(["hello world"]).shape == (1, 4)
+
+
+@pytest.mark.parametrize("vocab_quantized", [False, True])
+@pytest.mark.parametrize("normalize", [False, True])
+def test_from_arrays_int8_matches_float32(vocab_quantized: bool, normalize: bool) -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
+    vocab_size = tokenizers_vocab_size(tokenizer)
+    rng = np.random.default_rng(0)
+    rows = 10 if vocab_quantized else vocab_size
+    embeddings = rng.integers(-128, 128, size=(rows, 4), dtype=np.int8)
+    weights = rng.random(vocab_size, dtype=np.float32)
+    mapping = np.arange(vocab_size, dtype=np.int64) % rows if vocab_quantized else None
+    texts = ["hello world", "foo bar baz", ""]
+    int8 = StaticModel.from_arrays(tokenizer, embeddings, normalize=normalize, weights=weights, token_mapping=mapping)
+    float32 = StaticModel.from_arrays(
+        tokenizer, embeddings.astype(np.float32), normalize=normalize, weights=weights, token_mapping=mapping
+    )
+    np.testing.assert_allclose(int8.encode(texts), float32.encode(texts), rtol=1e-6)
+
+
+def test_from_arrays_rejects_other_dtypes() -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
+    vocab_size = tokenizers_vocab_size(tokenizer)
+    with pytest.raises(TypeError):
+        StaticModel.from_arrays(tokenizer, np.zeros((vocab_size, 4), dtype=np.float64))
 
 
 def test_from_arrays_too_few_rows() -> None:

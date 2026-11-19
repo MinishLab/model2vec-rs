@@ -18,16 +18,28 @@ class StaticModel:
     @staticmethod
     def from_arrays(
         tokenizer: str,
-        embeddings: npt.NDArray[np.float32],
+        embeddings: npt.NDArray[np.float32] | npt.NDArray[np.int8],
         normalize: bool = False,
         weights: npt.NDArray[np.float32] | None = None,
         token_mapping: npt.NDArray[np.int64] | None = None,
     ) -> StaticModel: ...
     @overload
-    def encode(self, sentences: str, max_length: int | None = 512, batch_size: int | None = None) -> npt.NDArray[np.float32]: ...
+    def encode(
+        self,
+        sentences: str,
+        max_length: int | None = 512,
+        batch_size: int | None = None,
+        normalize: bool | None = None,
+    ) -> npt.NDArray[np.float32]: ...
     @overload
     def encode(
-        self, sentences: Sequence[str], max_length: int | None = 512, batch_size: int | None = None
+        self,
+        sentences: Sequence[str],
+        max_length: int | None = 512,
+        batch_size: int | None = None,
+        normalize: bool | None = None,
     ) -> npt.NDArray[np.float32]: ...
     @property
     def dim(self) -> int: ...
+    @property
+    def normalize(self) -> bool: ...

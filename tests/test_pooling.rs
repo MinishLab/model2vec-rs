@@ -245,7 +245,7 @@ fn check_all(tokenizer_path: &str, dims: &[usize]) {
                 assert_eq!(model.dim(), dim, "{} dim()", case.label());
                 for (max_length, ids) in MAX_LENGTHS.iter().zip(&ids) {
                     let want = case.reference(ids);
-                    let flat = model.encode_flat_with_args(&texts, *max_length);
+                    let flat = model.encode_flat_with_args(&texts, *max_length, None);
                     assert_eq!(
                         flat.len(),
                         texts.len() * dim,
@@ -256,7 +256,7 @@ fn check_all(tokenizer_path: &str, dims: &[usize]) {
                     let what = format!("encode_flat_with_args(max_length={max_length:?})");
                     assert_bit_identical(&case, &what, &rows, &want, &texts);
                     for batch_size in [1, 1024] {
-                        let got = model.encode_with_args(&texts, *max_length, batch_size);
+                        let got = model.encode_with_args(&texts, *max_length, batch_size, None);
                         let what = format!("encode_with_args(max_length={max_length:?}, batch_size={batch_size})");
                         assert_bit_identical(&case, &what, &got, &want, &texts);
                     }

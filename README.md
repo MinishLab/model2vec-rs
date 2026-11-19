@@ -85,6 +85,7 @@ fn main() -> Result<()> {
         &sentences,
         Some(256), // Optional: custom max token length for truncation
         512,       // Custom batch size for processing
+        None,      // Optional: override the model's normalization setting
     );
     println!("Generated {} custom embeddings.", custom_embeddings.len());
 
