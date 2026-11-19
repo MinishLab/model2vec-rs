@@ -14,6 +14,7 @@ class StaticModel:
         token: str | None = None,
         normalize: bool | None = None,
         subfolder: str | None = None,
+        max_length: int | None = ...,
     ) -> StaticModel: ...
     @staticmethod
     def from_arrays(
@@ -22,12 +23,13 @@ class StaticModel:
         normalize: bool = False,
         weights: npt.NDArray[np.float32] | None = None,
         token_mapping: npt.NDArray[np.int64] | None = None,
+        max_length: int | None = 512,
     ) -> StaticModel: ...
     @overload
     def encode(
         self,
         sentences: str,
-        max_length: int | None = 512,
+        max_length: int | None = ...,
         batch_size: int | None = None,
         normalize: bool | None = None,
     ) -> npt.NDArray[np.float32]: ...
@@ -35,7 +37,7 @@ class StaticModel:
     def encode(
         self,
         sentences: Sequence[str],
-        max_length: int | None = 512,
+        max_length: int | None = ...,
         batch_size: int | None = None,
         normalize: bool | None = None,
     ) -> npt.NDArray[np.float32]: ...
@@ -43,3 +45,5 @@ class StaticModel:
     def dim(self) -> int: ...
     @property
     def normalize(self) -> bool: ...
+    @property
+    def max_length(self) -> int | None: ...

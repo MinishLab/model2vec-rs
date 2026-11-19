@@ -21,9 +21,12 @@ embedding = model.encode("Hello world")                        # np.ndarray, sha
 
 model.dim  # int
 model.normalize  # bool, whether encode L2-normalizes by default
+model.max_length  # int | None, the default max tokens per sentence for encode
 ```
 
-`encode` accepts `max_length` (default `512`, `None` for no limit), `batch_size` (default `None`, which encodes all sentences in one parallel pass) and `normalize` (default `None`, which uses the model's setting), and releases the GIL while encoding.
+`encode` accepts `max_length` (default: the model's `max_length`, `None` for no limit), `batch_size` (default `None`, which encodes all sentences in one parallel pass) and `normalize` (default `None`, which uses the model's setting), and releases the GIL while encoding.
+
+As in `model2vec`, the model's `max_length` comes from its config (512 if unset, `null` for no limit). Override it with `StaticModel.from_pretrained(..., max_length=...)`; `from_arrays` defaults to 512.
 
 ## Performance
 

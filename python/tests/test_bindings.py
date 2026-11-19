@@ -1,6 +1,7 @@
 import json
 from importlib.metadata import version
 import multiprocessing
+import shutil
 import sys
 from pathlib import Path
 
@@ -105,6 +106,61 @@ def test_encode_normalize() -> None:
         np.testing.assert_array_equal(model.encode(texts, normalize=flag), other.encode(texts))
         np.testing.assert_array_equal(model.encode(texts, normalize=flag, batch_size=2), other.encode(texts))
         np.testing.assert_array_equal(model.encode("hello world", normalize=flag), other.encode("hello world"))
+
+
+LONG_TEXT = " ".join(["hello world"] * 400 + ["foo bar baz"])
+
+
+def model_with_config_max_length(tmp_path: Path, max_length: int | None) -> Path:
+    shutil.copytree(FIXTURES / "test-model-float32", tmp_path / "model")
+    config_path = tmp_path / "model" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["max_length"] = max_length
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    return tmp_path / "model"
+
+
+@pytest.mark.parametrize("config_max_length", [None, 7])
+def test_max_length_from_config(tmp_path: Path, config_max_length: int | None) -> None:
+    path = model_with_config_max_length(tmp_path, config_max_length)
+    model = StaticModel.from_pretrained(path)
+    assert model.max_length == config_max_length
+    texts = [LONG_TEXT, "hello world"]
+    np.testing.assert_array_equal(model.encode(texts), model.encode(texts, max_length=config_max_length))
+    np.testing.assert_array_equal(model.encode(LONG_TEXT), model.encode(LONG_TEXT, max_length=config_max_length))
+    other = 3 if config_max_length is None else None
+    assert not np.array_equal(model.encode(LONG_TEXT), model.encode(LONG_TEXT, max_length=other))
+
+
+def test_max_length_default(model: StaticModel) -> None:
+    assert model.max_length == 512
+    unlimited = model.encode(LONG_TEXT, max_length=None)
+    assert not np.array_equal(model.encode(LONG_TEXT), unlimited)
+    np.testing.assert_array_equal(model.encode(LONG_TEXT), model.encode(LONG_TEXT, max_length=512))
+
+
+@pytest.mark.parametrize("override", [None, 3, 600])
+def test_from_pretrained_max_length_override(tmp_path: Path, override: int | None) -> None:
+    path = model_with_config_max_length(tmp_path, 7)
+    model = StaticModel.from_pretrained(path, max_length=override)
+    assert model.max_length == override
+    np.testing.assert_array_equal(model.encode(LONG_TEXT), model.encode(LONG_TEXT, max_length=override))
+
+
+def test_from_arrays_max_length() -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
+    embeddings = np.random.default_rng(0).random((tokenizers_vocab_size(tokenizer), 4), dtype=np.float32)
+    assert StaticModel.from_arrays(tokenizer, embeddings).max_length == 512
+    for max_length in [None, 7]:
+        model = StaticModel.from_arrays(tokenizer, embeddings, max_length=max_length)
+        assert model.max_length == max_length
+        np.testing.assert_array_equal(model.encode(LONG_TEXT), model.encode(LONG_TEXT, max_length=max_length))
+
+
+def test_invalid_config_max_length(tmp_path: Path) -> None:
+    path = model_with_config_max_length(tmp_path, -1)
+    with pytest.raises(RuntimeError, match="max_length"):
+        StaticModel.from_pretrained(path)
 
 
 def test_repr(model: StaticModel) -> None:
