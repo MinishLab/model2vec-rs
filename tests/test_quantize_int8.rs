@@ -180,8 +180,8 @@ fn check(tokenizer_path: &str, dim: usize, combo: (bool, bool, bool)) {
         let label = format!("{} max_length={max_length:?}", case.label());
         assert_bit_identical(
             &label,
-            &quantized.encode_with_args(&texts, max_length, 1024),
-            &oracle.encode_with_args(&texts, max_length, 1024),
+            &quantized.encode_with_args(&texts, max_length, 1024, None),
+            &oracle.encode_with_args(&texts, max_length, 1024, None),
         );
     }
     let singles = |m: &StaticModel| texts.iter().map(|t| m.encode_single(t)).collect::<Vec<_>>();

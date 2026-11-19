@@ -200,8 +200,8 @@ fn check(tokenizer_path: &str, dim: usize, (weights, mapping, normalize): (bool,
         let label = format!("{} max_length={max_length:?}", case.label());
         assert_bit_identical(
             &label,
-            &int8.encode_with_args(&texts, max_length, 1024),
-            &f32_model.encode_with_args(&texts, max_length, 1024),
+            &int8.encode_with_args(&texts, max_length, 1024, None),
+            &f32_model.encode_with_args(&texts, max_length, 1024, None),
         );
     }
     let singles = |m: &StaticModel| texts.iter().map(|t| m.encode_single(t)).collect::<Vec<_>>();

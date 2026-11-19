@@ -16,6 +16,21 @@ enum Sentences {
     Many(Vec<String>),
 }
 
+#[derive(FromPyObject)]
+enum EmbeddingArray<'py> {
+    F32(PyReadonlyArray2<'py, f32>),
+    I8(PyReadonlyArray2<'py, i8>),
+}
+
+impl EmbeddingArray<'_> {
+    fn dim(&self) -> (usize, usize) {
+        match self {
+            Self::F32(array) => array.as_array().dim(),
+            Self::I8(array) => array.as_array().dim(),
+        }
+    }
+}
+
 /// Static embedding model for Model2Vec.
 #[pyclass(module = "model2vec_rs", name = "StaticModel", frozen)]
 struct StaticModel {
@@ -48,7 +63,7 @@ impl StaticModel {
     ///
     /// Args:
     ///     tokenizer: The tokenizer serialized as a JSON string.
-    ///     embeddings: A float32 array of shape (rows, dim).
+    ///     embeddings: A float32 or int8 array of shape (rows, dim).
     ///     normalize: Whether to L2-normalize output embeddings.
     ///     weights: Optional float32 per-token weights, indexed by token id.
     ///     token_mapping: Optional int64 mapping from token id to embedding row.
@@ -56,14 +71,13 @@ impl StaticModel {
     #[pyo3(signature = (tokenizer, embeddings, normalize=false, weights=None, token_mapping=None))]
     fn from_arrays(
         tokenizer: &str,
-        embeddings: PyReadonlyArray2<'_, f32>,
+        embeddings: EmbeddingArray<'_>,
         normalize: bool,
         weights: Option<PyReadonlyArray1<'_, f32>>,
         token_mapping: Option<PyReadonlyArray1<'_, i64>>,
     ) -> PyResult<Self> {
         let tokenizer = Tokenizer::from_str(tokenizer)
             .map_err(|e| PyValueError::new_err(format!("failed to load tokenizer: {e}")))?;
-        let embeddings = embeddings.as_array();
         let (rows, cols) = embeddings.dim();
         let vocab_size = tokenizer
             .get_vocab(true)
@@ -106,15 +120,27 @@ impl StaticModel {
                 weights.as_array().len()
             )));
         }
-        let model = RustStaticModel::from_owned(
-            tokenizer,
-            embeddings.iter().copied().collect(),
-            rows,
-            cols,
-            normalize,
-            weights.map(|w| w.as_array().to_vec()),
-            token_mapping,
-        )?;
+        let weights = weights.map(|w| w.as_array().to_vec());
+        let model = match embeddings {
+            EmbeddingArray::F32(array) => RustStaticModel::from_owned(
+                tokenizer,
+                array.as_array().iter().copied().collect(),
+                rows,
+                cols,
+                normalize,
+                weights,
+                token_mapping,
+            )?,
+            EmbeddingArray::I8(array) => RustStaticModel::from_owned_i8(
+                tokenizer,
+                array.as_array().iter().copied().collect(),
+                rows,
+                cols,
+                normalize,
+                weights,
+                token_mapping,
+            )?,
+        };
         Ok(Self { model })
     }
 
@@ -124,16 +150,18 @@ impl StaticModel {
     ///     sentences: A single string or a sequence of strings.
     ///     max_length: Maximum number of tokens per sentence, or None for no limit.
     ///     batch_size: Number of sentences encoded per parallel pass, or None to encode all at once.
+    ///     normalize: Whether to L2-normalize the embeddings, or None to use the model's setting.
     ///
     /// Returns:
     ///     A float32 array of shape (dim,) for a single string, or (n, dim) for a sequence.
-    #[pyo3(signature = (sentences, max_length=Some(512), batch_size=None))]
+    #[pyo3(signature = (sentences, max_length=Some(512), batch_size=None, normalize=None))]
     fn encode<'py>(
         &self,
         py: Python<'py>,
         sentences: Sentences,
         max_length: Option<usize>,
         batch_size: Option<usize>,
+        normalize: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if batch_size == Some(0) {
             return Err(PyValueError::new_err("batch_size must be greater than 0"));
@@ -143,17 +171,17 @@ impl StaticModel {
             Sentences::Single(sentence) => {
                 let embedding = py.detach(|| {
                     self.model
-                        .encode_flat_with_args(std::slice::from_ref(&sentence), max_length)
+                        .encode_flat_with_args(std::slice::from_ref(&sentence), max_length, normalize)
                 });
                 Ok(embedding.into_pyarray(py).into_any())
             }
             Sentences::Many(sentences) => {
                 let flat = py.detach(|| match batch_size {
-                    None => self.model.encode_flat_with_args(&sentences, max_length),
+                    None => self.model.encode_flat_with_args(&sentences, max_length, normalize),
                     Some(batch_size) => {
                         let mut flat = Vec::with_capacity(sentences.len() * dim);
                         for batch in sentences.chunks(batch_size) {
-                            flat.extend(self.model.encode_flat_with_args(batch, max_length));
+                            flat.extend(self.model.encode_flat_with_args(batch, max_length, normalize));
                         }
                         flat
                     }
@@ -169,6 +197,12 @@ impl StaticModel {
     #[getter]
     fn dim(&self) -> usize {
         self.model.dim()
+    }
+
+    /// Whether the model L2-normalizes its embeddings by default.
+    #[getter]
+    fn normalize(&self) -> bool {
+        self.model.normalize()
     }
 
     fn __repr__(&self) -> String {

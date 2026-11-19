@@ -144,6 +144,36 @@ fn test_normalization_flag_override() {
     );
 }
 
+/// A per-call `normalize` override matches a model loaded with that setting
+#[test]
+fn test_encode_normalize_override() {
+    let model_norm = StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, Some(true), None).unwrap();
+    let model_no_norm =
+        StaticModel::from_pretrained("tests/fixtures/test-model-float32", None, Some(false), None).unwrap();
+    let sentences = ["test sentence".to_string(), "hello world".to_string(), String::new()];
+
+    assert!(model_norm.normalize());
+    assert!(!model_no_norm.normalize());
+    for (model, other) in [(&model_norm, &model_no_norm), (&model_no_norm, &model_norm)] {
+        assert_eq!(
+            model.encode_flat_with_args(&sentences, Some(512), None),
+            model.encode_flat(&sentences)
+        );
+        assert_eq!(
+            model.encode_flat_with_args(&sentences, Some(512), Some(other.normalize())),
+            other.encode_flat(&sentences)
+        );
+        assert_eq!(
+            model.encode_with_args(&sentences, Some(512), 2, None),
+            model.encode(&sentences)
+        );
+        assert_eq!(
+            model.encode_with_args(&sentences, Some(512), 2, Some(other.normalize())),
+            other.encode(&sentences)
+        );
+    }
+}
+
 /// A path that matches no known layout returns a helpful error
 #[test]
 fn test_load_invalid_path_error() {

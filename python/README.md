@@ -20,9 +20,10 @@ embeddings = model.encode(["Hello world", "Rust is awesome"])  # np.ndarray, sha
 embedding = model.encode("Hello world")                        # np.ndarray, shape (dim,)
 
 model.dim  # int
+model.normalize  # bool, whether encode L2-normalizes by default
 ```
 
-`encode` accepts `max_length` (default `512`, `None` for no limit) and `batch_size` (default `None`, which encodes all sentences in one parallel pass), and releases the GIL while encoding.
+`encode` accepts `max_length` (default `512`, `None` for no limit), `batch_size` (default `None`, which encodes all sentences in one parallel pass) and `normalize` (default `None`, which uses the model's setting), and releases the GIL while encoding.
 
 ## Performance
 

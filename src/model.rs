@@ -579,17 +579,20 @@ impl StaticModel {
     /// * `sentences` - the list of sentences to encode.
     /// * `max_length` - max tokens per text.
     /// * `batch_size` - number of texts per batch.
+    /// * `normalize` - whether to L2-normalize the embeddings, or `None` to use the model's setting.
     pub fn encode_with_args(
         &self,
         sentences: &[String],
         max_length: Option<usize>,
         batch_size: usize,
+        normalize: Option<bool>,
     ) -> Vec<Vec<f32>> {
+        let normalize = normalize.unwrap_or(self.inner.normalize);
         let mut embeddings = Vec::with_capacity(sentences.len());
         for batch in sentences.chunks(batch_size) {
             let pooled: Vec<Vec<f32>> = batch
                 .maybe_par_iter()
-                .map(|text| self.encode_one(text, max_length))
+                .map(|text| self.encode_one(text, max_length, normalize))
                 .collect();
             embeddings.extend(pooled);
         }
@@ -598,7 +601,7 @@ impl StaticModel {
 
     /// Default encode: `max_length=512`, all sentences in one batch
     pub fn encode(&self, sentences: &[String]) -> Vec<Vec<f32>> {
-        self.encode_with_args(sentences, Some(512), sentences.len().max(1))
+        self.encode_with_args(sentences, Some(512), sentences.len().max(1), None)
     }
 
     /// Embedding dimension of the vectors this model produces.
@@ -611,36 +614,48 @@ impl StaticModel {
     /// # Arguments
     /// * `sentences` - the list of sentences to encode.
     /// * `max_length` - max tokens per text.
-    pub fn encode_flat_with_args(&self, sentences: &[String], max_length: Option<usize>) -> Vec<f32> {
+    /// * `normalize` - whether to L2-normalize the embeddings, or `None` to use the model's setting.
+    pub fn encode_flat_with_args(
+        &self,
+        sentences: &[String],
+        max_length: Option<usize>,
+        normalize: Option<bool>,
+    ) -> Vec<f32> {
         let dim = self.inner.dim;
+        let normalize = normalize.unwrap_or(self.inner.normalize);
         let mut out = vec![0.0_f32; sentences.len() * dim];
         let mut jobs: Vec<(&str, &mut [f32])> = sentences.iter().map(String::as_str).zip(out.chunks_mut(dim)).collect();
         jobs.maybe_par_iter_mut()
-            .for_each(|(text, row)| self.encode_into(text, max_length, row));
+            .for_each(|(text, row)| self.encode_into(text, max_length, normalize, row));
         out
+    }
+
+    /// Whether the model L2-normalizes its embeddings by default.
+    pub fn normalize(&self) -> bool {
+        self.inner.normalize
     }
 
     /// Default flat encode: `max_length=512`
     pub fn encode_flat(&self, sentences: &[String]) -> Vec<f32> {
-        self.encode_flat_with_args(sentences, Some(512))
+        self.encode_flat_with_args(sentences, Some(512), None)
     }
 
     /// Encode a single sentence into a vector.
     pub fn encode_single(&self, sentence: &str) -> Vec<f32> {
-        self.encode_one(sentence, Some(512))
+        self.encode_one(sentence, Some(512), self.inner.normalize)
     }
 
     /// Truncate, tokenize and pool one text.
     /// Uses the custom WordPiece tokenizer or Unigram model when the model
     /// matches that pipeline; other pipelines use the `tokenizers` crate.
-    fn encode_one(&self, text: &str, max_length: Option<usize>) -> Vec<f32> {
+    fn encode_one(&self, text: &str, max_length: Option<usize>, normalize: bool) -> Vec<f32> {
         let mut out = vec![0.0_f32; self.inner.dim];
-        self.encode_into(text, max_length, &mut out);
+        self.encode_into(text, max_length, normalize, &mut out);
         out
     }
 
     /// Truncate, tokenize and pool one text into `out`, which must hold `dim` zeros.
-    fn encode_into(&self, text: &str, max_length: Option<usize>, out: &mut [f32]) {
+    fn encode_into(&self, text: &str, max_length: Option<usize>, normalize: bool, out: &mut [f32]) {
         let model = &self.inner;
         let text = max_length.map_or(text, |max_tok| {
             Self::truncate_str(text, max_tok, model.tokenizer.median_token_length)
@@ -649,21 +664,21 @@ impl StaticModel {
             Tokenization::WordPiece(ft) => TOKEN_IDS.with_borrow_mut(|ids| {
                 ids.clear();
                 ft.encode_ids_into(text, ids);
-                self.pool_ids(ids, max_length, out)
+                self.pool_ids(ids, max_length, normalize, out)
             }),
             Tokenization::Unigram(tokenizer, fu) => {
                 let ids = fu.encode_ids(tokenizer, text).expect("tokenization failed");
-                self.pool_ids(&ids, max_length, out)
+                self.pool_ids(&ids, max_length, normalize, out)
             }
             Tokenization::Crate(tokenizer) => {
                 let encoding = tokenizer.encode_fast(text, false).expect("tokenization failed");
-                self.pool_ids(encoding.get_ids(), max_length, out)
+                self.pool_ids(encoding.get_ids(), max_length, normalize, out)
             }
         }
     }
 
     /// Mean-pool the first `max_length` token IDs, skipping the unk token.
-    fn pool_ids(&self, ids: &[u32], max_length: Option<usize>, sum: &mut [f32]) {
+    fn pool_ids(&self, ids: &[u32], max_length: Option<usize>, normalize: bool, sum: &mut [f32]) {
         let model = &self.inner;
         let ids = &ids[..max_length.map_or(ids.len(), |max_tok| max_tok.min(ids.len()))];
         let cnt = match &model.embeddings {
@@ -671,7 +686,7 @@ impl StaticModel {
             Embeddings::I8(table) => self.sum_rows(table, ids, sum),
         };
         let denom = cnt.max(1) as f32;
-        if model.normalize {
+        if normalize {
             let mut sq = 0.0_f32;
             for x in sum.iter_mut() {
                 *x /= denom;
