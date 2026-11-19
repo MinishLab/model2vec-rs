@@ -20,6 +20,9 @@ use tokenizers::{
 use crate::fast_unigram::FastUnigram;
 use crate::fast_wordpiece::FastWordPiece;
 
+/// Default `max_length` when a model config does not set one, as in model2vec.
+pub const DEFAULT_MAX_LENGTH: usize = 512;
+
 thread_local! {
     static TOKEN_IDS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
@@ -30,6 +33,7 @@ thread_local! {
 #[derive(Debug, Clone)]
 pub struct StaticModel {
     inner: Arc<StaticModelInner>,
+    max_length: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -298,10 +302,19 @@ impl StaticModel {
         config_bytes: &[u8],
         normalize: Option<bool>,
     ) -> Result<Self> {
-        // Read normalize default from config.json
         let cfg: Value = serde_json::from_slice(config_bytes).context("failed to parse config.json")?;
         let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
         let normalize = normalize.unwrap_or(cfg_norm);
+        let max_length = match cfg.get("max_length") {
+            None => Some(DEFAULT_MAX_LENGTH),
+            Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| anyhow!("invalid max_length in config.json: {value}"))?,
+            ),
+        };
 
         // Load the safetensors
         let safet = SafeTensors::deserialize(model_bytes).context("failed to parse safetensors")?;
@@ -353,6 +366,7 @@ impl StaticModel {
             weights.map(Cow::Owned),
             token_mapping.map(Cow::Owned),
         )
+        .map(|model| model.with_max_length(max_length))
     }
 
     /// Load a Model2Vec model from a local folder or the HuggingFace Hub.
@@ -527,6 +541,7 @@ impl StaticModel {
                 token_mapping,
                 normalize,
             }),
+            max_length: Some(DEFAULT_MAX_LENGTH),
         })
     }
 
@@ -563,7 +578,10 @@ impl StaticModel {
             }
         }
         inner.row_scales = Some(scales);
-        StaticModel { inner: Arc::new(inner) }
+        StaticModel {
+            inner: Arc::new(inner),
+            max_length: self.max_length,
+        }
     }
 
     /// Char-level truncation to max_tokens * median_token_length
@@ -599,9 +617,9 @@ impl StaticModel {
         embeddings
     }
 
-    /// Default encode: `max_length=512`, all sentences in one batch
+    /// Default encode: the model's `max_length`, all sentences in one batch
     pub fn encode(&self, sentences: &[String]) -> Vec<Vec<f32>> {
-        self.encode_with_args(sentences, Some(512), sentences.len().max(1), None)
+        self.encode_with_args(sentences, self.max_length, sentences.len().max(1), None)
     }
 
     /// Embedding dimension of the vectors this model produces.
@@ -635,14 +653,27 @@ impl StaticModel {
         self.inner.normalize
     }
 
-    /// Default flat encode: `max_length=512`
-    pub fn encode_flat(&self, sentences: &[String]) -> Vec<f32> {
-        self.encode_flat_with_args(sentences, Some(512), None)
+    /// Set the default max tokens per text used by `encode`, or `None` for no limit.
+    /// Models loaded from files use the config's `max_length` (512 if absent); models
+    /// built from arrays default to 512.
+    pub fn with_max_length(mut self, max_length: Option<usize>) -> Self {
+        self.max_length = max_length;
+        self
     }
 
-    /// Encode a single sentence into a vector.
+    /// The default max tokens per text used by `encode`, or `None` for no limit.
+    pub fn max_length(&self) -> Option<usize> {
+        self.max_length
+    }
+
+    /// Default flat encode: the model's `max_length`
+    pub fn encode_flat(&self, sentences: &[String]) -> Vec<f32> {
+        self.encode_flat_with_args(sentences, self.max_length, None)
+    }
+
+    /// Encode a single sentence into a vector, using the model's `max_length`.
     pub fn encode_single(&self, sentence: &str) -> Vec<f32> {
-        self.encode_one(sentence, Some(512), self.inner.normalize)
+        self.encode_one(sentence, self.max_length, self.inner.normalize)
     }
 
     /// Truncate, tokenize and pool one text.

@@ -75,7 +75,8 @@ fn main() -> Result<()> {
     ];
 
     // Generate embeddings using default parameters
-    // (Default max_length: Some(512), all sentences in one batch)
+    // (Default max_length: the config's `max_length` (512 if unset), all sentences in one batch;
+    // change it with `model.with_max_length(...)`)
     let embeddings = model.encode(&sentences);
     // `embeddings` is a Vec<Vec<f32>>
     println!("Generated {} embeddings.", embeddings.len());
@@ -178,7 +179,7 @@ See the [bindings README](python/README.md) for installation, the API and benchm
 *   **Fast Inference:** Optimized Rust implementation for fast embedding generation.
 *   **Hugging Face Hub Integration:** Load pre-trained Model2Vec models directly from the Hugging Face Hub using model IDs, or use models from local paths.
 *   **Model Formats:** Supports models with f32, f16, and i8 weight types stored in `safetensors` files. Int8 models (model2vec's `quantize_to="int8"`) stay int8 in memory, and f32 models can be quantized to int8 at load time with `quantize_int8`.
-*   **Flexible Loading:** Load models from the Hub (`from_pretrained`), raw bytes (`from_bytes`), or owned/borrowed data (`from_owned`, `from_borrowed`, and `from_owned_i8`, `from_borrowed_i8` for int8 embeddings) for embedded and WASM use cases.
+*   **Flexible Loading:** Load models from the Hub (`from_pretrained`), raw bytes (`from_bytes`), or owned/borrowed data (`from_owned`, `from_borrowed`, and `from_owned_i8`, `from_borrowed_i8` for int8 embeddings) for embedded and WASM use cases. Models built from owned/borrowed data truncate at 512 tokens by default; change this with `with_max_length`.
 *   **Batch Processing:** Encodes multiple sentences in batches.
 *   **Configurable Encoding:** Allows customization of maximum sequence length and batch size during encoding.
 

@@ -174,6 +174,90 @@ fn test_encode_normalize_override() {
     }
 }
 
+fn load_with_config(config: &str) -> anyhow::Result<StaticModel> {
+    let path = "tests/fixtures/test-model-float32";
+    StaticModel::from_bytes(
+        fs::read(format!("{path}/tokenizer.json")).unwrap(),
+        fs::read(format!("{path}/model.safetensors")).unwrap(),
+        config,
+        None,
+    )
+}
+
+/// `max_length` is read from the config, defaults to 512, and can be overridden
+#[test]
+fn test_max_length_from_config() {
+    let cases = [
+        (r#"{"normalize": true}"#, None, Some(512)),
+        (r#"{"normalize": true, "max_length": null}"#, None, None),
+        (r#"{"normalize": true, "max_length": 7}"#, None, Some(7)),
+        (r#"{"normalize": true, "max_length": 7}"#, Some(Some(3)), Some(3)),
+        (r#"{"normalize": true, "max_length": 7}"#, Some(None), None),
+        (r#"{"normalize": true, "max_length": null}"#, Some(Some(3)), Some(3)),
+    ];
+    let sentences = [vec!["hello"; 1000].join(" "), "hello world".to_string(), String::new()];
+    for (config, override_, want) in cases {
+        let model = load_with_config(config).unwrap();
+        let model = match override_ {
+            Some(max_length) => model.with_max_length(max_length),
+            None => model,
+        };
+        assert_eq!(model.max_length(), want, "{config} with {override_:?}");
+        assert_eq!(
+            model.encode(&sentences),
+            model.encode_with_args(&sentences, want, 3, None)
+        );
+        assert_eq!(
+            model.encode_flat(&sentences),
+            model.encode_flat_with_args(&sentences, want, None)
+        );
+        assert_eq!(
+            model.encode_single(&sentences[0]),
+            model.encode_flat_with_args(&sentences[..1], want, None)
+        );
+        assert_eq!(model.clone().quantize_int8().max_length(), want);
+    }
+    let truncated = load_with_config(r#"{"max_length": 7}"#).unwrap();
+    let unlimited = load_with_config(r#"{"max_length": null}"#).unwrap();
+    let long = vec!["hello world"; 400].join(" ") + " foo bar baz";
+    assert_ne!(truncated.encode_single(&long), unlimited.encode_single(&long));
+}
+
+#[test]
+fn test_invalid_max_length_in_config_is_rejected() {
+    for config in [
+        r#"{"max_length": -1}"#,
+        r#"{"max_length": "512"}"#,
+        r#"{"max_length": 1.5}"#,
+    ] {
+        let err = load_with_config(config).unwrap_err();
+        assert!(err.to_string().contains("max_length"), "{config}: {err}");
+    }
+}
+
+/// Models built from arrays default to 512 tokens, and `with_max_length` changes the default
+#[test]
+fn test_with_max_length() {
+    use tokenizers::Tokenizer;
+
+    let tokenizer = Tokenizer::from_file("tests/fixtures/test-model-float32/tokenizer.json").unwrap();
+    let rows = tokenizer.get_vocab_size(true);
+    let embeddings: Vec<f32> = (0..rows * 2).map(|i| (i % 97) as f32).collect();
+    let model = StaticModel::from_owned(tokenizer, embeddings, rows, 2, false, None, None).unwrap();
+    assert_eq!(model.max_length(), Some(512));
+    let long = vec!["hello world"; 400].join(" ") + " foo bar baz";
+    for max_length in [None, Some(7)] {
+        let configured = model.clone().with_max_length(max_length);
+        assert_eq!(configured.max_length(), max_length);
+        assert_eq!(configured.clone().max_length(), max_length);
+        assert_eq!(
+            configured.encode_single(&long),
+            model.encode_flat_with_args(std::slice::from_ref(&long), max_length, None)
+        );
+    }
+    assert_eq!(model.max_length(), Some(512));
+}
+
 /// A path that matches no known layout returns a helpful error
 #[test]
 fn test_load_invalid_path_error() {

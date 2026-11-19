@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use model2vec_rs::model::StaticModel as RustStaticModel;
+use model2vec_rs::model::{DEFAULT_MAX_LENGTH, StaticModel as RustStaticModel};
 use ndarray::Array2;
 use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -31,6 +31,28 @@ impl EmbeddingArray<'_> {
     }
 }
 
+enum MaxLength {
+    Unset,
+    Set(Option<usize>),
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for MaxLength {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        Ok(Self::Set(obj.extract()?))
+    }
+}
+
+impl MaxLength {
+    fn or(self, default: Option<usize>) -> Option<usize> {
+        match self {
+            Self::Unset => default,
+            Self::Set(max_length) => max_length,
+        }
+    }
+}
+
 /// Static embedding model for Model2Vec.
 #[pyclass(module = "model2vec_rs", name = "StaticModel", frozen)]
 struct StaticModel {
@@ -46,17 +68,23 @@ impl StaticModel {
     ///     token: Optional Hugging Face token for private models.
     ///     normalize: Override the normalization setting from the model config.
     ///     subfolder: Optional subfolder within the repo or folder.
+    ///     max_length: Override the default maximum number of tokens per sentence used by `encode`,
+    ///         or None for no limit. If not passed, the value from the model config is used (512 if unset).
     #[staticmethod]
-    #[pyo3(signature = (path, token=None, normalize=None, subfolder=None))]
+    #[pyo3(signature = (path, token=None, normalize=None, subfolder=None, max_length=MaxLength::Unset))]
     fn from_pretrained(
         py: Python<'_>,
         path: PathBuf,
         token: Option<&str>,
         normalize: Option<bool>,
         subfolder: Option<&str>,
+        max_length: MaxLength,
     ) -> PyResult<Self> {
         let model = py.detach(|| RustStaticModel::from_pretrained(path, token, normalize, subfolder))?;
-        Ok(Self { model })
+        let max_length = max_length.or(model.max_length());
+        Ok(Self {
+            model: model.with_max_length(max_length),
+        })
     }
 
     /// Build a model from in-memory data.
@@ -67,14 +95,16 @@ impl StaticModel {
     ///     normalize: Whether to L2-normalize output embeddings.
     ///     weights: Optional float32 per-token weights, indexed by token id.
     ///     token_mapping: Optional int64 mapping from token id to embedding row.
+    ///     max_length: The default maximum number of tokens per sentence used by `encode`, or None for no limit.
     #[staticmethod]
-    #[pyo3(signature = (tokenizer, embeddings, normalize=false, weights=None, token_mapping=None))]
+    #[pyo3(signature = (tokenizer, embeddings, normalize=false, weights=None, token_mapping=None, max_length=Some(DEFAULT_MAX_LENGTH)))]
     fn from_arrays(
         tokenizer: &str,
         embeddings: EmbeddingArray<'_>,
         normalize: bool,
         weights: Option<PyReadonlyArray1<'_, f32>>,
         token_mapping: Option<PyReadonlyArray1<'_, i64>>,
+        max_length: Option<usize>,
     ) -> PyResult<Self> {
         let tokenizer = Tokenizer::from_str(tokenizer)
             .map_err(|e| PyValueError::new_err(format!("failed to load tokenizer: {e}")))?;
@@ -141,28 +171,32 @@ impl StaticModel {
                 token_mapping,
             )?,
         };
-        Ok(Self { model })
+        Ok(Self {
+            model: model.with_max_length(max_length),
+        })
     }
 
     /// Encode one or more sentences into embeddings.
     ///
     /// Args:
     ///     sentences: A single string or a sequence of strings.
-    ///     max_length: Maximum number of tokens per sentence, or None for no limit.
+    ///     max_length: Maximum number of tokens per sentence, or None for no limit. If not passed, the
+    ///         model's `max_length` is used.
     ///     batch_size: Number of sentences encoded per parallel pass, or None to encode all at once.
     ///     normalize: Whether to L2-normalize the embeddings, or None to use the model's setting.
     ///
     /// Returns:
     ///     A float32 array of shape (dim,) for a single string, or (n, dim) for a sequence.
-    #[pyo3(signature = (sentences, max_length=Some(512), batch_size=None, normalize=None))]
+    #[pyo3(signature = (sentences, max_length=MaxLength::Unset, batch_size=None, normalize=None))]
     fn encode<'py>(
         &self,
         py: Python<'py>,
         sentences: Sentences,
-        max_length: Option<usize>,
+        max_length: MaxLength,
         batch_size: Option<usize>,
         normalize: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let max_length = max_length.or(self.model.max_length());
         if batch_size == Some(0) {
             return Err(PyValueError::new_err("batch_size must be greater than 0"));
         }
@@ -203,6 +237,12 @@ impl StaticModel {
     #[getter]
     fn normalize(&self) -> bool {
         self.model.normalize()
+    }
+
+    /// The default maximum number of tokens per sentence used by `encode`, or None for no limit.
+    #[getter]
+    fn max_length(&self) -> Option<usize> {
+        self.model.max_length()
     }
 
     fn __repr__(&self) -> String {
