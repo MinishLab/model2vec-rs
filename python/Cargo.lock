@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "model2vec-rs"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "half",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "model2vec-rs-python"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "model2vec-rs",
  "ndarray",
