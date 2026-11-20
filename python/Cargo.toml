@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Python bindings for model2vec-rs"
 license = "MIT"
+readme = "README.md"
 publish = false
 
 [lib]

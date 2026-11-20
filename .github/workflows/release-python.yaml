@@ -103,6 +103,19 @@ jobs:
           tar -xzf python/dist/*.tar.gz -C "$RUNNER_TEMP/sdist-check"
           python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/sdist-wheel" "$RUNNER_TEMP"/sdist-check/*/
 
+      - name: Check wheel built from sdist contents
+        shell: python
+        run: |
+          import glob, os, zipfile
+          (path,) = glob.glob(os.path.join(os.environ["RUNNER_TEMP"], "sdist-wheel", "*.whl"))
+          with zipfile.ZipFile(path) as whl:
+              names = set(whl.namelist())
+              for required in ("model2vec_rs/__init__.pyi", "model2vec_rs/py.typed"):
+                  assert required in names, f"{required} missing from {path}"
+              (metadata,) = [n for n in names if n.endswith(".dist-info/METADATA")]
+              body = whl.read(metadata).decode().split("\n\n", 1)[1]
+              assert body.lstrip().startswith("# model2vec-rs (Python)"), "wheel long description is not python/README.md"
+
       - name: Test wheel built from sdist
         working-directory: python
         run: |

@@ -5,7 +5,6 @@ build-backend = "maturin"
 [project]
 name = "model2vec-rs"
 description = "Python bindings for model2vec-rs, the Rust implementation of Model2Vec"
-readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = ["numpy"]
@@ -13,13 +12,14 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
-dynamic = ["version"]
+dynamic = ["version", "readme"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
 
 [tool.maturin]
-module-name = "model2vec_rs"
+module-name = "model2vec_rs.model2vec_rs"
+python-source = "python"
 features = ["pyo3/extension-module"]
 
 [tool.uv]
@@ -27,6 +27,9 @@ cache-keys = [
     { file = "pyproject.toml" },
     { file = "Cargo.toml" },
     { file = "src/**/*.rs" },
+    { file = "python/**/*.py" },
+    { file = "python/**/*.pyi" },
+    { file = "python/**/py.typed" },
     { file = "../Cargo.toml" },
     { file = "../src/**/*.rs" },
 ]
