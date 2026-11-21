@@ -3,8 +3,8 @@
 //! `encode_batch_fast` builds full `Encoding` objects (offsets, alignment,
 //! masks, type IDs) of which the static-embedding path uses only `get_ids()`.
 //! This module implements just the forward text -> IDs mapping for the
-//! BertNormalizer + BertPreTokenizer + WordPiece pipeline shared by every
-//! non-multilingual POTION model, producing token IDs identical to the
+//! BertNormalizer + BertPreTokenizer (optionally followed by FixedLength) +
+//! WordPiece pipeline, producing token IDs identical to the
 //! `tokenizers` crate (verified by the parity test below).
 //!
 //! Literal added-token text (e.g. `[MASK]`, `[CLS]`) is matched and resolved
@@ -15,7 +15,8 @@
 //! [`FastWordPiece::from_tokenizer`] so the caller falls back to the crate.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -23,7 +24,8 @@ use tokenizers::{
     Tokenizer, models::ModelWrapper, normalizers::NormalizerWrapper, pre_tokenizers::PreTokenizerWrapper,
 };
 use unicode_categories::UnicodeCategories;
-use unicode_normalization::UnicodeNormalization;
+use unicode_normalization_alignments::UnicodeNormalization;
+use unicode_normalization_alignments::char::canonical_combining_class;
 
 use crate::model::median_token_length;
 use crate::trie::{DoubleArrayTrie, NONE};
@@ -66,6 +68,8 @@ struct NormalizerJson {
 struct PreTokenizerJson {
     #[serde(rename = "type")]
     kind: String,
+    pretokenizers: Option<Vec<PreTokenizerJson>>,
+    length: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -91,15 +95,15 @@ pub(crate) struct FastWordPiece {
     single_byte: [i32; 128],
     unk_id: Option<u32>,
     max_input_chars_per_word: usize,
-    // BertNormalizer settings
-    clean_text: bool,
-    handle_chinese_chars: bool,
-    strip_accents: bool,
-    lowercase: bool,
+    norm: BertFlags,
+    /// Normalization class of every BMP char under `norm`.
+    classes: CharClasses,
+    /// Split every pre-tokenized word into chunks of this many chars, like
+    /// HuggingFace's `FixedLength` pre-tokenizer after `BertPreTokenizer`.
+    fixed_length: Option<usize>,
     /// Added tokens matched as literal substrings of the raw text before
-    /// normalization, longest content first so a shorter token cannot shadow
-    /// a longer one with the same prefix.
-    added_tokens: Vec<(String, u32)>,
+    /// normalization, longest match first.
+    added_tokens: DoubleArrayTrie,
     /// First byte of every added token, so the scan skips byte positions
     /// that cannot start a match with one array lookup.
     added_token_first_bytes: [bool; 256],
@@ -113,9 +117,18 @@ impl FastWordPiece {
         let ModelWrapper::WordPiece(model) = tok.get_model() else {
             return None;
         };
-        if !matches!(tok.get_pre_tokenizer(), Some(PreTokenizerWrapper::BertPreTokenizer(_))) {
-            return None;
-        }
+        let fixed_length = match tok.get_pre_tokenizer()? {
+            PreTokenizerWrapper::BertPreTokenizer(_) => None,
+            PreTokenizerWrapper::Sequence(seq) => match seq.as_ref() {
+                [PreTokenizerWrapper::BertPreTokenizer(_)] => None,
+                [
+                    PreTokenizerWrapper::BertPreTokenizer(_),
+                    PreTokenizerWrapper::FixedLength(f),
+                ] if f.length > 0 => Some(f.length),
+                _ => return None,
+            },
+            _ => return None,
+        };
         let Some(NormalizerWrapper::BertNormalizer(norm)) = tok.get_normalizer() else {
             return None;
         };
@@ -143,6 +156,7 @@ impl FastWordPiece {
             // `strip_accents: None` follows the lowercase setting, matching HuggingFace.
             norm.strip_accents.unwrap_or(norm.lowercase),
             norm.lowercase,
+            fixed_length,
             added_tokens,
         ))
     }
@@ -150,15 +164,16 @@ impl FastWordPiece {
     /// Build straight from `tokenizer.json` bytes without constructing a
     /// [`Tokenizer`]. Returns the tokenizer and the median token length, or
     /// `None` for another pipeline, a missing field, an unk token outside the
-    /// vocab, or added tokens that are duplicated, absent from the vocab, or
-    /// use matching flags not implemented here. Only the fields read here are
+    /// vocab, or added tokens that are duplicated or use matching flags not
+    /// implemented here. Only the fields read here are
     /// validated, so JSON the crate would reject elsewhere may still load.
     pub(crate) fn from_json(bytes: &[u8]) -> Option<(FastWordPiece, usize)> {
         let json: TokenizerJson = serde_json::from_slice(bytes).ok()?;
         let model = json.model;
-        if model.kind.as_deref() != Some("WordPiece") || json.pre_tokenizer?.kind != "BertPreTokenizer" {
+        if model.kind.as_deref() != Some("WordPiece") {
             return None;
         }
+        let fixed_length = fixed_length_from_json(&json.pre_tokenizer?)?;
         let norm = json.normalizer?;
         if norm.kind != "BertNormalizer" {
             return None;
@@ -168,18 +183,28 @@ impl FastWordPiece {
         let vocab: HashMap<String, u32> = serde_json::from_str(model.vocab?.get()).ok()?;
         let unk_id = *vocab.get(&model.unk_token?)?;
 
-        // The crate gives an added token that is already in the vocab its
-        // vocab id, so with every added token in the vocab the vocab with
-        // added tokens equals the model vocab.
+        // IDs follow `AddedVocabulary::add_tokens`: an added token in the vocab
+        // keeps its vocab id; any other gets the vocab size, or one past the
+        // largest added id once that reaches the vocab size.
+        let vocab_size = vocab.len() as u32;
         let mut added_tokens: Vec<(String, u32)> = Vec::with_capacity(json.added_tokens.len());
+        let mut seen = HashSet::with_capacity(json.added_tokens.len());
+        let mut max_added: Option<u32> = None;
         for t in json.added_tokens {
             if t.content.is_empty() || t.normalized || t.single_word || t.lstrip || t.rstrip {
                 return None;
             }
-            if added_tokens.iter().any(|(content, _)| *content == t.content) {
+            if !seen.insert(t.content.clone()) {
                 return None;
             }
-            let id = *vocab.get(&t.content)?;
+            let id = match vocab.get(&t.content) {
+                Some(&id) => id,
+                None => match max_added {
+                    Some(max) if max >= vocab_size || vocab_size == 0 => max.checked_add(1)?,
+                    _ => vocab_size,
+                },
+            };
+            max_added = Some(max_added.map_or(id, |max| max.max(id)));
             added_tokens.push((t.content, id));
         }
 
@@ -193,6 +218,7 @@ impl FastWordPiece {
             norm.handle_chinese_chars?,
             norm.strip_accents.unwrap_or(lowercase),
             lowercase,
+            fixed_length,
             added_tokens,
         );
         Some((ft, median))
@@ -208,13 +234,14 @@ impl FastWordPiece {
         handle_chinese_chars: bool,
         strip_accents: bool,
         lowercase: bool,
-        mut added_tokens: Vec<(String, u32)>,
+        fixed_length: Option<usize>,
+        added_tokens: Vec<(String, u32)>,
     ) -> FastWordPiece {
-        added_tokens.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         let mut added_token_first_bytes = [false; 256];
         for (content, _) in &added_tokens {
             added_token_first_bytes[content.as_bytes()[0] as usize] = true;
         }
+        let added_tokens = DoubleArrayTrie::build(added_tokens.iter().map(|(k, id)| (k.as_bytes(), *id)).collect());
 
         let mut single_byte = [-1_i32; 128];
         for (b, slot) in single_byte.iter_mut().enumerate() {
@@ -226,16 +253,21 @@ impl FastWordPiece {
         let vocab = DoubleArrayTrie::build(vocab.iter().map(|(k, &id)| (k.as_bytes(), id)).collect());
         let continuation = vocab.walk(continuing_subword_prefix.as_bytes());
 
+        let norm = BertFlags {
+            clean_text,
+            handle_chinese_chars,
+            strip_accents,
+            lowercase,
+        };
         FastWordPiece {
             vocab,
             continuation,
             single_byte,
             unk_id,
             max_input_chars_per_word,
-            clean_text,
-            handle_chinese_chars,
-            strip_accents,
-            lowercase,
+            norm,
+            classes: norm.char_classes(),
+            fixed_length,
             added_tokens,
             added_token_first_bytes,
         }
@@ -267,17 +299,13 @@ impl FastWordPiece {
         let mut i = 0;
         while i < text.len() {
             let hit = self.added_token_first_bytes[bytes[i] as usize]
-                .then(|| {
-                    self.added_tokens
-                        .iter()
-                        .find(|(content, _)| text[i..].starts_with(content.as_str()))
-                })
+                .then(|| self.added_tokens.longest_prefix(0, &bytes[i..]))
                 .flatten();
             match hit {
-                Some((content, id)) => {
+                Some((id, len)) => {
                     self.encode_span(&text[start..i], out, scratch);
-                    out.push(*id);
-                    i += content.len();
+                    out.push(id);
+                    i += len;
                     start = i;
                 }
                 // Added tokens are valid UTF-8, so a match can only start on
@@ -295,7 +323,22 @@ impl FastWordPiece {
         }
         normalized.clear();
         self.normalize_into(span, normalized);
-        pre_tokenize(normalized, |word| self.word_to_ids(word, out));
+        match self.fixed_length {
+            None => pre_tokenize(normalized, |word| self.word_to_ids(word, out)),
+            Some(n) => pre_tokenize(normalized, |word| self.chunks_to_ids(word, n, out)),
+        }
+    }
+
+    /// WordPiece `word` in chunks of at most `n` chars.
+    fn chunks_to_ids(&self, mut word: &str, n: usize, out: &mut Vec<u32>) {
+        while word.len() > n {
+            let Some((end, _)) = word.char_indices().nth(n) else {
+                break;
+            };
+            self.word_to_ids(&word[..end], out);
+            word = &word[end..];
+        }
+        self.word_to_ids(word, out);
     }
 
     // --- WordPiece ---------------------------------------------------------
@@ -356,7 +399,7 @@ impl FastWordPiece {
     /// pre-tokenization drops it anyway.
     fn normalize_into(&self, input: &str, out: &mut String) {
         if input.is_ascii() {
-            self.normalize_ascii(input, out)
+            self.norm.normalize_ascii(input, out)
         } else {
             self.normalize_mixed(input, out)
         }
@@ -376,7 +419,7 @@ impl FastWordPiece {
                 .map_or(bytes.len(), |n| start + n);
             let run = &input[start..end];
             if plain {
-                self.normalize_ascii(run, out);
+                self.norm.normalize_ascii(run, out);
             } else {
                 self.normalize_unicode(run, out);
             }
@@ -384,6 +427,45 @@ impl FastWordPiece {
         }
     }
 
+    /// Normalize non-ASCII text in runs of one [`CharClasses`] class. Runs
+    /// split only before or after a starter that NFD leaves unchanged, which
+    /// does not change NFD's canonical reordering.
+    fn normalize_unicode(&self, input: &str, out: &mut String) {
+        let mut rest = input;
+        while let Some(first) = rest.chars().next() {
+            let class = self.classes.get(first);
+            let end = rest
+                .char_indices()
+                .find(|&(_, c)| self.classes.get(c) != class)
+                .map_or(rest.len(), |(i, _)| i);
+            let (run, tail) = rest.split_at(end);
+            match class {
+                UNCHANGED => out.push_str(run),
+                PADDED => {
+                    out.reserve(run.len() * 3);
+                    for c in run.chars() {
+                        out.push(' ');
+                        out.push(c);
+                        out.push(' ');
+                    }
+                }
+                _ => self.norm.normalize_other(run, out),
+            }
+            rest = tail;
+        }
+    }
+}
+
+/// BertNormalizer settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BertFlags {
+    clean_text: bool,
+    handle_chinese_chars: bool,
+    strip_accents: bool,
+    lowercase: bool,
+}
+
+impl BertFlags {
     /// Fused clean + lowercase over ASCII bytes. Accent stripping (NFD is
     /// identity below 0x80) and Chinese handling are no-ops for ASCII.
     fn normalize_ascii(&self, input: &str, out: &mut String) {
@@ -420,12 +502,12 @@ impl FastWordPiece {
         [Some(c), None, None]
     }
 
-    fn normalize_unicode(&self, input: &str, out: &mut String) {
+    fn normalize_other(&self, input: &str, out: &mut String) {
         let staged = input.chars().flat_map(|c| self.stage(c).into_iter().flatten());
         if self.strip_accents {
             // NFD, drop nonspacing marks, then (optionally) lowercase; left
             // decomposed, matching HuggingFace.
-            for c in staged.nfd() {
+            for (c, _) in staged.nfd() {
                 if c.is_mark_nonspacing() {
                     continue;
                 }
@@ -441,6 +523,82 @@ impl FastWordPiece {
             out.extend(staged);
         }
     }
+
+    /// The shared [`CharClasses`] table for these flags, built on first use.
+    fn char_classes(self) -> CharClasses {
+        static TABLES: [OnceLock<Box<[u8]>>; 16] = [const { OnceLock::new() }; 16];
+        let index = self.clean_text as usize
+            | (self.handle_chinese_chars as usize) << 1
+            | (self.strip_accents as usize) << 2
+            | (self.lowercase as usize) << 3;
+        CharClasses(TABLES[index].get_or_init(|| (0..0x10000).map(|cp| self.classify(cp)).collect()))
+    }
+
+    fn classify(self, cp: u32) -> u8 {
+        let Some(c) = char::from_u32(cp) else {
+            return OTHER;
+        };
+        if self.strip_accents
+            && (canonical_combining_class(c) != 0 || std::iter::once(c).nfd().map(|(c, _)| c).ne(std::iter::once(c)))
+        {
+            return OTHER;
+        }
+        let mut buf = [0; 4];
+        let mut out = String::new();
+        self.normalize_other(c.encode_utf8(&mut buf), &mut out);
+        let mut chars = out.chars();
+        match (chars.next(), chars.next(), chars.next(), chars.next()) {
+            (Some(a), None, _, _) if a == c => UNCHANGED,
+            (Some(' '), Some(b), Some(' '), None) if b == c => PADDED,
+            _ => OTHER,
+        }
+    }
+}
+
+/// Normalization is the identity on the char.
+const UNCHANGED: u8 = 1;
+/// Normalization surrounds the char with spaces and leaves it unchanged.
+const PADDED: u8 = 2;
+/// Anything else, including every char outside the BMP.
+const OTHER: u8 = 0;
+
+/// Per-BMP-char normalization class for one set of [`BertFlags`].
+#[derive(Clone, Copy)]
+struct CharClasses(&'static [u8]);
+
+impl CharClasses {
+    #[inline]
+    fn get(self, c: char) -> u8 {
+        self.0.get(c as usize).copied().unwrap_or(OTHER)
+    }
+}
+
+impl std::fmt::Debug for CharClasses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CharClasses")
+    }
+}
+
+impl PartialEq for CharClasses {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+/// `Some(fixed_length)` for `BertPreTokenizer`, optionally followed by
+/// `FixedLength` in a `Sequence`; `None` for any other pre-tokenizer.
+fn fixed_length_from_json(p: &PreTokenizerJson) -> Option<Option<usize>> {
+    match (p.kind.as_str(), p.pretokenizers.as_deref()) {
+        ("BertPreTokenizer", _) => Some(None),
+        ("Sequence", Some([bert])) if bert.kind == "BertPreTokenizer" => Some(None),
+        ("Sequence", Some([bert, fixed])) if bert.kind == "BertPreTokenizer" && fixed.kind == "FixedLength" => {
+            match fixed.length.unwrap_or(5) {
+                0 => None,
+                n => Some(Some(n)),
+            }
+        }
+        _ => None,
+    }
 }
 
 // --- BertPreTokenizer -------------------------------------------------------
@@ -455,6 +613,27 @@ fn ascii_class(b: u8) -> u8 {
     }
 }
 
+/// Pre-tokenizer class of a char, with the same values as [`ascii_class`].
+fn char_class(c: char) -> u8 {
+    if c.is_whitespace() {
+        1
+    } else if c.is_ascii_punctuation() || c.is_punctuation() {
+        2
+    } else {
+        0
+    }
+}
+
+/// [`char_class`] of every BMP char, built on first use.
+fn pre_tokenizer_classes() -> &'static [u8] {
+    static TABLE: OnceLock<Box<[u8]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..0x10000)
+            .map(|cp| char::from_u32(cp).map_or(0, char_class))
+            .collect()
+    })
+}
+
 /// Split like HuggingFace's BertPreTokenizer: drop whitespace, isolate each
 /// punctuation char as its own word, and call `emit` on each word in order.
 fn pre_tokenize<'a>(s: &'a str, mut emit: impl FnMut(&'a str)) {
@@ -466,12 +645,9 @@ fn pre_tokenize<'a>(s: &'a str, mut emit: impl FnMut(&'a str)) {
             (ascii_class(bytes[i]), 1)
         } else {
             let c = s[i..].chars().next().unwrap();
-            let class = if c.is_whitespace() {
-                1
-            } else if c.is_ascii_punctuation() || c.is_punctuation() {
-                2
-            } else {
-                0
+            let class = match pre_tokenizer_classes().get(c as usize) {
+                Some(&class) => class,
+                None => char_class(c),
             };
             (class, c.len_utf8())
         };
@@ -582,11 +758,13 @@ mod tests {
             "Ab\u{00C0}\u{0007}C\td\u{3000}E\u{00A0}f", // controls/NBSP/ideographic space between runs
             "ÉCOLE\nÜBER\r\nСЛОВО 東京Tokyo",
             // --- CJK / handle_chinese_chars boundaries and non-CJK scripts ---
-            "一鿿㐀䶿",                       // BMP CJK range endpoints
-            "𠀀 𪛖 豈",                       // ext-B (U+20000) + compatibility (U+F900)
-            "你好world世界",                  // CJK adjacent to latin, no spaces
-            "，。、！？；：",                 // fullwidth/CJK punctuation (category Po → isolate)
-            "こんにちは カタカナ 안녕하세요", // kana + hangul: must NOT be space-wrapped
+            "一鿿㐀䶿",                                          // BMP CJK range endpoints
+            "\u{9FA5}\u{9FA6}\u{4DB5}\u{4DB6}\u{33FF}\u{4DFF}",  // plain-ideograph range edges
+            "字\u{0301}字\u{0323}\u{0301}é字ÀB字\u{3000}字，字", // marks, accents, spaces, punctuation next to ideographs
+            "𠀀 𪛖 豈",                                          // ext-B (U+20000) + compatibility (U+F900)
+            "你好world世界",                                     // CJK adjacent to latin, no spaces
+            "，。、！？；：",                                    // fullwidth/CJK punctuation (category Po → isolate)
+            "こんにちは カタカナ 안녕하세요",                    // kana + hangul: must NOT be space-wrapped
             // --- punctuation isolation: ASCII vs Unicode P vs Unicode symbol ---
             "a≤b x→y n≠m", // Sm math symbols: NOT punctuation → stay in word
             "«guillemets» \u{201c}smart\u{201d} \u{2018}quotes\u{2019}", // Pi/Pf → isolate
@@ -650,6 +828,103 @@ mod tests {
         }
     }
 
+    fn with_fixed_length(json: &mut serde_json::Value, length: serde_json::Value) {
+        let mut fixed = serde_json::json!({"type": "FixedLength"});
+        if !length.is_null() {
+            fixed["length"] = length;
+        }
+        json["pre_tokenizer"] = serde_json::json!({
+            "type": "Sequence",
+            "pretokenizers": [{"type": "BertPreTokenizer"}, fixed],
+        });
+    }
+
+    #[test]
+    fn fixed_length_matches_crate() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let base: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut texts: Vec<String> = corpus().into_iter().map(String::from).collect();
+        texts.extend(noise(500));
+        for length in [serde_json::Value::Null, 1.into(), 3.into(), 7.into(), 100.into()] {
+            let mut json = base.clone();
+            with_fixed_length(&mut json, length);
+            let json = json.to_string();
+            let mut tok = Tokenizer::from_str(&json).expect("build tokenizer");
+            assert_matches_crate(&tok, &texts);
+            assert_json_matches_tokenizer(json.as_bytes());
+            tok.add_tokens(&[
+                tokenizers::AddedToken::from("你好", false).normalized(false),
+                tokenizers::AddedToken::from("你好世", false).normalized(false),
+                tokenizers::AddedToken::from("世界", false).normalized(false),
+            ]);
+            assert!(FastWordPiece::from_tokenizer(&tok).is_some());
+            assert_matches_crate(&tok, &texts);
+        }
+    }
+
+    #[test]
+    fn from_json_assigns_added_token_ids_like_crate() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let added = json["added_tokens"].as_array_mut().unwrap();
+        let in_vocab = added[0].clone();
+        added.clear();
+        for (i, content) in ["zzqx", "", "你好", "", "你好世", "qqq"].into_iter().enumerate() {
+            let mut t = in_vocab.clone();
+            if !content.is_empty() {
+                t["content"] = content.into();
+                t["special"] = (i % 2 == 0).into();
+            }
+            t["id"] = 0.into();
+            added.push(t);
+        }
+        added.remove(3);
+        let bytes = json.to_string();
+        assert_json_matches_tokenizer(bytes.as_bytes());
+        let tok = Tokenizer::from_str(&bytes).expect("build tokenizer");
+        let texts: Vec<String> = ["zzqx 你好世界 qqq", "你好世 [UNK] zzqxqqq"].map(String::from).into();
+        assert_matches_crate(&tok, &texts);
+    }
+
+    #[test]
+    fn from_json_declines_other_sequences() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let declines = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut json = json.clone();
+            edit(&mut json);
+            let bytes = json.to_string();
+            let tok = Tokenizer::from_str(&bytes).expect("build tokenizer");
+            let declined = FastWordPiece::from_json(bytes.as_bytes()).is_none();
+            assert_eq!(declined, FastWordPiece::from_tokenizer(&tok).is_none());
+            declined
+        };
+        assert!(!declines(&|j| with_fixed_length(j, 4.into())));
+        assert!(declines(&|j| with_fixed_length(j, 0.into())));
+        assert!(!declines(&|j| {
+            j["pre_tokenizer"] =
+                serde_json::json!({"type": "Sequence", "pretokenizers": [{"type": "BertPreTokenizer"}]});
+        }));
+        assert!(declines(&|j| {
+            j["pre_tokenizer"] = serde_json::json!({"type": "Sequence", "pretokenizers": [
+                {"type": "FixedLength", "length": 4}, {"type": "BertPreTokenizer"}]});
+        }));
+        assert!(declines(&|j| {
+            j["pre_tokenizer"] = serde_json::json!({"type": "Sequence", "pretokenizers": [
+                {"type": "BertPreTokenizer"}, {"type": "FixedLength", "length": 4},
+                {"type": "FixedLength", "length": 2}]});
+        }));
+    }
+
     /// Every (clean_text, handle_chinese_chars, strip_accents, lowercase) combination.
     fn flag_combinations() -> impl Iterator<Item = [bool; 4]> {
         (0..16u8).map(|m| [m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0])
@@ -657,7 +932,18 @@ mod tests {
 
     fn normalizer_with([clean, chinese, strip, lower]: [bool; 4]) -> FastWordPiece {
         let vocab = HashMap::from([("[UNK]".to_string(), 0)]);
-        FastWordPiece::assemble(&vocab, "##", Some(0), 100, clean, chinese, strip, lower, Vec::new())
+        FastWordPiece::assemble(
+            &vocab,
+            "##",
+            Some(0),
+            100,
+            clean,
+            chinese,
+            strip,
+            lower,
+            None,
+            Vec::new(),
+        )
     }
 
     fn fast_normalized(ft: &FastWordPiece, text: &str) -> String {
@@ -747,6 +1033,52 @@ mod tests {
         }
     }
 
+    /// Every BMP char in runs of 64, each char also between combining marks
+    /// of different classes and next to a CJK ideograph.
+    fn every_bmp_char() -> Vec<String> {
+        let chars: Vec<char> = (0..0x10000).filter_map(char::from_u32).collect();
+        let mut texts: Vec<String> = chars.chunks(64).map(|c| c.iter().collect()).collect();
+        texts.extend(chars.chunks(16).map(|c| {
+            c.iter()
+                .map(|&c| format!("a\u{0323}{c}\u{0301}\u{0323}字{c}字\u{1D165}"))
+                .collect()
+        }));
+        texts
+    }
+
+    #[test]
+    fn normalize_matches_crate_on_every_bmp_char() {
+        let texts = every_bmp_char();
+        for flags in flag_combinations() {
+            let ft = normalizer_with(flags);
+            for text in &texts {
+                assert_eq!(
+                    fast_normalized(&ft, text),
+                    crate_normalized(flags, text),
+                    "normalized-text mismatch for {text:?} with [clean, chinese, strip, lower] = {flags:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pre_tokenize_matches_crate_on_every_bmp_char() {
+        use tokenizers::pre_tokenizers::bert::BertPreTokenizer;
+        use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
+        for text in every_bmp_char() {
+            let mut pre = PreTokenizedString::from(text.as_str());
+            BertPreTokenizer.pre_tokenize(&mut pre).unwrap();
+            let want: Vec<String> = pre
+                .get_splits(OffsetReferential::Original, OffsetType::Byte)
+                .into_iter()
+                .map(|(s, _, _)| s.to_string())
+                .collect();
+            let mut got = Vec::new();
+            pre_tokenize(&text, |w| got.push(w.to_string()));
+            assert_eq!(got, want, "pre-tokenization mismatch for {text:?}");
+        }
+    }
+
     #[test]
     fn normalize_keeps_mark_order_and_controls() {
         // [clean_text, strip_accents]; handle_chinese_chars on, lowercase off.
@@ -793,7 +1125,6 @@ mod tests {
     }
 
     /// Random lowercase words, so long subword splits and unknown words occur.
-    #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
     fn noise(n: usize) -> Vec<String> {
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = |bound: u64| {
@@ -871,6 +1202,19 @@ mod tests {
             assert_matches_crate(&tok, &texts);
             assert_json_matches_tokenizer(&std::fs::read(&path).expect("read cached tokenizer"));
         }
+        let Some(path) = cache
+            .model("minishlab/blink-multilingual-64M".to_string())
+            .get("tokenizer.json")
+        else {
+            eprintln!("skipped: minishlab/blink-multilingual-64M is not in the local cache");
+            return;
+        };
+        let tok = Tokenizer::from_file(&path).expect("load cached tokenizer");
+        assert_json_matches_tokenizer(&std::fs::read(&path).expect("read cached tokenizer"));
+        texts.extend(["一个可以使用的模型", "军队回答日至成分合并或是运营多年皇家免费"].map(String::from));
+        texts.push("字".repeat(250));
+        texts.push("a".repeat(250));
+        assert_matches_crate(&tok, &texts);
     }
 
     /// `from_json` must build exactly what `from_tokenizer` builds from the
@@ -906,7 +1250,6 @@ mod tests {
         };
         assert!(!declines(&|_| {}));
         assert!(declines(&|j| j["added_tokens"][0]["normalized"] = true.into()));
-        assert!(declines(&|j| j["added_tokens"][0]["content"] = "[NOT IN VOCAB]".into()));
         assert!(declines(&|j| {
             let first = j["added_tokens"][0].clone();
             j["added_tokens"].as_array_mut().unwrap().push(first);
