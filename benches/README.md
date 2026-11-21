@@ -76,7 +76,7 @@ for model_id in ["minishlab/potion-base-8M", "minishlab/potion-retrieval-32M"]:
 ## Runtime int8 quantization
 
 `quantize.rs` compares the f32 model, a separately loaded copy of it (a
-control that should come out at 1.00x), the per-row quantized model, and
+control that should come out at 1.00x), the `quantize_int8` model, and
 optionally a model2vec int8 model, all in one process:
 
 ```sh

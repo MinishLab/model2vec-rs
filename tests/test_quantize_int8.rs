@@ -1,8 +1,11 @@
-//! `StaticModel::quantize_int8`: per-row int8 quantization of f32 models.
+//! `StaticModel::quantize_int8`: int8 quantization of f32 models.
 //!
-//! Exactness is checked against `from_owned_i8` given the same int8 values
+//! Models with both a token mapping and token weights are quantized per row;
+//! exactness is checked against `from_owned_i8` given the same int8 values
 //! and per-token weights equal to the token weight times the row scale,
-//! which performs the same float operations.
+//! which performs the same float operations. Other models are quantized per
+//! column; every encode entry point must agree bit for bit and stay close to
+//! the f32 model.
 
 use model2vec_rs::model::StaticModel;
 use tokenizers::Tokenizer;
@@ -175,17 +178,20 @@ fn check(tokenizer_path: &str, dim: usize, combo: (bool, bool, bool)) {
     let case = Case::new(tokenizer_path, dim, combo);
     let f32_model = case.f32_model();
     let quantized = case.f32_model().quantize_int8();
-    let oracle = case.oracle();
+    let per_row = case.weights.is_some() && case.mapping.is_some();
+    let oracle = if per_row { case.oracle() } else { quantized.clone() };
     for max_length in [Some(512), Some(7), None] {
         let label = format!("{} max_length={max_length:?}", case.label());
+        let got = quantized.encode_with_args(&texts, max_length, 1024, None);
+        assert_bit_identical(&label, &got, &oracle.encode_with_args(&texts, max_length, 1024, None));
         assert_bit_identical(
-            &label,
-            &quantized.encode_with_args(&texts, max_length, 1024, None),
-            &oracle.encode_with_args(&texts, max_length, 1024, None),
+            &format!("{label} batch_size=2"),
+            &quantized.encode_with_args(&texts, max_length, 2, None),
+            &got,
         );
     }
     let singles = |m: &StaticModel| texts.iter().map(|t| m.encode_single(t)).collect::<Vec<_>>();
-    assert_bit_identical(&case.label(), &singles(&quantized), &singles(&oracle));
+    assert_bit_identical(&case.label(), &singles(&quantized), &oracle.encode(&texts));
     let flat: Vec<Vec<f32>> = quantized
         .encode_flat(&texts)
         .chunks_exact(dim)

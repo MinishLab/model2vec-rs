@@ -128,7 +128,7 @@ use model2vec_rs::model::StaticModel;
 let model = StaticModel::from_pretrained("minishlab/potion-base-8M", None, None, None)?.quantize_int8();
 ```
 
-`quantize_int8` stores the embeddings as int8 with one scale per row, using a quarter of the memory and encoding faster. Outputs stay very close to the f32 model (cosine similarity above 0.9998 on the potion models).
+`quantize_int8` stores the embeddings as int8 with one scale per column and a power-of-two scale per row, using a quarter of the memory and encoding faster, since pooling then sums integers. Outputs stay very close to the f32 model (cosine similarity above 0.9997 on the potion models).
 
 See the [feature flags](#feature-flags) section for `wasm` and `local-only` build configurations.
 
@@ -258,7 +258,7 @@ Benchmark details:
 *   **Method:** 5 alternating rounds of Rust and Python processes, 5 timed passes each after one warm-up pass; throughput is the median over the 25 passes.
 *   **Model load:** median time over all 10 process launches per side to load the model from the local Hugging Face cache; for Python this includes importing `model2vec`.
 *   **Output:** for float32, the Rust and Python embeddings differ by at most 3.0e-7 per value (minimum cosine similarity 0.9999998).
-*   **int8:** the model is quantized at load time on both sides, with `quantize_int8` in Rust and `quantize_to="int8"` in Python. Rust keeps one scale per row and Python one scale for the whole table, so the int8 embeddings differ between the two (minimum cosine similarity 0.27); these bars compare speed only.
+*   **int8:** the model is quantized at load time on both sides, with `quantize_int8` in Rust and `quantize_to="int8"` in Python. Rust keeps one scale per column plus a power-of-two scale per row and Python one scale for the whole table, so the int8 embeddings differ between the two; these bars compare speed only.
 
 ## Relation to Python `model2vec`
 

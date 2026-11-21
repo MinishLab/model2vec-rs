@@ -28,6 +28,7 @@ use unicode_normalization_alignments::UnicodeNormalization;
 use unicode_normalization_alignments::char::canonical_combining_class;
 
 use crate::model::median_token_length;
+use crate::piece_table::{self, KEY_BYTES, PieceTable};
 use crate::trie::{DoubleArrayTrie, NONE};
 
 thread_local! {
@@ -90,6 +91,17 @@ pub(crate) struct FastWordPiece {
     vocab: DoubleArrayTrie,
     /// Trie node reached by the continuing-subword prefix, or `NONE`.
     continuation: u32,
+    /// Vocab pieces of up to [`KEY_BYTES`] bytes, for the ASCII fast path.
+    first: PieceTable,
+    /// Continuation pieces of up to [`KEY_BYTES`] bytes, without the prefix.
+    cont: PieceTable,
+    /// Pre-tokenizer class of every byte, or [`GENERAL`] for bytes the ASCII
+    /// fast path leaves to normalization.
+    byte_class: [u8; 256],
+    /// Longest word the ASCII fast path tokenizes from its packed key.
+    fast_limit: usize,
+    /// Normalization of every BMP char the fast path can handle alone.
+    char_map: CharMap,
     /// Vocab IDs of single-ASCII-byte tokens (-1 when absent), so isolated
     /// punctuation words skip the trie walk.
     single_byte: [i32; 128],
@@ -250,8 +262,30 @@ impl FastWordPiece {
             }
         }
 
+        let first = PieceTable::build(vocab.iter().map(|(k, &id)| (k.as_bytes(), id)));
+        let cont = PieceTable::build(vocab.iter().filter_map(|(k, &id)| {
+            k.as_bytes()
+                .strip_prefix(continuing_subword_prefix.as_bytes())
+                .map(|rest| (rest, id))
+        }));
         let vocab = DoubleArrayTrie::build(vocab.iter().map(|(k, &id)| (k.as_bytes(), id)).collect());
         let continuation = vocab.walk(continuing_subword_prefix.as_bytes());
+        let cont = if continuation == NONE {
+            PieceTable::build([])
+        } else {
+            cont
+        };
+
+        let mut byte_class = [GENERAL; 256];
+        for (b, class) in byte_class.iter_mut().enumerate().take(0x80) {
+            let b = b as u8;
+            if !(clean_text && (b < 0x20 || b == 0x7f) && !matches!(b, b'\t' | b'\n' | b'\r')) {
+                *class = ascii_class(b);
+            }
+        }
+        let fast_limit = KEY_BYTES
+            .min(max_input_chars_per_word)
+            .min(fixed_length.unwrap_or(usize::MAX));
 
         let norm = BertFlags {
             clean_text,
@@ -262,6 +296,11 @@ impl FastWordPiece {
         FastWordPiece {
             vocab,
             continuation,
+            first,
+            cont,
+            byte_class,
+            fast_limit,
+            char_map: norm.char_map(),
             single_byte,
             unk_id,
             max_input_chars_per_word,
@@ -321,11 +360,161 @@ impl FastWordPiece {
         if span.is_empty() {
             return;
         }
-        normalized.clear();
-        self.normalize_into(span, normalized);
+        let mut rest = span;
+        while let Some(general) = self.encode_ascii(rest, out, normalized) {
+            normalized.clear();
+            let cut = self.normalize_mixed(general, normalized, true);
+            self.encode_normalized(normalized, out);
+            rest = &general[cut..];
+        }
+    }
+
+    /// Pre-tokenize and WordPiece normalized text.
+    fn encode_normalized(&self, normalized: &str, out: &mut Vec<u32>) {
         match self.fixed_length {
             None => pre_tokenize(normalized, |word| self.word_to_ids(word, out)),
             Some(n) => pre_tokenize(normalized, |word| self.chunks_to_ids(word, n, out)),
+        }
+    }
+
+    /// Tokenize the leading run of `span` made of bytes that normalize to
+    /// themselves (up to lowercasing), fusing normalization, pre-tokenization
+    /// and lookup into one pass. Returns the rest of `span`, starting at the
+    /// word holding the first byte it cannot handle, or `None` when done.
+    fn encode_ascii<'s>(&self, span: &'s str, out: &mut Vec<u32>, scratch: &mut String) -> Option<&'s str> {
+        let bytes = span.as_bytes();
+        let lowercase = self.norm.lowercase;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match self.byte_class[b as usize] {
+                SPACE => {
+                    i += 1;
+                    continue;
+                }
+                PUNCT => {
+                    self.word_to_ids(&span[i..i + 1], out);
+                    i += 1;
+                    continue;
+                }
+                WORD => {}
+                _ => match self.encode_word(span, i, out, scratch) {
+                    Some(next) => {
+                        i = next;
+                        continue;
+                    }
+                    None => return Some(&span[i..]),
+                },
+            }
+
+            let raw = piece_table::load(bytes, i);
+            let (mut n, lowered) = piece_table::scan_alnum(raw);
+            let mut lo = if lowercase { lowered } else { raw };
+            let mut hi = 0;
+            if n == 8 {
+                let raw = piece_table::load(bytes, i + 8);
+                let (m, lowered) = piece_table::scan_alnum(raw);
+                hi = if lowercase { lowered } else { raw } & piece_table::low_bytes(m);
+                n += m;
+            } else {
+                lo &= piece_table::low_bytes(n);
+            }
+
+            let end = i + n;
+            let whole = end == bytes.len() || matches!(self.byte_class[bytes[end] as usize], SPACE | PUNCT);
+            if whole && n <= self.fast_limit {
+                match self.first.get(lo, hi, n) {
+                    Some(id) => out.push(id),
+                    None => self.split_key(lo, hi, n, out),
+                }
+                i = end;
+                continue;
+            }
+
+            match self.encode_word(span, i, out, scratch) {
+                Some(next) => i = next,
+                None => return Some(&span[i..]),
+            }
+        }
+        None
+    }
+
+    /// Normalize char by char the word of `span` starting at `start`, then
+    /// WordPiece it; a leading punctuation char is a word of its own and
+    /// leading whitespace is skipped. Returns where the word ends, or `None`,
+    /// with nothing emitted, when a char needs the full normalizer.
+    fn encode_word(&self, span: &str, start: usize, out: &mut Vec<u32>, word: &mut String) -> Option<usize> {
+        let bytes = span.as_bytes();
+        word.clear();
+        let mut j = start;
+        while j < bytes.len() {
+            let b = bytes[j];
+            let (kind, size, normalized): (u8, usize, &str) = if b < 0x80 {
+                match self.byte_class[b as usize] {
+                    WORD => {
+                        word.push(if self.norm.lowercase { b.to_ascii_lowercase() } else { b } as char);
+                        j += 1;
+                        continue;
+                    }
+                    GENERAL => return None,
+                    kind => (kind, 1, &span[j..j + 1]),
+                }
+            } else if b < 0xE0 {
+                let cp = (((b & 0x1F) as usize) << 6) | (bytes[j + 1] & 0x3F) as usize;
+                let m = &self.char_map.0[cp];
+                (m.kind, 2, m.as_str())
+            } else if b < 0xF0 {
+                let cp = (((b & 0x0F) as usize) << 12)
+                    | (((bytes[j + 1] & 0x3F) as usize) << 6)
+                    | (bytes[j + 2] & 0x3F) as usize;
+                let m = &self.char_map.0[cp];
+                (m.kind, 3, m.as_str())
+            } else {
+                return None;
+            };
+            match kind {
+                WORD => {
+                    word.push_str(normalized);
+                    j += size;
+                }
+                GENERAL => return None,
+                _ if j > start => break,
+                SPACE => return Some(j + size),
+                _ => {
+                    self.word_to_ids(normalized, out);
+                    return Some(j + size);
+                }
+            }
+        }
+        if !word.is_empty() {
+            match self.fixed_length {
+                None => self.word_to_ids(word, out),
+                Some(k) => self.chunks_to_ids(word, k, out),
+            }
+        }
+        Some(j)
+    }
+
+    /// Greedy longest-match-first over a word of `n <= KEY_BYTES` bytes
+    /// packed into `(lo, hi)` that is not a vocab entry as a whole.
+    fn split_key(&self, mut lo: u64, mut hi: u64, mut n: usize, out: &mut Vec<u32>) {
+        let mark = out.len();
+        let mut table = &self.first;
+        let mut len = n - 1;
+        while n > 0 {
+            let found = (1..=len)
+                .rev()
+                .find_map(|l| table.get_prefix(lo, hi, l).map(|id| (id, l)));
+            let Some((id, l)) = found else {
+                out.truncate(mark);
+                self.push_unk(out);
+                return;
+            };
+            out.push(id);
+            (lo, hi) = piece_table::shift_out(lo, hi, l);
+            n -= l;
+            len = n;
+            table = &self.cont;
         }
     }
 
@@ -397,17 +586,21 @@ impl FastWordPiece {
 
     /// Append the normalized `input` to `out`. Edge whitespace is kept, since
     /// pre-tokenization drops it anyway.
+    #[cfg(test)]
     fn normalize_into(&self, input: &str, out: &mut String) {
         if input.is_ascii() {
             self.norm.normalize_ascii(input, out)
         } else {
-            self.normalize_mixed(input, out)
+            self.normalize_mixed(input, out, false);
         }
     }
 
     /// Normalize runs of printable ASCII (plus `\t\n\r`) with the ASCII path
-    /// and everything in between with the Unicode path.
-    fn normalize_mixed(&self, input: &str, out: &mut String) {
+    /// and everything in between with the Unicode path. With `resume`, stop
+    /// after the first whitespace of a printable ASCII run that leaves at
+    /// least [`MIN_ASCII_RUN`] bytes of it, or the rest of the input, for the
+    /// ASCII fast path. Returns the length of `input` normalized.
+    fn normalize_mixed(&self, input: &str, out: &mut String, resume: bool) -> usize {
         out.reserve(input.len());
         let bytes = input.as_bytes();
         let mut start = 0;
@@ -419,12 +612,24 @@ impl FastWordPiece {
                 .map_or(bytes.len(), |n| start + n);
             let run = &input[start..end];
             if plain {
+                if resume && (end - start > MIN_ASCII_RUN || end == bytes.len()) {
+                    let cut = run
+                        .bytes()
+                        .position(|b| self.byte_class[b as usize] == SPACE)
+                        .map(|p| start + p + 1)
+                        .filter(|&r| r < end && (end - r >= MIN_ASCII_RUN || end == bytes.len()));
+                    if let Some(r) = cut {
+                        self.norm.normalize_ascii(&input[start..r], out);
+                        return r;
+                    }
+                }
                 self.norm.normalize_ascii(run, out);
             } else {
                 self.normalize_unicode(run, out);
             }
             start = end;
         }
+        bytes.len()
     }
 
     /// Normalize non-ASCII text in runs of one [`CharClasses`] class. Runs
@@ -524,14 +729,62 @@ impl BertFlags {
         }
     }
 
+    /// The shared [`CharMap`] for these flags, built on first use.
+    fn char_map(self) -> CharMap {
+        static TABLES: [OnceLock<Box<[Mapped]>>; 16] = [const { OnceLock::new() }; 16];
+        CharMap(TABLES[self.index()].get_or_init(|| (0..0x10000).map(|cp| self.map_char(cp)).collect()))
+    }
+
+    /// The [`Mapped`] normalization of one BMP char, when normalizing it
+    /// alone is exact: without accent stripping always, since every other
+    /// step is per char; with it, when the char is a starter whose
+    /// decomposition also starts with one, so NFD cannot reorder across it.
+    /// The normalization must be all word chars, all whitespace, one
+    /// punctuation char, or one word char between spaces.
+    fn map_char(self, cp: u32) -> Mapped {
+        let Some(c) = char::from_u32(cp) else {
+            return Mapped::GENERAL;
+        };
+        if cp < 0x80 {
+            return Mapped::GENERAL;
+        }
+        if self.strip_accents
+            && (canonical_combining_class(c) != 0
+                || std::iter::once(c)
+                    .nfd()
+                    .next()
+                    .is_some_and(|(d, _)| canonical_combining_class(d) != 0))
+        {
+            return Mapped::GENERAL;
+        }
+        let mut buf = [0; 4];
+        let mut normalized = String::new();
+        self.normalize_other(c.encode_utf8(&mut buf), &mut normalized);
+        let kinds: Vec<u8> = normalized.chars().map(char_class).collect();
+        let (kind, normalized) = match kinds.as_slice() {
+            k if k.iter().all(|&k| k == WORD) => (WORD, normalized.as_str()),
+            k if k.iter().all(|&k| k == SPACE) => (SPACE, normalized.as_str()),
+            [PUNCT] => (PUNCT, normalized.as_str()),
+            [SPACE, WORD, SPACE] => (PUNCT, normalized.trim_matches(' ')),
+            _ => return Mapped::GENERAL,
+        };
+        if kind == PUNCT && normalized.chars().count() != 1 {
+            return Mapped::GENERAL;
+        }
+        Mapped::new(kind, normalized).unwrap_or(Mapped::GENERAL)
+    }
+
+    fn index(self) -> usize {
+        self.clean_text as usize
+            | (self.handle_chinese_chars as usize) << 1
+            | (self.strip_accents as usize) << 2
+            | (self.lowercase as usize) << 3
+    }
+
     /// The shared [`CharClasses`] table for these flags, built on first use.
     fn char_classes(self) -> CharClasses {
         static TABLES: [OnceLock<Box<[u8]>>; 16] = [const { OnceLock::new() }; 16];
-        let index = self.clean_text as usize
-            | (self.handle_chinese_chars as usize) << 1
-            | (self.strip_accents as usize) << 2
-            | (self.lowercase as usize) << 3;
-        CharClasses(TABLES[index].get_or_init(|| (0..0x10000).map(|cp| self.classify(cp)).collect()))
+        CharClasses(TABLES[self.index()].get_or_init(|| (0..0x10000).map(|cp| self.classify(cp)).collect()))
     }
 
     fn classify(self, cp: u32) -> u8 {
@@ -555,12 +808,66 @@ impl BertFlags {
     }
 }
 
+/// The normalization of one char and its pre-tokenizer class: [`WORD`],
+/// [`SPACE`], [`PUNCT`] for a char that is a word of its own, or
+/// [`GENERAL`] when the char needs the full normalizer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Mapped {
+    kind: u8,
+    len: u8,
+    bytes: [u8; MAPPED_BYTES],
+}
+
+/// Longest normalization a [`Mapped`] holds; a Hangul syllable decomposes
+/// into up to nine bytes of jamo.
+const MAPPED_BYTES: usize = 12;
+
+impl Mapped {
+    const GENERAL: Mapped = Mapped {
+        kind: GENERAL,
+        len: 0,
+        bytes: [0; MAPPED_BYTES],
+    };
+
+    fn new(kind: u8, normalized: &str) -> Option<Mapped> {
+        let mut bytes = [0; MAPPED_BYTES];
+        bytes
+            .get_mut(..normalized.len())?
+            .copy_from_slice(normalized.as_bytes());
+        Some(Mapped {
+            kind,
+            len: normalized.len() as u8,
+            bytes,
+        })
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or_default()
+    }
+}
+
 /// Normalization is the identity on the char.
 const UNCHANGED: u8 = 1;
 /// Normalization surrounds the char with spaces and leaves it unchanged.
 const PADDED: u8 = 2;
 /// Anything else, including every char outside the BMP.
 const OTHER: u8 = 0;
+
+/// Per-BMP-char [`Mapped`] normalization for one set of [`BertFlags`].
+#[derive(Clone, Copy)]
+struct CharMap(&'static [Mapped]);
+
+impl std::fmt::Debug for CharMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CharMap")
+    }
+}
+
+impl PartialEq for CharMap {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
 
 /// Per-BMP-char normalization class for one set of [`BertFlags`].
 #[derive(Clone, Copy)]
@@ -603,13 +910,22 @@ fn fixed_length_from_json(p: &PreTokenizerJson) -> Option<Option<usize>> {
 
 // --- BertPreTokenizer -------------------------------------------------------
 
-/// ASCII byte class: 0 = word, 1 = space, 2 = punctuation. Agrees with the
+const WORD: u8 = 0;
+const SPACE: u8 = 1;
+const PUNCT: u8 = 2;
+/// Byte the ASCII fast path hands to the full pipeline.
+const GENERAL: u8 = 3;
+
+/// Shortest run of fast-path bytes worth leaving the full pipeline for.
+const MIN_ASCII_RUN: usize = 32;
+
+/// ASCII byte class: [`WORD`], [`SPACE`] or [`PUNCT`]. Agrees with the
 /// rune-level predicates on every value below 0x80.
 fn ascii_class(b: u8) -> u8 {
     match b {
-        b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' => 1,
-        b'!'..=b'/' | b':'..=b'@' | b'['..=b'`' | b'{'..=b'~' => 2,
-        _ => 0,
+        b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' => SPACE,
+        b'!'..=b'/' | b':'..=b'@' | b'['..=b'`' | b'{'..=b'~' => PUNCT,
+        _ => WORD,
     }
 }
 
@@ -926,6 +1242,48 @@ mod tests {
     }
 
     /// Every (clean_text, handle_chinese_chars, strip_accents, lowercase) combination.
+    /// Every BMP char, alone, between ASCII letters, and next to combining
+    /// marks, through the whole pipeline, with a vocabulary holding every char
+    /// as a first and as a continuation piece so words split into their
+    /// normalized chars.
+    #[test]
+    fn fast_path_matches_crate_on_every_bmp_char() {
+        let chars: Vec<char> = (0x80..0x10000).filter_map(char::from_u32).collect();
+        let mut vocab = serde_json::Map::new();
+        vocab.insert("[UNK]".into(), 0.into());
+        for c in (0x20..0x7f).filter_map(char::from_u32).chain(chars.iter().copied()) {
+            for piece in [c.to_string(), format!("##{c}")] {
+                let id = vocab.len();
+                vocab.entry(piece).or_insert(id.into());
+            }
+        }
+        let mut texts = every_bmp_char();
+        texts.extend(
+            chars
+                .chunks(16)
+                .map(|c| c.iter().map(|&c| format!("ab{c}cd {c} x{c}{c}y. ")).collect()),
+        );
+        std::thread::scope(|scope| {
+            for flags in flag_combinations() {
+                let (vocab, texts) = (&vocab, &texts);
+                scope.spawn(move || {
+                    let [clean, chinese, strip, lower] = flags;
+                    let json = serde_json::json!({
+                        "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                        "normalizer": {"type": "BertNormalizer", "clean_text": clean, "handle_chinese_chars": chinese,
+                                       "strip_accents": strip, "lowercase": lower},
+                        "pre_tokenizer": {"type": "BertPreTokenizer"},
+                        "post_processor": null, "decoder": null,
+                        "model": {"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##",
+                                  "max_input_chars_per_word": 100, "vocab": vocab},
+                    });
+                    let tok = Tokenizer::from_str(&json.to_string()).expect("build tokenizer");
+                    assert_matches_crate(&tok, texts);
+                });
+            }
+        });
+    }
+
     fn flag_combinations() -> impl Iterator<Item = [bool; 4]> {
         (0..16u8).map(|m| [m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0])
     }
@@ -1157,6 +1515,26 @@ mod tests {
                 .to_vec();
             assert_eq!(ft.encode_ids(text), want, "token-id mismatch for {text:?}");
         }
+    }
+
+    #[test]
+    fn zero_max_input_chars_maps_punctuation_to_unk() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-float32/tokenizer.json"
+        );
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        json["model"]["max_input_chars_per_word"] = 0.into();
+        let tok = Tokenizer::from_str(&json.to_string()).unwrap();
+        let texts = ["!", "hello, world!", "a.b", "(x) [y] {z}", "café! 你好。", "Ünïcödé?!"].map(String::from);
+        assert!(
+            tok.encode_fast("!", false)
+                .unwrap()
+                .get_ids()
+                .iter()
+                .all(|&id| tok.id_to_token(id).as_deref() == Some("[UNK]"))
+        );
+        assert_matches_crate(&tok, &texts);
     }
 
     #[test]

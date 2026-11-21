@@ -25,6 +25,7 @@ pub const DEFAULT_MAX_LENGTH: usize = 512;
 
 thread_local! {
     static TOKEN_IDS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    static INT_SUM: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Static embedding model for Model2Vec.
@@ -43,6 +44,10 @@ struct StaticModelInner {
     dim: usize,
     /// Per-row scale applied after the token weight; set by `quantize_int8`.
     row_scales: Option<Vec<f32>>,
+    /// Per-column scale applied to the pooled sum; set by `quantize_int8`.
+    col_scales: Option<Vec<f32>>,
+    /// Per-row left shift applied in the integer sum; set by `quantize_int8`.
+    row_shifts: Option<Vec<u8>>,
     weights: Option<Cow<'static, [f32]>>,
     token_mapping: Option<Cow<'static, [usize]>>,
     normalize: bool,
@@ -537,6 +542,8 @@ impl StaticModel {
                 embeddings,
                 dim: cols,
                 row_scales: None,
+                col_scales: None,
+                row_shifts: None,
                 weights,
                 token_mapping,
                 normalize,
@@ -545,15 +552,24 @@ impl StaticModel {
         })
     }
 
-    /// Quantize the embeddings to int8 with one scale per row, storing them in
-    /// a quarter of the memory. Outputs are close to, but not bit-identical
-    /// with, those of the f32 model. Models that are already int8 are
-    /// returned unchanged.
+    /// Quantize the embeddings to int8, storing them in a quarter of the
+    /// memory. Token weights are folded into the rows, which get one scale per
+    /// column and a power-of-two scale per row, so pooling sums integers.
+    /// Models with both a token mapping and token weights keep one scale per
+    /// row instead. Outputs are close to, but not bit-identical with, those of
+    /// the f32 model. Models that are already int8 are returned unchanged.
     pub fn quantize_int8(self) -> StaticModel {
         let Embeddings::F32(table) = &self.inner.embeddings else {
             return self;
         };
-        let (data, mut scales) = quantize_rows(table, self.inner.dim);
+        let per_column = self.inner.token_mapping.is_none() || self.inner.weights.is_none();
+        let (data, scales, shifts) = if per_column {
+            let (data, scales, shifts) = quantize_columns(table, self.inner.dim, self.inner.weights.as_deref());
+            (data, scales, Some(shifts))
+        } else {
+            let (data, scales) = quantize_rows(table, self.inner.dim);
+            (data, scales, None)
+        };
         let embeddings = Embeddings::I8(Cow::Owned(data));
         let mut inner = match Arc::try_unwrap(self.inner) {
             Ok(mut inner) => {
@@ -565,19 +581,20 @@ impl StaticModel {
                 embeddings,
                 dim: shared.dim,
                 row_scales: None,
+                col_scales: None,
+                row_shifts: None,
                 weights: shared.weights.clone(),
                 token_mapping: shared.token_mapping.clone(),
                 normalize: shared.normalize,
             },
         };
-        if inner.token_mapping.is_none()
-            && let Some(weights) = inner.weights.take()
-        {
-            for (row, scale) in scales.iter_mut().enumerate() {
-                *scale *= weights.get(row).copied().unwrap_or(1.0);
-            }
+        if per_column {
+            inner.weights = None;
+            inner.col_scales = Some(scales);
+            inner.row_shifts = shifts;
+        } else {
+            inner.row_scales = Some(scales);
         }
-        inner.row_scales = Some(scales);
         StaticModel {
             inner: Arc::new(inner),
             max_length: self.max_length,
@@ -714,6 +731,15 @@ impl StaticModel {
         let ids = &ids[..max_length.map_or(ids.len(), |max_tok| max_tok.min(ids.len()))];
         let cnt = match &model.embeddings {
             Embeddings::F32(table) => self.sum_rows(table, ids, sum),
+            Embeddings::I8(table) if model.weights.is_none() && model.row_scales.is_none() => {
+                let cnt = self.sum_rows_int(table, ids, sum);
+                if let Some(col_scales) = &model.col_scales {
+                    for (s, &c) in sum.iter_mut().zip(col_scales) {
+                        *s *= c;
+                    }
+                }
+                cnt
+            }
             Embeddings::I8(table) => self.sum_rows(table, ids, sum),
         };
         let denom = cnt.max(1) as f32;
@@ -787,6 +813,113 @@ impl StaticModel {
         });
         for &(row, scale) in &pending[..n] {
             add_row(sum, row, scale);
+        }
+        cnt
+    }
+
+    /// Unweighted row sum of an int8 table, accumulated in integers, with
+    /// each row shifted left by its `row_shifts` entry.
+    fn sum_rows_int(&self, table: &[i8], ids: &[u32], out: &mut [f32]) -> usize {
+        let model = &self.inner;
+        let max_shift = model.row_shifts.as_ref().map_or(0, |_| MAX_SHIFT);
+        let per_chunk = i32::MAX as usize / (128 << max_shift);
+        let mut cnt = 0;
+        for ids in ids.chunks(per_chunk) {
+            cnt += match model.dim {
+                64 => self.sum_rows_int_fixed::<64>(table, ids, out),
+                128 => self.sum_rows_int_fixed::<128>(table, ids, out),
+                256 => self.sum_rows_int_fixed::<256>(table, ids, out),
+                384 => self.sum_rows_int_fixed::<384>(table, ids, out),
+                512 => self.sum_rows_int_fixed::<512>(table, ids, out),
+                768 => self.sum_rows_int_fixed::<768>(table, ids, out),
+                1024 => self.sum_rows_int_fixed::<1024>(table, ids, out),
+                _ => INT_SUM.with_borrow_mut(|acc| {
+                    acc.clear();
+                    acc.resize(model.dim, 0);
+                    let cnt = self.sum_rows_int_blocked(table, ids, acc);
+                    widen_add(out, acc);
+                    cnt
+                }),
+            };
+        }
+        cnt
+    }
+
+    /// Integer row sum for a compile-time embedding dimension.
+    fn sum_rows_int_fixed<const D: usize>(&self, table: &[i8], ids: &[u32], out: &mut [f32]) -> usize {
+        let mut acc = [0_i32; D];
+        let cnt = self.sum_rows_int_blocked(table, ids, &mut acc);
+        widen_add(out, &acc);
+        cnt
+    }
+
+    /// Integer row sum that adds `BLOCK` rows per pass over `acc`.
+    #[inline(always)]
+    fn sum_rows_int_blocked(&self, table: &[i8], ids: &[u32], acc: &mut [i32]) -> usize {
+        let dim = self.inner.dim;
+        let mut rows: [&[i8]; BLOCK] = [&[]; BLOCK];
+        let mut n = 0;
+        match &self.inner.row_shifts {
+            None => {
+                let cnt = self.for_each_row_index(ids, |row| {
+                    rows[n] = &table[row * dim..(row + 1) * dim];
+                    n += 1;
+                    if n == BLOCK {
+                        add_rows_int(acc, &rows);
+                        n = 0;
+                    }
+                });
+                for row in &rows[..n] {
+                    for (a, &v) in acc.iter_mut().zip(*row) {
+                        *a += i32::from(v);
+                    }
+                }
+                cnt
+            }
+            Some(row_shifts) => {
+                let mut shifts = [0_u32; BLOCK];
+                let cnt = self.for_each_row_index(ids, |row| {
+                    rows[n] = &table[row * dim..(row + 1) * dim];
+                    shifts[n] = u32::from(row_shifts[row]);
+                    n += 1;
+                    if n == BLOCK {
+                        add_rows_int_shifted(acc, &rows, &shifts);
+                        n = 0;
+                    }
+                });
+                for (row, &shift) in rows[..n].iter().zip(&shifts) {
+                    for (a, &v) in acc.iter_mut().zip(*row) {
+                        *a += i32::from(v) << shift;
+                    }
+                }
+                cnt
+            }
+        }
+    }
+
+    /// Call `f` with the embedding row index of every non-unk token; returns
+    /// the number of rows visited.
+    #[inline(always)]
+    fn for_each_row_index(&self, ids: &[u32], mut f: impl FnMut(usize)) -> usize {
+        let model = &self.inner;
+        let mut cnt = 0;
+        let tokens = ids
+            .iter()
+            .map(|&id| id as usize)
+            .filter(|&tok| Some(tok) != model.tokenizer.unk_token_id);
+        match &model.token_mapping {
+            None => {
+                for tok in tokens {
+                    f(tok);
+                    cnt += 1;
+                }
+            }
+            Some(mapping) => {
+                for tok in tokens {
+                    f(mapping.get(tok).copied().unwrap_or(tok));
+                    cnt += 1;
+                }
+            }
         }
         cnt
     }
@@ -882,6 +1015,95 @@ where
             + f32::from(r6[j]) * s6
             + f32::from(r7[j]) * s7;
     }
+}
+
+/// Largest left shift `quantize_int8` stores for a row.
+const MAX_SHIFT: u32 = 4;
+
+/// `acc += r0 + r1 + ...` over BLOCK int8 rows.
+#[inline(always)]
+fn add_rows_int(acc: &mut [i32], rows: &[&[i8]; BLOCK]) {
+    let n = acc.len();
+    let [r0, r1, r2, r3, r4, r5, r6, r7] = rows.map(|r| &r[..n]);
+    for j in 0..n {
+        let s = i16::from(r0[j])
+            + i16::from(r1[j])
+            + i16::from(r2[j])
+            + i16::from(r3[j])
+            + i16::from(r4[j])
+            + i16::from(r5[j])
+            + i16::from(r6[j])
+            + i16::from(r7[j]);
+        acc[j] += i32::from(s);
+    }
+}
+
+/// `acc += (r0 << s0) + (r1 << s1) + ...` over BLOCK int8 rows.
+#[inline(always)]
+fn add_rows_int_shifted(acc: &mut [i32], rows: &[&[i8]; BLOCK], shifts: &[u32; BLOCK]) {
+    let n = acc.len();
+    let [r0, r1, r2, r3, r4, r5, r6, r7] = rows.map(|r| &r[..n]);
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = *shifts;
+    for j in 0..n {
+        let s = (i16::from(r0[j]) << s0)
+            + (i16::from(r1[j]) << s1)
+            + (i16::from(r2[j]) << s2)
+            + (i16::from(r3[j]) << s3)
+            + (i16::from(r4[j]) << s4)
+            + (i16::from(r5[j]) << s5)
+            + (i16::from(r6[j]) << s6)
+            + (i16::from(r7[j]) << s7);
+        acc[j] += i32::from(s);
+    }
+}
+
+/// `out += acc` as f32.
+fn widen_add(out: &mut [f32], acc: &[i32]) {
+    for (o, &a) in out.iter_mut().zip(acc) {
+        *o += a as f32;
+    }
+}
+
+/// Int8 quantization of the rows times their token weights with one scale
+/// per column and a power-of-two scale per row: `x[i][j]` is stored as
+/// `q[i][j] * 2^(shift[i] - MAX_SHIFT) * col_scale[j]`, with `q` in
+/// [-127, 127] and `shift[i]` in [0, MAX_SHIFT].
+fn quantize_columns(table: &[f32], dim: usize, weights: Option<&[f32]>) -> (Vec<i8>, Vec<f32>, Vec<u8>) {
+    let dim = dim.max(1);
+    let weight = |row: usize| weights.and_then(|w| w.get(row)).copied().unwrap_or(1.0);
+    let mut col_max = vec![0.0_f32; dim];
+    for (i, row) in table.chunks_exact(dim).enumerate() {
+        let w = weight(i);
+        for (m, &v) in col_max.iter_mut().zip(row) {
+            *m = m.max((v * w).abs());
+        }
+    }
+    let unit: Vec<f32> = col_max.iter().map(|&m| m / 127.0).collect();
+    let mut data = Vec::with_capacity(table.len());
+    let mut shifts = Vec::with_capacity(table.len() / dim);
+    for (i, row) in table.chunks_exact(dim).enumerate() {
+        let w = weight(i);
+        let units = |v: f32, u: f32| if u > 0.0 { f64::from(v * w) / f64::from(u) } else { 0.0 };
+        let peak = row
+            .iter()
+            .zip(&unit)
+            .map(|(&v, &u)| units(v, u).abs())
+            .fold(0.0, f64::max);
+        let mut up = 0;
+        while up < MAX_SHIFT && peak * f64::from(1_u32 << (up + 1)) <= 127.0 {
+            up += 1;
+        }
+        let factor = f64::from(1_u32 << up);
+        data.extend(
+            row.iter()
+                .zip(&unit)
+                .map(|(&v, &u)| (units(v, u) * factor).round().clamp(-127.0, 127.0) as i8),
+        );
+        shifts.push((MAX_SHIFT - up) as u8);
+    }
+    let scale = f32::powi(2.0, -(MAX_SHIFT as i32));
+    let col_scales = unit.iter().map(|&u| u * scale).collect();
+    (data, col_scales, shifts)
 }
 
 /// Symmetric per-row int8 quantization: each row is divided by
@@ -989,6 +1211,124 @@ mod tests {
         assert!(matches!(&int8.inner.embeddings, Embeddings::I8(Cow::Owned(t)) if t.len() == 29528 * 2));
         let f32_model = StaticModel::from_pretrained(format!("{dir}/test-model-float32"), None, None, None).unwrap();
         assert!(matches!(&f32_model.inner.embeddings, Embeddings::F32(_)));
+    }
+
+    fn quantized_case(dim: usize, weights: bool, mapping: bool) -> StaticModel {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-float32/tokenizer.json"
+        );
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let vocab = tokenizer.get_vocab_size(true);
+        let mut state = 0x9E3779B97F4A7C15_u64 ^ dim as u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let rows = if mapping { 97 } else { vocab };
+        let table = (0..rows * dim)
+            .map(|i| (next() * 2.0 - 1.0) * 10f32.powi((i / dim % 5) as i32 - 3))
+            .collect();
+        let weights = weights.then(|| (0..vocab).map(|_| next() * 2.0).collect());
+        let mapping = mapping.then(|| (0..vocab).map(|_| (next() * 97.0) as usize % 97).collect());
+        StaticModel::from_owned(tokenizer, table, rows, dim, false, weights, mapping)
+            .unwrap()
+            .quantize_int8()
+    }
+
+    fn reference_int_sum(model: &StaticModel, ids: &[u32]) -> Vec<f32> {
+        let inner = &model.inner;
+        let Embeddings::I8(table) = &inner.embeddings else {
+            panic!("not int8")
+        };
+        let shifts = inner.row_shifts.as_ref().unwrap();
+        let mut acc = vec![0_i64; inner.dim];
+        let mut cnt = 0;
+        for &id in ids {
+            let tok = id as usize;
+            if Some(tok) == inner.tokenizer.unk_token_id {
+                continue;
+            }
+            let row = inner.token_mapping.as_ref().map_or(tok, |m| m[tok]);
+            for (a, &q) in acc.iter_mut().zip(&table[row * inner.dim..(row + 1) * inner.dim]) {
+                *a += i64::from(q) << shifts[row];
+            }
+            cnt += 1;
+        }
+        let scales = inner.col_scales.as_ref().unwrap();
+        acc.iter()
+            .zip(scales)
+            .map(|(&a, &c)| a as f32 * c / cnt.max(1) as f32)
+            .collect()
+    }
+
+    #[test]
+    fn integer_pooling_matches_an_exact_reference() {
+        for (dim, weights, mapping) in [
+            (64, true, false),
+            (300, false, true),
+            (256, false, false),
+            (7, true, false),
+        ] {
+            let model = quantized_case(dim, weights, mapping);
+            let inner = &model.inner;
+            assert!(inner.row_scales.is_none() && inner.weights.is_none());
+            assert!(inner.row_shifts.as_ref().unwrap().iter().any(|&s| s > 0));
+            let vocab = inner
+                .token_mapping
+                .as_ref()
+                .map_or(inner.embeddings.len() / dim, |m| m.len());
+            let unk = inner.tokenizer.unk_token_id.unwrap() as u32;
+            for len in [0, 1, 7, 8, 9, 63, 500] {
+                let ids: Vec<u32> = (0..len)
+                    .map(|i| if i % 11 == 3 { unk } else { (i * 7919 % vocab) as u32 })
+                    .collect();
+                let mut got = vec![0.0; dim];
+                model.pool_ids(&ids, None, false, &mut got);
+                let want = reference_int_sum(&model, &ids);
+                let same = got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits());
+                assert!(same, "dim={dim} weights={weights} mapping={mapping} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn integer_pooling_does_not_overflow_on_long_inputs() {
+        let model = quantized_case(64, false, false);
+        let inner = &model.inner;
+        let Embeddings::I8(table) = &inner.embeddings else {
+            panic!("not int8")
+        };
+        let shifts = inner.row_shifts.as_ref().unwrap();
+        let row = (0..inner.embeddings.len() / 64)
+            .find(|&r| shifts[r] == super::MAX_SHIFT as u8 && Some(r) != inner.tokenizer.unk_token_id)
+            .unwrap();
+        let ids = vec![row as u32; 3 << 20];
+        let mut got = vec![0.0; 64];
+        model.pool_ids(&ids, None, false, &mut got);
+        let scales = inner.col_scales.as_ref().unwrap();
+        for j in 0..64 {
+            let want = f64::from(table[row * 64 + j]) * 16.0 * f64::from(scales[j]);
+            assert!((f64::from(got[j]) - want).abs() <= want.abs() * 1e-5, "column {j}");
+        }
+    }
+
+    #[test]
+    fn integer_pooling_handles_minus_128_on_long_inputs() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-float32/tokenizer.json"
+        );
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let rows = tokenizer.get_vocab_size(true);
+        let model = StaticModel::from_owned_i8(tokenizer, vec![-128; rows * 2], rows, 2, false, None, None).unwrap();
+        let unk = model.inner.tokenizer.unk_token_id;
+        let tok = (0..rows).find(|&t| Some(t) != unk).unwrap() as u32;
+        let mut got = vec![0.0; 2];
+        model.pool_ids(&vec![tok; (1 << 24) + 1], None, false, &mut got);
+        assert!(got.iter().all(|&x| (x + 128.0).abs() < 1e-3), "{got:?}");
     }
 
     #[test]
