@@ -3,8 +3,8 @@
 //! `encode_batch_fast` builds full `Encoding` objects (offsets, alignment,
 //! masks, type IDs) of which the static-embedding path uses only `get_ids()`.
 //! This module implements just the forward text -> IDs mapping for the
-//! BertNormalizer + BertPreTokenizer + WordPiece pipeline shared by every
-//! non-multilingual POTION model, producing token IDs identical to the
+//! BertNormalizer + BertPreTokenizer (optionally followed by FixedLength) +
+//! WordPiece pipeline, producing token IDs identical to the
 //! `tokenizers` crate (verified by the parity test below).
 //!
 //! Literal added-token text (e.g. `[MASK]`, `[CLS]`) is matched and resolved
@@ -15,7 +15,7 @@
 //! [`FastWordPiece::from_tokenizer`] so the caller falls back to the crate.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -66,6 +66,8 @@ struct NormalizerJson {
 struct PreTokenizerJson {
     #[serde(rename = "type")]
     kind: String,
+    pretokenizers: Option<Vec<PreTokenizerJson>>,
+    length: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -96,10 +98,12 @@ pub(crate) struct FastWordPiece {
     handle_chinese_chars: bool,
     strip_accents: bool,
     lowercase: bool,
+    /// Split every pre-tokenized word into chunks of this many chars, like
+    /// HuggingFace's `FixedLength` pre-tokenizer after `BertPreTokenizer`.
+    fixed_length: Option<usize>,
     /// Added tokens matched as literal substrings of the raw text before
-    /// normalization, longest content first so a shorter token cannot shadow
-    /// a longer one with the same prefix.
-    added_tokens: Vec<(String, u32)>,
+    /// normalization, longest match first.
+    added_tokens: DoubleArrayTrie,
     /// First byte of every added token, so the scan skips byte positions
     /// that cannot start a match with one array lookup.
     added_token_first_bytes: [bool; 256],
@@ -113,9 +117,18 @@ impl FastWordPiece {
         let ModelWrapper::WordPiece(model) = tok.get_model() else {
             return None;
         };
-        if !matches!(tok.get_pre_tokenizer(), Some(PreTokenizerWrapper::BertPreTokenizer(_))) {
-            return None;
-        }
+        let fixed_length = match tok.get_pre_tokenizer()? {
+            PreTokenizerWrapper::BertPreTokenizer(_) => None,
+            PreTokenizerWrapper::Sequence(seq) => match seq.as_ref() {
+                [PreTokenizerWrapper::BertPreTokenizer(_)] => None,
+                [
+                    PreTokenizerWrapper::BertPreTokenizer(_),
+                    PreTokenizerWrapper::FixedLength(f),
+                ] if f.length > 0 => Some(f.length),
+                _ => return None,
+            },
+            _ => return None,
+        };
         let Some(NormalizerWrapper::BertNormalizer(norm)) = tok.get_normalizer() else {
             return None;
         };
@@ -143,6 +156,7 @@ impl FastWordPiece {
             // `strip_accents: None` follows the lowercase setting, matching HuggingFace.
             norm.strip_accents.unwrap_or(norm.lowercase),
             norm.lowercase,
+            fixed_length,
             added_tokens,
         ))
     }
@@ -150,15 +164,16 @@ impl FastWordPiece {
     /// Build straight from `tokenizer.json` bytes without constructing a
     /// [`Tokenizer`]. Returns the tokenizer and the median token length, or
     /// `None` for another pipeline, a missing field, an unk token outside the
-    /// vocab, or added tokens that are duplicated, absent from the vocab, or
-    /// use matching flags not implemented here. Only the fields read here are
+    /// vocab, or added tokens that are duplicated or use matching flags not
+    /// implemented here. Only the fields read here are
     /// validated, so JSON the crate would reject elsewhere may still load.
     pub(crate) fn from_json(bytes: &[u8]) -> Option<(FastWordPiece, usize)> {
         let json: TokenizerJson = serde_json::from_slice(bytes).ok()?;
         let model = json.model;
-        if model.kind.as_deref() != Some("WordPiece") || json.pre_tokenizer?.kind != "BertPreTokenizer" {
+        if model.kind.as_deref() != Some("WordPiece") {
             return None;
         }
+        let fixed_length = fixed_length_from_json(&json.pre_tokenizer?)?;
         let norm = json.normalizer?;
         if norm.kind != "BertNormalizer" {
             return None;
@@ -168,18 +183,28 @@ impl FastWordPiece {
         let vocab: HashMap<String, u32> = serde_json::from_str(model.vocab?.get()).ok()?;
         let unk_id = *vocab.get(&model.unk_token?)?;
 
-        // The crate gives an added token that is already in the vocab its
-        // vocab id, so with every added token in the vocab the vocab with
-        // added tokens equals the model vocab.
+        // IDs follow `AddedVocabulary::add_tokens`: an added token in the vocab
+        // keeps its vocab id; any other gets the vocab size, or one past the
+        // largest added id once that reaches the vocab size.
+        let vocab_size = vocab.len() as u32;
         let mut added_tokens: Vec<(String, u32)> = Vec::with_capacity(json.added_tokens.len());
+        let mut seen = HashSet::with_capacity(json.added_tokens.len());
+        let mut max_added: Option<u32> = None;
         for t in json.added_tokens {
             if t.content.is_empty() || t.normalized || t.single_word || t.lstrip || t.rstrip {
                 return None;
             }
-            if added_tokens.iter().any(|(content, _)| *content == t.content) {
+            if !seen.insert(t.content.clone()) {
                 return None;
             }
-            let id = *vocab.get(&t.content)?;
+            let id = match vocab.get(&t.content) {
+                Some(&id) => id,
+                None => match max_added {
+                    Some(max) if max >= vocab_size || vocab_size == 0 => max.checked_add(1)?,
+                    _ => vocab_size,
+                },
+            };
+            max_added = Some(max_added.map_or(id, |max| max.max(id)));
             added_tokens.push((t.content, id));
         }
 
@@ -193,6 +218,7 @@ impl FastWordPiece {
             norm.handle_chinese_chars?,
             norm.strip_accents.unwrap_or(lowercase),
             lowercase,
+            fixed_length,
             added_tokens,
         );
         Some((ft, median))
@@ -208,13 +234,14 @@ impl FastWordPiece {
         handle_chinese_chars: bool,
         strip_accents: bool,
         lowercase: bool,
-        mut added_tokens: Vec<(String, u32)>,
+        fixed_length: Option<usize>,
+        added_tokens: Vec<(String, u32)>,
     ) -> FastWordPiece {
-        added_tokens.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         let mut added_token_first_bytes = [false; 256];
         for (content, _) in &added_tokens {
             added_token_first_bytes[content.as_bytes()[0] as usize] = true;
         }
+        let added_tokens = DoubleArrayTrie::build(added_tokens.iter().map(|(k, id)| (k.as_bytes(), *id)).collect());
 
         let mut single_byte = [-1_i32; 128];
         for (b, slot) in single_byte.iter_mut().enumerate() {
@@ -236,6 +263,7 @@ impl FastWordPiece {
             handle_chinese_chars,
             strip_accents,
             lowercase,
+            fixed_length,
             added_tokens,
             added_token_first_bytes,
         }
@@ -267,17 +295,13 @@ impl FastWordPiece {
         let mut i = 0;
         while i < text.len() {
             let hit = self.added_token_first_bytes[bytes[i] as usize]
-                .then(|| {
-                    self.added_tokens
-                        .iter()
-                        .find(|(content, _)| text[i..].starts_with(content.as_str()))
-                })
+                .then(|| self.added_tokens.longest_prefix(0, &bytes[i..]))
                 .flatten();
             match hit {
-                Some((content, id)) => {
+                Some((id, len)) => {
                     self.encode_span(&text[start..i], out, scratch);
-                    out.push(*id);
-                    i += content.len();
+                    out.push(id);
+                    i += len;
                     start = i;
                 }
                 // Added tokens are valid UTF-8, so a match can only start on
@@ -295,7 +319,22 @@ impl FastWordPiece {
         }
         normalized.clear();
         self.normalize_into(span, normalized);
-        pre_tokenize(normalized, |word| self.word_to_ids(word, out));
+        match self.fixed_length {
+            None => pre_tokenize(normalized, |word| self.word_to_ids(word, out)),
+            Some(n) => pre_tokenize(normalized, |word| self.chunks_to_ids(word, n, out)),
+        }
+    }
+
+    /// WordPiece `word` in chunks of at most `n` chars.
+    fn chunks_to_ids(&self, mut word: &str, n: usize, out: &mut Vec<u32>) {
+        while word.len() > n {
+            let Some((end, _)) = word.char_indices().nth(n) else {
+                break;
+            };
+            self.word_to_ids(&word[..end], out);
+            word = &word[end..];
+        }
+        self.word_to_ids(word, out);
     }
 
     // --- WordPiece ---------------------------------------------------------
@@ -420,7 +459,36 @@ impl FastWordPiece {
         [Some(c), None, None]
     }
 
+    /// Splits `input` into runs of [`is_plain_ideograph`] chars, which every
+    /// normalization step leaves unchanged, and runs of everything else.
+    /// Splitting before or after a starter without decomposition does not
+    /// change NFD.
     fn normalize_unicode(&self, input: &str, out: &mut String) {
+        let mut rest = input;
+        while !rest.is_empty() {
+            let plain = rest.chars().next().is_some_and(is_plain_ideograph);
+            let end = rest
+                .char_indices()
+                .find(|&(_, c)| is_plain_ideograph(c) != plain)
+                .map_or(rest.len(), |(i, _)| i);
+            let (run, tail) = rest.split_at(end);
+            if !plain {
+                self.normalize_other(run, out);
+            } else if self.handle_chinese_chars {
+                out.reserve(run.len() * 3);
+                for c in run.chars() {
+                    out.push(' ');
+                    out.push(c);
+                    out.push(' ');
+                }
+            } else {
+                out.push_str(run);
+            }
+            rest = tail;
+        }
+    }
+
+    fn normalize_other(&self, input: &str, out: &mut String) {
         let staged = input.chars().flat_map(|c| self.stage(c).into_iter().flatten());
         if self.strip_accents {
             // NFD, drop nonspacing marks, then (optionally) lowercase; left
@@ -440,6 +508,22 @@ impl FastWordPiece {
         } else {
             out.extend(staged);
         }
+    }
+}
+
+/// `Some(fixed_length)` for `BertPreTokenizer`, optionally followed by
+/// `FixedLength` in a `Sequence`; `None` for any other pre-tokenizer.
+fn fixed_length_from_json(p: &PreTokenizerJson) -> Option<Option<usize>> {
+    match (p.kind.as_str(), p.pretokenizers.as_deref()) {
+        ("BertPreTokenizer", _) => Some(None),
+        ("Sequence", Some([bert])) if bert.kind == "BertPreTokenizer" => Some(None),
+        ("Sequence", Some([bert, fixed])) if bert.kind == "BertPreTokenizer" && fixed.kind == "FixedLength" => {
+            match fixed.length.unwrap_or(5) {
+                0 => None,
+                n => Some(Some(n)),
+            }
+        }
+        _ => None,
     }
 }
 
@@ -466,7 +550,9 @@ fn pre_tokenize<'a>(s: &'a str, mut emit: impl FnMut(&'a str)) {
             (ascii_class(bytes[i]), 1)
         } else {
             let c = s[i..].chars().next().unwrap();
-            let class = if c.is_whitespace() {
+            let class = if is_plain_ideograph(c) {
+                0
+            } else if c.is_whitespace() {
                 1
             } else if c.is_ascii_punctuation() || c.is_punctuation() {
                 2
@@ -518,6 +604,13 @@ fn is_control(c: char) -> bool {
         '\t' | '\n' | '\r' => false,
         _ => c.is_other(),
     }
+}
+
+/// CJK ideographs assigned since Unicode 3.0: letters (`Lo`) with no case
+/// mapping or decomposition, so cleaning, accent stripping, lowercasing and
+/// punctuation splitting all leave them alone.
+fn is_plain_ideograph(c: char) -> bool {
+    matches!(c as u32, 0x3400..=0x4DB5 | 0x4E00..=0x9FA5)
 }
 
 fn is_chinese_char(c: char) -> bool {
@@ -582,11 +675,13 @@ mod tests {
             "Ab\u{00C0}\u{0007}C\td\u{3000}E\u{00A0}f", // controls/NBSP/ideographic space between runs
             "ÉCOLE\nÜBER\r\nСЛОВО 東京Tokyo",
             // --- CJK / handle_chinese_chars boundaries and non-CJK scripts ---
-            "一鿿㐀䶿",                       // BMP CJK range endpoints
-            "𠀀 𪛖 豈",                       // ext-B (U+20000) + compatibility (U+F900)
-            "你好world世界",                  // CJK adjacent to latin, no spaces
-            "，。、！？；：",                 // fullwidth/CJK punctuation (category Po → isolate)
-            "こんにちは カタカナ 안녕하세요", // kana + hangul: must NOT be space-wrapped
+            "一鿿㐀䶿",                                          // BMP CJK range endpoints
+            "\u{9FA5}\u{9FA6}\u{4DB5}\u{4DB6}\u{33FF}\u{4DFF}",  // plain-ideograph range edges
+            "字\u{0301}字\u{0323}\u{0301}é字ÀB字\u{3000}字，字", // marks, accents, spaces, punctuation next to ideographs
+            "𠀀 𪛖 豈",                                          // ext-B (U+20000) + compatibility (U+F900)
+            "你好world世界",                                     // CJK adjacent to latin, no spaces
+            "，。、！？；：",                                    // fullwidth/CJK punctuation (category Po → isolate)
+            "こんにちは カタカナ 안녕하세요",                    // kana + hangul: must NOT be space-wrapped
             // --- punctuation isolation: ASCII vs Unicode P vs Unicode symbol ---
             "a≤b x→y n≠m", // Sm math symbols: NOT punctuation → stay in word
             "«guillemets» \u{201c}smart\u{201d} \u{2018}quotes\u{2019}", // Pi/Pf → isolate
@@ -650,6 +745,103 @@ mod tests {
         }
     }
 
+    fn with_fixed_length(json: &mut serde_json::Value, length: serde_json::Value) {
+        let mut fixed = serde_json::json!({"type": "FixedLength"});
+        if !length.is_null() {
+            fixed["length"] = length;
+        }
+        json["pre_tokenizer"] = serde_json::json!({
+            "type": "Sequence",
+            "pretokenizers": [{"type": "BertPreTokenizer"}, fixed],
+        });
+    }
+
+    #[test]
+    fn fixed_length_matches_crate() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let base: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut texts: Vec<String> = corpus().into_iter().map(String::from).collect();
+        texts.extend(noise(500));
+        for length in [serde_json::Value::Null, 1.into(), 3.into(), 7.into(), 100.into()] {
+            let mut json = base.clone();
+            with_fixed_length(&mut json, length);
+            let json = json.to_string();
+            let mut tok = Tokenizer::from_str(&json).expect("build tokenizer");
+            assert_matches_crate(&tok, &texts);
+            assert_json_matches_tokenizer(json.as_bytes());
+            tok.add_tokens(&[
+                tokenizers::AddedToken::from("你好", false).normalized(false),
+                tokenizers::AddedToken::from("你好世", false).normalized(false),
+                tokenizers::AddedToken::from("世界", false).normalized(false),
+            ]);
+            assert!(FastWordPiece::from_tokenizer(&tok).is_some());
+            assert_matches_crate(&tok, &texts);
+        }
+    }
+
+    #[test]
+    fn from_json_assigns_added_token_ids_like_crate() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let added = json["added_tokens"].as_array_mut().unwrap();
+        let in_vocab = added[0].clone();
+        added.clear();
+        for (i, content) in ["zzqx", "", "你好", "", "你好世", "qqq"].into_iter().enumerate() {
+            let mut t = in_vocab.clone();
+            if !content.is_empty() {
+                t["content"] = content.into();
+                t["special"] = (i % 2 == 0).into();
+            }
+            t["id"] = 0.into();
+            added.push(t);
+        }
+        added.remove(3);
+        let bytes = json.to_string();
+        assert_json_matches_tokenizer(bytes.as_bytes());
+        let tok = Tokenizer::from_str(&bytes).expect("build tokenizer");
+        let texts: Vec<String> = ["zzqx 你好世界 qqq", "你好世 [UNK] zzqxqqq"].map(String::from).into();
+        assert_matches_crate(&tok, &texts);
+    }
+
+    #[test]
+    fn from_json_declines_other_sequences() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let declines = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut json = json.clone();
+            edit(&mut json);
+            let bytes = json.to_string();
+            let tok = Tokenizer::from_str(&bytes).expect("build tokenizer");
+            let declined = FastWordPiece::from_json(bytes.as_bytes()).is_none();
+            assert_eq!(declined, FastWordPiece::from_tokenizer(&tok).is_none());
+            declined
+        };
+        assert!(!declines(&|j| with_fixed_length(j, 4.into())));
+        assert!(declines(&|j| with_fixed_length(j, 0.into())));
+        assert!(!declines(&|j| {
+            j["pre_tokenizer"] =
+                serde_json::json!({"type": "Sequence", "pretokenizers": [{"type": "BertPreTokenizer"}]});
+        }));
+        assert!(declines(&|j| {
+            j["pre_tokenizer"] = serde_json::json!({"type": "Sequence", "pretokenizers": [
+                {"type": "FixedLength", "length": 4}, {"type": "BertPreTokenizer"}]});
+        }));
+        assert!(declines(&|j| {
+            j["pre_tokenizer"] = serde_json::json!({"type": "Sequence", "pretokenizers": [
+                {"type": "BertPreTokenizer"}, {"type": "FixedLength", "length": 4},
+                {"type": "FixedLength", "length": 2}]});
+        }));
+    }
+
     /// Every (clean_text, handle_chinese_chars, strip_accents, lowercase) combination.
     fn flag_combinations() -> impl Iterator<Item = [bool; 4]> {
         (0..16u8).map(|m| [m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0])
@@ -657,7 +849,18 @@ mod tests {
 
     fn normalizer_with([clean, chinese, strip, lower]: [bool; 4]) -> FastWordPiece {
         let vocab = HashMap::from([("[UNK]".to_string(), 0)]);
-        FastWordPiece::assemble(&vocab, "##", Some(0), 100, clean, chinese, strip, lower, Vec::new())
+        FastWordPiece::assemble(
+            &vocab,
+            "##",
+            Some(0),
+            100,
+            clean,
+            chinese,
+            strip,
+            lower,
+            None,
+            Vec::new(),
+        )
     }
 
     fn fast_normalized(ft: &FastWordPiece, text: &str) -> String {
@@ -871,6 +1074,19 @@ mod tests {
             assert_matches_crate(&tok, &texts);
             assert_json_matches_tokenizer(&std::fs::read(&path).expect("read cached tokenizer"));
         }
+        let Some(path) = cache
+            .model("minishlab/blink-multilingual-64M".to_string())
+            .get("tokenizer.json")
+        else {
+            eprintln!("skipped: minishlab/blink-multilingual-64M is not in the local cache");
+            return;
+        };
+        let tok = Tokenizer::from_file(&path).expect("load cached tokenizer");
+        assert_json_matches_tokenizer(&std::fs::read(&path).expect("read cached tokenizer"));
+        texts.extend(["一个可以使用的模型", "军队回答日至成分合并或是运营多年皇家免费"].map(String::from));
+        texts.push("字".repeat(250));
+        texts.push("a".repeat(250));
+        assert_matches_crate(&tok, &texts);
     }
 
     /// `from_json` must build exactly what `from_tokenizer` builds from the
@@ -906,7 +1122,6 @@ mod tests {
         };
         assert!(!declines(&|_| {}));
         assert!(declines(&|j| j["added_tokens"][0]["normalized"] = true.into()));
-        assert!(declines(&|j| j["added_tokens"][0]["content"] = "[NOT IN VOCAB]".into()));
         assert!(declines(&|j| {
             let first = j["added_tokens"][0].clone();
             j["added_tokens"].as_array_mut().unwrap().push(first);
