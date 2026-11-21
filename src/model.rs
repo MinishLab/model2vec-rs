@@ -822,7 +822,7 @@ impl StaticModel {
     fn sum_rows_int(&self, table: &[i8], ids: &[u32], out: &mut [f32]) -> usize {
         let model = &self.inner;
         let max_shift = model.row_shifts.as_ref().map_or(0, |_| MAX_SHIFT);
-        let per_chunk = (i32::MAX as usize / (127 << max_shift)).max(1);
+        let per_chunk = i32::MAX as usize / (128 << max_shift);
         let mut cnt = 0;
         for ids in ids.chunks(per_chunk) {
             cnt += match model.dim {
@@ -1313,6 +1313,22 @@ mod tests {
             let want = f64::from(table[row * 64 + j]) * 16.0 * f64::from(scales[j]);
             assert!((f64::from(got[j]) - want).abs() <= want.abs() * 1e-5, "column {j}");
         }
+    }
+
+    #[test]
+    fn integer_pooling_handles_minus_128_on_long_inputs() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-float32/tokenizer.json"
+        );
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let rows = tokenizer.get_vocab_size(true);
+        let model = StaticModel::from_owned_i8(tokenizer, vec![-128; rows * 2], rows, 2, false, None, None).unwrap();
+        let unk = model.inner.tokenizer.unk_token_id;
+        let tok = (0..rows).find(|&t| Some(t) != unk).unwrap() as u32;
+        let mut got = vec![0.0; 2];
+        model.pool_ids(&vec![tok; (1 << 24) + 1], None, false, &mut got);
+        assert!(got.iter().all(|&x| (x + 128.0).abs() < 1e-3), "{got:?}");
     }
 
     #[test]

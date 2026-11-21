@@ -393,10 +393,7 @@ impl FastWordPiece {
                     continue;
                 }
                 PUNCT => {
-                    match self.single_byte[b as usize] {
-                        id if id >= 0 => out.push(id as u32),
-                        _ => self.push_unk(out),
-                    }
+                    self.word_to_ids(&span[i..i + 1], out);
                     i += 1;
                     continue;
                 }
@@ -1518,6 +1515,26 @@ mod tests {
                 .to_vec();
             assert_eq!(ft.encode_ids(text), want, "token-id mismatch for {text:?}");
         }
+    }
+
+    #[test]
+    fn zero_max_input_chars_maps_punctuation_to_unk() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-float32/tokenizer.json"
+        );
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        json["model"]["max_input_chars_per_word"] = 0.into();
+        let tok = Tokenizer::from_str(&json.to_string()).unwrap();
+        let texts = ["!", "hello, world!", "a.b", "(x) [y] {z}", "café! 你好。", "Ünïcödé?!"].map(String::from);
+        assert!(
+            tok.encode_fast("!", false)
+                .unwrap()
+                .get_ids()
+                .iter()
+                .all(|&id| tok.id_to_token(id).as_deref() == Some("[UNK]"))
+        );
+        assert_matches_crate(&tok, &texts);
     }
 
     #[test]
