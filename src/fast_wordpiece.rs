@@ -16,6 +16,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -23,7 +24,8 @@ use tokenizers::{
     Tokenizer, models::ModelWrapper, normalizers::NormalizerWrapper, pre_tokenizers::PreTokenizerWrapper,
 };
 use unicode_categories::UnicodeCategories;
-use unicode_normalization::UnicodeNormalization;
+use unicode_normalization_alignments::UnicodeNormalization;
+use unicode_normalization_alignments::char::canonical_combining_class;
 
 use crate::model::median_token_length;
 use crate::trie::{DoubleArrayTrie, NONE};
@@ -93,11 +95,9 @@ pub(crate) struct FastWordPiece {
     single_byte: [i32; 128],
     unk_id: Option<u32>,
     max_input_chars_per_word: usize,
-    // BertNormalizer settings
-    clean_text: bool,
-    handle_chinese_chars: bool,
-    strip_accents: bool,
-    lowercase: bool,
+    norm: BertFlags,
+    /// Normalization class of every BMP char under `norm`.
+    classes: CharClasses,
     /// Split every pre-tokenized word into chunks of this many chars, like
     /// HuggingFace's `FixedLength` pre-tokenizer after `BertPreTokenizer`.
     fixed_length: Option<usize>,
@@ -253,16 +253,20 @@ impl FastWordPiece {
         let vocab = DoubleArrayTrie::build(vocab.iter().map(|(k, &id)| (k.as_bytes(), id)).collect());
         let continuation = vocab.walk(continuing_subword_prefix.as_bytes());
 
+        let norm = BertFlags {
+            clean_text,
+            handle_chinese_chars,
+            strip_accents,
+            lowercase,
+        };
         FastWordPiece {
             vocab,
             continuation,
             single_byte,
             unk_id,
             max_input_chars_per_word,
-            clean_text,
-            handle_chinese_chars,
-            strip_accents,
-            lowercase,
+            norm,
+            classes: norm.char_classes(),
             fixed_length,
             added_tokens,
             added_token_first_bytes,
@@ -395,7 +399,7 @@ impl FastWordPiece {
     /// pre-tokenization drops it anyway.
     fn normalize_into(&self, input: &str, out: &mut String) {
         if input.is_ascii() {
-            self.normalize_ascii(input, out)
+            self.norm.normalize_ascii(input, out)
         } else {
             self.normalize_mixed(input, out)
         }
@@ -415,7 +419,7 @@ impl FastWordPiece {
                 .map_or(bytes.len(), |n| start + n);
             let run = &input[start..end];
             if plain {
-                self.normalize_ascii(run, out);
+                self.norm.normalize_ascii(run, out);
             } else {
                 self.normalize_unicode(run, out);
             }
@@ -423,6 +427,45 @@ impl FastWordPiece {
         }
     }
 
+    /// Normalize non-ASCII text in runs of one [`CharClasses`] class. Runs
+    /// split only before or after a starter that NFD leaves unchanged, which
+    /// does not change NFD's canonical reordering.
+    fn normalize_unicode(&self, input: &str, out: &mut String) {
+        let mut rest = input;
+        while let Some(first) = rest.chars().next() {
+            let class = self.classes.get(first);
+            let end = rest
+                .char_indices()
+                .find(|&(_, c)| self.classes.get(c) != class)
+                .map_or(rest.len(), |(i, _)| i);
+            let (run, tail) = rest.split_at(end);
+            match class {
+                UNCHANGED => out.push_str(run),
+                PADDED => {
+                    out.reserve(run.len() * 3);
+                    for c in run.chars() {
+                        out.push(' ');
+                        out.push(c);
+                        out.push(' ');
+                    }
+                }
+                _ => self.norm.normalize_other(run, out),
+            }
+            rest = tail;
+        }
+    }
+}
+
+/// BertNormalizer settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BertFlags {
+    clean_text: bool,
+    handle_chinese_chars: bool,
+    strip_accents: bool,
+    lowercase: bool,
+}
+
+impl BertFlags {
     /// Fused clean + lowercase over ASCII bytes. Accent stripping (NFD is
     /// identity below 0x80) and Chinese handling are no-ops for ASCII.
     fn normalize_ascii(&self, input: &str, out: &mut String) {
@@ -459,41 +502,12 @@ impl FastWordPiece {
         [Some(c), None, None]
     }
 
-    /// Splits `input` into runs of [`is_plain_ideograph`] chars, which every
-    /// normalization step leaves unchanged, and runs of everything else.
-    /// Splitting before or after a starter without decomposition does not
-    /// change NFD.
-    fn normalize_unicode(&self, input: &str, out: &mut String) {
-        let mut rest = input;
-        while !rest.is_empty() {
-            let plain = rest.chars().next().is_some_and(is_plain_ideograph);
-            let end = rest
-                .char_indices()
-                .find(|&(_, c)| is_plain_ideograph(c) != plain)
-                .map_or(rest.len(), |(i, _)| i);
-            let (run, tail) = rest.split_at(end);
-            if !plain {
-                self.normalize_other(run, out);
-            } else if self.handle_chinese_chars {
-                out.reserve(run.len() * 3);
-                for c in run.chars() {
-                    out.push(' ');
-                    out.push(c);
-                    out.push(' ');
-                }
-            } else {
-                out.push_str(run);
-            }
-            rest = tail;
-        }
-    }
-
     fn normalize_other(&self, input: &str, out: &mut String) {
         let staged = input.chars().flat_map(|c| self.stage(c).into_iter().flatten());
         if self.strip_accents {
             // NFD, drop nonspacing marks, then (optionally) lowercase; left
             // decomposed, matching HuggingFace.
-            for c in staged.nfd() {
+            for (c, _) in staged.nfd() {
                 if c.is_mark_nonspacing() {
                     continue;
                 }
@@ -508,6 +522,66 @@ impl FastWordPiece {
         } else {
             out.extend(staged);
         }
+    }
+
+    /// The shared [`CharClasses`] table for these flags, built on first use.
+    fn char_classes(self) -> CharClasses {
+        static TABLES: [OnceLock<Box<[u8]>>; 16] = [const { OnceLock::new() }; 16];
+        let index = self.clean_text as usize
+            | (self.handle_chinese_chars as usize) << 1
+            | (self.strip_accents as usize) << 2
+            | (self.lowercase as usize) << 3;
+        CharClasses(TABLES[index].get_or_init(|| (0..0x10000).map(|cp| self.classify(cp)).collect()))
+    }
+
+    fn classify(self, cp: u32) -> u8 {
+        let Some(c) = char::from_u32(cp) else {
+            return OTHER;
+        };
+        if self.strip_accents
+            && (canonical_combining_class(c) != 0 || std::iter::once(c).nfd().map(|(c, _)| c).ne(std::iter::once(c)))
+        {
+            return OTHER;
+        }
+        let mut buf = [0; 4];
+        let mut out = String::new();
+        self.normalize_other(c.encode_utf8(&mut buf), &mut out);
+        let mut chars = out.chars();
+        match (chars.next(), chars.next(), chars.next(), chars.next()) {
+            (Some(a), None, _, _) if a == c => UNCHANGED,
+            (Some(' '), Some(b), Some(' '), None) if b == c => PADDED,
+            _ => OTHER,
+        }
+    }
+}
+
+/// Normalization is the identity on the char.
+const UNCHANGED: u8 = 1;
+/// Normalization surrounds the char with spaces and leaves it unchanged.
+const PADDED: u8 = 2;
+/// Anything else, including every char outside the BMP.
+const OTHER: u8 = 0;
+
+/// Per-BMP-char normalization class for one set of [`BertFlags`].
+#[derive(Clone, Copy)]
+struct CharClasses(&'static [u8]);
+
+impl CharClasses {
+    #[inline]
+    fn get(self, c: char) -> u8 {
+        self.0.get(c as usize).copied().unwrap_or(OTHER)
+    }
+}
+
+impl std::fmt::Debug for CharClasses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CharClasses")
+    }
+}
+
+impl PartialEq for CharClasses {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
     }
 }
 
@@ -539,6 +613,27 @@ fn ascii_class(b: u8) -> u8 {
     }
 }
 
+/// Pre-tokenizer class of a char, with the same values as [`ascii_class`].
+fn char_class(c: char) -> u8 {
+    if c.is_whitespace() {
+        1
+    } else if c.is_ascii_punctuation() || c.is_punctuation() {
+        2
+    } else {
+        0
+    }
+}
+
+/// [`char_class`] of every BMP char, built on first use.
+fn pre_tokenizer_classes() -> &'static [u8] {
+    static TABLE: OnceLock<Box<[u8]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..0x10000)
+            .map(|cp| char::from_u32(cp).map_or(0, char_class))
+            .collect()
+    })
+}
+
 /// Split like HuggingFace's BertPreTokenizer: drop whitespace, isolate each
 /// punctuation char as its own word, and call `emit` on each word in order.
 fn pre_tokenize<'a>(s: &'a str, mut emit: impl FnMut(&'a str)) {
@@ -550,14 +645,9 @@ fn pre_tokenize<'a>(s: &'a str, mut emit: impl FnMut(&'a str)) {
             (ascii_class(bytes[i]), 1)
         } else {
             let c = s[i..].chars().next().unwrap();
-            let class = if is_plain_ideograph(c) {
-                0
-            } else if c.is_whitespace() {
-                1
-            } else if c.is_ascii_punctuation() || c.is_punctuation() {
-                2
-            } else {
-                0
+            let class = match pre_tokenizer_classes().get(c as usize) {
+                Some(&class) => class,
+                None => char_class(c),
             };
             (class, c.len_utf8())
         };
@@ -604,13 +694,6 @@ fn is_control(c: char) -> bool {
         '\t' | '\n' | '\r' => false,
         _ => c.is_other(),
     }
-}
-
-/// CJK ideographs assigned since Unicode 3.0: letters (`Lo`) with no case
-/// mapping or decomposition, so cleaning, accent stripping, lowercasing and
-/// punctuation splitting all leave them alone.
-fn is_plain_ideograph(c: char) -> bool {
-    matches!(c as u32, 0x3400..=0x4DB5 | 0x4E00..=0x9FA5)
 }
 
 fn is_chinese_char(c: char) -> bool {
@@ -947,6 +1030,52 @@ mod tests {
                     "normalized-text mismatch for {text:?} with [clean, chinese, strip, lower] = {flags:?}"
                 );
             }
+        }
+    }
+
+    /// Every BMP char in runs of 64, each char also between combining marks
+    /// of different classes and next to a CJK ideograph.
+    fn every_bmp_char() -> Vec<String> {
+        let chars: Vec<char> = (0..0x10000).filter_map(char::from_u32).collect();
+        let mut texts: Vec<String> = chars.chunks(64).map(|c| c.iter().collect()).collect();
+        texts.extend(chars.chunks(16).map(|c| {
+            c.iter()
+                .map(|&c| format!("a\u{0323}{c}\u{0301}\u{0323}字{c}字\u{1D165}"))
+                .collect()
+        }));
+        texts
+    }
+
+    #[test]
+    fn normalize_matches_crate_on_every_bmp_char() {
+        let texts = every_bmp_char();
+        for flags in flag_combinations() {
+            let ft = normalizer_with(flags);
+            for text in &texts {
+                assert_eq!(
+                    fast_normalized(&ft, text),
+                    crate_normalized(flags, text),
+                    "normalized-text mismatch for {text:?} with [clean, chinese, strip, lower] = {flags:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pre_tokenize_matches_crate_on_every_bmp_char() {
+        use tokenizers::pre_tokenizers::bert::BertPreTokenizer;
+        use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
+        for text in every_bmp_char() {
+            let mut pre = PreTokenizedString::from(text.as_str());
+            BertPreTokenizer.pre_tokenize(&mut pre).unwrap();
+            let want: Vec<String> = pre
+                .get_splits(OffsetReferential::Original, OffsetType::Byte)
+                .into_iter()
+                .map(|(s, _, _)| s.to_string())
+                .collect();
+            let mut got = Vec::new();
+            pre_tokenize(&text, |w| got.push(w.to_string()));
+            assert_eq!(got, want, "pre-tokenization mismatch for {text:?}");
         }
     }
 
