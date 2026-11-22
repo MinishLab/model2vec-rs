@@ -42,7 +42,7 @@ embeddings = np.load("embeddings.npy")  # float32 or int8, shape (rows, dim)
 model = StaticModel.from_arrays(tokenizer, embeddings, normalize=True)
 ```
 
-C-contiguous `embeddings` and `weights` are shared with the model instead of copied, so building a model doesn't duplicate the embedding table in memory. The model keeps the arrays alive, and they must not be modified while the model exists: in-place changes, such as `embeddings /= norms`, change the model's output. Pass a copy (`embeddings.copy()`) if you need to keep modifying the original. Arrays that are not C-contiguous, such as Fortran-ordered or strided arrays, and `token_mapping` are copied.
+`embeddings` and `weights` are copied, so later changes to your arrays don't affect the model. To avoid the copy, pass C-contiguous arrays over memory that cannot be written to, such as `np.load("embeddings.npy", mmap_mode="r")` or `np.frombuffer(data, dtype=np.float32).reshape(rows, dim)` with `data` a `bytes` object: these are shared with the model, which keeps them alive. Writable arrays are always copied, because another thread could write to them while `encode` reads them without the GIL. `token_mapping` is always copied.
 
 ## Performance
 

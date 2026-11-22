@@ -27,8 +27,9 @@ class StaticModel:
     ) -> StaticModel:
         """Build a model from in-memory data.
 
-        C-contiguous `embeddings` and `weights` are shared with the model instead of copied, and must not be
-        modified while the model exists. Other arrays, and `token_mapping`, are copied.
+        `embeddings` and `weights` are copied, unless they are C-contiguous arrays over memory that cannot be
+        written to, such as `np.frombuffer(bytes)` or `np.load(..., mmap_mode="r")`: those are shared with the
+        model instead. `token_mapping` is always copied.
         """
     @overload
     def encode(
