@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 
 REPO = Path(__file__).resolve().parent.parent
 SURFACE, INK, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df", "#b5b4ae"
-LIBRARIES = [("model2vec-rs", "rs:", "#2a78d6"), ("go-potion", "go-potion", "#eb6834"), ("encoders", "encoders", "#1baf7a")]
+LIBRARIES = [("model2vec-rs", None, "#2a78d6"), ("go-potion", "go-potion f32", "#eb6834"), ("encoders", "encoders f32", "#1baf7a")]
 NAMES = {
     "big": "big.txt",
     "en_ascii": "English,\nASCII only",
@@ -56,15 +56,12 @@ MODES = {"single": "one 256-word chunk per call, one thread", "batch": "all 256-
 ENCODERS_PARALLEL_MIN, ENCODERS_MIN_LEN = 128, 32
 
 
-def column(rates: dict[str, float], prefix: str) -> str | None:
-    return next((k for k in rates if k.startswith(prefix) and k.endswith(" f32")), None)
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("results", type=Path, help="bench_suite.py results.json with a libs section")
     p.add_argument("--model", default="potion-base-8M")
     p.add_argument("--mode", default="single", choices=list(MODES))
+    p.add_argument("--revision", help="model2vec-rs revision to plot (default: the reference, the last of the run's --revisions)")
     p.add_argument("--hardware", default="Apple M3 Pro")
     p.add_argument("--cores", type=int, default=os.cpu_count(), help="cores of the machine the results come from")
     p.add_argument("--out", type=Path, help="default: assets/images/ascii_vs_non_ascii[_all_cores].png")
@@ -73,6 +70,9 @@ def main() -> None:
         a.out = REPO / "assets" / "images" / ("ascii_vs_non_ascii.png" if a.mode == "single" else "ascii_vs_non_ascii_all_cores.png")
 
     data = json.loads(a.results.read_text())
+    revision = a.revision or data["meta"]["revisions"][-1]
+    if revision not in data["meta"]["revisions"]:
+        raise SystemExit(f"{a.results} has no results for revision {revision}; it has {', '.join(data['meta']['revisions'])}")
     rows = [r for r in data["libs"] if r["model"] == a.model and r["mode"] == a.mode]
     if not rows:
         raise SystemExit(f"no libs results for {a.model} {a.mode} in {a.results}")
@@ -81,12 +81,14 @@ def main() -> None:
     rows = [r for r in rows if r not in dropped]
     corpora = [r["corpus"] for r in rows]
     series = []
-    for name, prefix, color in LIBRARIES:
+    for name, key, color in LIBRARIES:
+        if key is None:
+            key = f"rs:{revision} f32"
+            name = f"{name} ({'working tree' if revision == 'WORKTREE' else revision})"
         values = []
         for r in rows:
-            key = column(r["mb_per_s"], prefix)
-            if key is None:
-                raise SystemExit(f"{a.results} has no f32 {name} result for {r['corpus']}")
+            if key not in r["mb_per_s"]:
+                raise SystemExit(f"{a.results} has no {key} result for {r['corpus']}")
             values.append(r["mb_per_s"][key])
         series.append((name, color, values))
 
@@ -133,7 +135,7 @@ def main() -> None:
     )
     if "en_ascii" in corpora and "en" in corpora:
         i, j = corpora.index("en_ascii"), corpora.index("en")
-        kept = ", ".join(f"{name} {v[j] / v[i]:.0%}" for name, _, v in series)
+        kept = ", ".join(f"{name.split(' (')[0]} {v[j] / v[i]:.0%}" for name, _, v in series)
         fig.text(
             0.015,
             0.855,

@@ -14,6 +14,10 @@ Rebuilds every input from pinned sources under `target/bench-suite/data/`:
 - Python-style int8 copies (one scale for the whole table) of
   potion-base-8M, potion-retrieval-32M and static-retrieval-mrl-en-v1.
 
+model2vec-rs loads every model from the Hugging Face snapshot at the revision
+in `MODEL_REVISIONS`, and the int8 copies are made from that same snapshot.
+go-potion and encoders fetch their own copies of the weights.
+
 Sections (`--sections`, default all):
 
 - `ab`: `scripts/bench_compare.py` on every corpus, baseline vs candidate,
@@ -51,6 +55,7 @@ and `report.md`; the report is also printed.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -102,6 +107,15 @@ MODELS = {
     "blink-8m": {"hf": "minishlab/blink-8m", "go": "BLINK8M", "enc": "blink-8m"},
     "bekko-static-embedding-v1": {"hf": "hotchpotch/bekko-static-embedding-v1", "go": None, "enc": "bekko-static-embedding-v1"},
 }
+MODEL_REVISIONS = {
+    "minishlab/potion-base-2M": "389b9f64be5aa4ae7a6bc6fe95ef20ce485ae5da",
+    "minishlab/potion-base-8M": "bf8b056651a2c21b8d2565580b8569da283cab23",
+    "minishlab/potion-retrieval-32M": "6fc8051fab2a1e0ee76689cf08c853792ac285e7",
+    "minishlab/blink-multilingual-64M": "a7198ef875b9a756b8b641ab064542f7408e50f3",
+    "minishlab/blink-8m": "593ed556e9a417e80b3b251a28ba8f412bed026e",
+    "hotchpotch/bekko-static-embedding-v1": "c18167b8f244c1bc6de21ce9b710bac8a29c4615",
+    "sentence-transformers/static-retrieval-mrl-en-v1": "f60985c706f192d45d218078e49e5a8b6f15283a",
+}
 INT8_MODELS = ["minishlab/potion-base-8M", "minishlab/potion-retrieval-32M", "sentence-transformers/static-retrieval-mrl-en-v1"]
 AB_MODELS = ["minishlab/potion-base-8M", "minishlab/blink-multilingual-64M"]
 GO_POTION_MODULE = "github.com/trengrj/go-potion"
@@ -109,6 +123,7 @@ GO_POTION_VERSION = "v0.2.1-0.20261112123519-24a66aed39d7"
 ENCODERS_VERSION = "=3.1.0"
 ENCODERS_PARALLEL_MIN = 128
 ENCODERS_MIN_LEN = 32
+MIN_ROUNDS_FOR_CI = 5
 
 
 def encoders_all_cores(chunks: int) -> bool:
@@ -318,6 +333,11 @@ def check_digest(path: Path, want: str) -> None:
         sys.exit(f"{path} has SHA-256 {got}, expected {want}; delete it to rebuild")
 
 
+def write_if_changed(path: Path, text: str) -> None:
+    if not path.exists() or path.read_text() != text:
+        path.write_text(text)
+
+
 def corpus_path(name: str) -> Path:
     return DATA / ("big.txt" if name == "big" else f"miracl-{name}.txt")
 
@@ -358,11 +378,10 @@ def prepare_data() -> None:
         if (dst / "model.safetensors").exists():
             continue
         import numpy as np
-        from huggingface_hub import snapshot_download
         from safetensors.numpy import load_file, save_file
 
-        log(f"making Python-style int8 copy of {repo}")
-        src = Path(snapshot_download(repo))
+        log(f"making Python-style int8 copy of {repo}@{MODEL_REVISIONS[repo][:12]}")
+        src = model_dir(repo)
         st = next(p for p in [src / "model.safetensors", src / "0_StaticEmbedding" / "model.safetensors"] if p.exists())
         tensors = load_file(st)
         key = next(k for k in ["embeddings", "0", "embedding.weight"] if k in tensors)
@@ -377,8 +396,15 @@ def prepare_data() -> None:
         save_file(tensors, dst / "model.safetensors")
 
 
+@functools.cache
+def model_dir(repo: str) -> Path:
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(repo, revision=MODEL_REVISIONS[repo]))
+
+
 def int8_model_path(repo: str) -> Path:
-    return DATA / "int8-models" / repo.replace("/", "__")
+    return DATA / "int8-models" / f"{repo.replace('/', '__')}@{MODEL_REVISIONS[repo][:12]}"
 
 
 def revision_source(ref: str) -> tuple[Path, str]:
@@ -396,8 +422,9 @@ def build_rust(ref: str) -> Path:
     source, key = revision_source(ref)
     crate = WORK / "harness" / f"rust-{key}"
     (crate / "src").mkdir(parents=True, exist_ok=True)
-    (crate / "src" / "main.rs").write_text(RUST_MAIN)
-    (crate / "Cargo.toml").write_text(
+    write_if_changed(crate / "src" / "main.rs", RUST_MAIN)
+    write_if_changed(
+        crate / "Cargo.toml",
         f'[package]\nname = "suite-rs"\nversion = "0.0.0"\nedition = "2021"\n\n'
         f"[dependencies]\nmodel2vec-rs = {{ path = {json.dumps(str(source))} }}\n\n"
         '[profile.release]\nlto = true\ncodegen-units = 1\n\n[workspace]\n'
@@ -439,9 +466,10 @@ def build_go(go_potion: Path | None) -> tuple[Path, set[str]] | None:
 def build_encoders(models: list[str]) -> dict[tuple[str, str], Path]:
     crate = WORK / "harness" / "encoders"
     (crate / "src").mkdir(parents=True, exist_ok=True)
-    (crate / "src" / "main.rs").write_text(ENCODERS_MAIN)
+    write_if_changed(crate / "src" / "main.rs", ENCODERS_MAIN)
     features = sorted({MODELS[m]["enc"] for m in models if MODELS[m]["enc"]} | {"float32", "int8"})
-    (crate / "Cargo.toml").write_text(
+    write_if_changed(
+        crate / "Cargo.toml",
         '[package]\nname = "suite-enc"\nversion = "0.0.0"\nedition = "2024"\n\n'
         f'[dependencies]\nencoders = {{ version = "{ENCODERS_VERSION}", default-features = false, features = ["std", "rayon"] }}\n\n'
         "[features]\n" + "".join(f'{f} = ["encoders/{f}"]\n' for f in features) + "\n"
@@ -454,31 +482,31 @@ def build_encoders(models: list[str]) -> dict[tuple[str, str], Path]:
             continue
         for prec in ["float32", "int8"]:
             out = crate / "bin" / f"{enc}-{prec}"
-            if not out.exists():
-                log(f"building encoders harness for {enc} {prec}")
-                target = crate / "target" / f"{enc}-{prec}"
-                try:
-                    run(
-                        ["cargo", "build", "--release", "--quiet", "--features", f"{enc},{prec}"],
-                        cwd=crate,
-                        env=dict(os.environ, CARGO_TARGET_DIR=str(target)),
-                        capture_output=True,
-                    )
-                except subprocess.CalledProcessError as e:
-                    log(f"skipping encoders: build failed\n{e.stderr}")
-                    return {}
-                out.parent.mkdir(exist_ok=True)
-                shutil.copy2(target / "release" / "suite-enc", out)
+            log(f"building encoders harness for {enc} {prec}")
+            target = crate / "target" / f"{enc}-{prec}"
+            try:
+                run(
+                    ["cargo", "build", "--release", "--quiet", "--features", f"{enc},{prec}"],
+                    cwd=crate,
+                    env=dict(os.environ, CARGO_TARGET_DIR=str(target)),
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError as e:
+                log(f"skipping encoders: build failed\n{e.stderr}")
+                return {}
+            out.parent.mkdir(exist_ok=True)
+            shutil.copy2(target / "release" / "suite-enc", out)
             bins[(model, "f32" if prec == "float32" else "int8")] = out
     return bins
 
 
 def entrants(model: str, rust: dict[str, Path], go: tuple[Path, set[str]] | None, enc: dict) -> list[tuple[str, list[str]]]:
     hf = MODELS[model]["hf"]
+    path = str(model_dir(hf))
     out = []
     for ref, binary in rust.items():
-        out.append((f"rs:{ref} f32", [str(binary), hf, "{corpus}", "{iters}", "{mode}", "f32"]))
-        out.append((f"rs:{ref} int8", [str(binary), hf, "{corpus}", "{iters}", "{mode}", "int8"]))
+        out.append((f"rs:{ref} f32", [str(binary), path, "{corpus}", "{iters}", "{mode}", "f32"]))
+        out.append((f"rs:{ref} int8", [str(binary), path, "{corpus}", "{iters}", "{mode}", "int8"]))
         if hf in INT8_MODELS:
             out.append((f"rs:{ref} py-int8", [str(binary), str(int8_model_path(hf)), "{corpus}", "{iters}", "{mode}", "f32"]))
     if go is not None and MODELS[model]["go"] in go[1]:
@@ -564,7 +592,7 @@ def section_accuracy(a, rust, go, enc) -> list[dict]:
     return rows
 
 
-def section_ab(a, models: list[str], corpora: list[str], threads: str, label: str, out_dir: Path) -> list[dict]:
+def section_ab(a, models: dict[str, str], corpora: list[str], threads: str, label: str, out_dir: Path) -> list[dict]:
     rows = []
     for corpus in corpora:
         log(f"[{label}] {corpus}")
@@ -586,7 +614,7 @@ def section_ab(a, models: list[str], corpora: list[str], threads: str, label: st
             rows.append(
                 {
                     "corpus": corpus,
-                    "model": Path(r["model"]).name,
+                    "model": models[r["model"]],
                     "workload": r["workload"],
                     "threads": r["threads"],
                     "speedup": r["speedup"],
@@ -599,10 +627,14 @@ def section_ab(a, models: list[str], corpora: list[str], threads: str, label: st
 
 def fmt_ab(rows: list[dict], title: str, a) -> list[str]:
     lines = [f"## {title}", "", f"Speedup of {a.candidate} over {a.baseline} (median of paired rounds, 95% CI).", ""]
+    if a.ab_rounds < MIN_ROUNDS_FOR_CI:
+        lines += [f"Fewer than {MIN_ROUNDS_FOR_CI} rounds: the intervals are not meaningful, so nothing is marked faster or slower.", ""]
     lines += ["| corpus | model | workload | threads | speedup | 95% CI | output |", "|---|---|---|---|---|---|---|"]
     for r in rows:
         lo, hi = r["ci95"]
-        flag = " faster" if lo > 1 else " SLOWER" if hi < 1 else ""
+        flag = ""
+        if a.ab_rounds >= MIN_ROUNDS_FOR_CI:
+            flag = " faster" if lo > 1 else " SLOWER" if hi < 1 else ""
         lines.append(
             f"| {r['corpus']} | {r['model']} | {r['workload']} | {r['threads']} | {r['speedup']:.3f}x{flag} "
             f"| [{lo:.3f}, {hi:.3f}] | {'identical' if r['identical_output'] else 'DIFFERENT'} |"
@@ -684,7 +716,7 @@ def main() -> None:
     for m in a.models or []:
         if m not in MODELS:
             sys.exit(f"unknown model {m}")
-    ab_models = [MODELS[m]["hf"] for m in a.models] if a.models else AB_MODELS
+    ab_repos = [MODELS[m]["hf"] for m in a.models] if a.models else AB_MODELS
     a.models = a.models or list(MODELS)
 
     started = time.time()
@@ -699,6 +731,7 @@ def main() -> None:
             "candidate": a.candidate,
             "rounds": a.rounds,
             "ab_rounds": a.ab_rounds,
+            "model_revisions": MODEL_REVISIONS,
             "commit": run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True).stdout.strip(),
             "dirty": bool(run(["git", "status", "--porcelain"], cwd=REPO, capture_output=True).stdout.strip()),
         }
@@ -706,10 +739,12 @@ def main() -> None:
     report = ["# model2vec-rs benchmark suite", "", f"commit {results['meta']['commit'][:12]}{' (dirty)' if results['meta']['dirty'] else ''}", ""]
 
     if "ab" in sections:
+        ab_models = {str(model_dir(m)): m.split("/")[-1] for m in ab_repos}
         results["ab"] = section_ab(a, ab_models, a.corpora, "1", "ab", out_dir)
         report += fmt_ab(results["ab"], "A/B per corpus (single thread)", a)
     if "int8-ab" in sections:
-        results["int8_ab"] = section_ab(a, [str(int8_model_path(m)) for m in INT8_MODELS], ["big"], "1,all", "int8-ab", out_dir)
+        int8_models = {str(int8_model_path(m)): f"{m.split('/')[-1]} (Python int8)" for m in INT8_MODELS}
+        results["int8_ab"] = section_ab(a, int8_models, ["big"], "1,all", "int8-ab", out_dir)
         report += fmt_ab(results["int8_ab"], "A/B on Python-style int8 models (big.txt)", a)
     if sections & {"libs", "accuracy"}:
         rust = {ref: build_rust(ref) for ref in a.revisions}

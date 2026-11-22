@@ -225,15 +225,15 @@ A variety of pre-trained Model2Vec models are available on the [HuggingFace Hub 
 
 ## Performance
 
-We compared `model2vec-rs` with the Python version of Model2Vec by encoding the same 666,808 texts with [`potion-base-8M`](https://huggingface.co/minishlab/potion-base-8M) in both.
+We compared `model2vec-rs` with the Python version of Model2Vec by encoding the same 666,808 texts with [`blink-8m`](https://huggingface.co/minishlab/blink-8m) in both.
 
 | Implementation | Single thread       | All cores             | Model load |
 | -------------- | ------------------- | --------------------- | ---------- |
-| **Rust**       | 856K texts/second   | 3.43M texts/second    | 34 ms      |
-| **Python**     | 42K texts/second    | 130K texts/second     | 382 ms     |
-| **Speedup**    | **20.5×**           | **26.4×**             | **11.4×**  |
+| **Rust**       | 891K texts/second   | 3.33M texts/second    | 30 ms      |
+| **Python**     | 43K texts/second    | 132K texts/second     | 490 ms     |
+| **Speedup**    | **20.6×**           | **25.3×**             | **16.1×**  |
 
-On a single thread, the Rust version is roughly **20×** faster than the Python version, and about **26×** faster when using all cores. With int8 models the speedup is larger:
+On a single thread, the Rust version is roughly **20×** faster than the Python version, and about **25×** faster when using all cores. With int8 models the speedup is larger:
 
 <div align="center">
   <img width="85%" alt="model2vec-rs speedup over Python model2vec" src="assets/images/speedup.png">
@@ -242,7 +242,7 @@ On a single thread, the Rust version is roughly **20×** faster than the Python 
 To reproduce these numbers, run this from the repository root (it needs Rust and [`uv`](https://docs.astral.sh/uv/)):
 
 ```sh
-uv run scripts/python_compare.py --no-python-multiprocessing
+uv run scripts/python_compare.py --model minishlab/blink-8m --no-python-multiprocessing
 ```
 
 The script downloads the corpus, builds [`benches/python_compare.rs`](benches/python_compare.rs), runs both implementations and prints the table above. For the int8 bars of the chart, add `--quantize int8`, then pass both results to [`scripts/speedup_chart.py`](scripts/speedup_chart.py). See [`scripts/python_compare.py`](scripts/python_compare.py) for the options.
@@ -257,12 +257,12 @@ Benchmark details:
 *   **All cores:** Rust with Rayon parallelism; Python with tokenizer parallelism and `use_multiprocessing=False`. Python's default `use_multiprocessing=True` spreads the texts over a process pool, which makes it slower.
 *   **Method:** 5 alternating rounds of Rust and Python processes, 5 timed passes each after one warm-up pass; throughput is the median over the 25 passes.
 *   **Model load:** median time over all 10 process launches per side to load the model from the local Hugging Face cache; for Python this includes importing `model2vec`.
-*   **Output:** for float32, the Rust and Python embeddings differ by at most 3.0e-7 per value (minimum cosine similarity 0.9999998).
+*   **Output:** for float32, the Rust and Python embeddings differ by at most 1.5e-7 per value (minimum cosine similarity 0.9999998).
 *   **int8:** the model is quantized at load time on both sides, with `quantize_int8` in Rust and `quantize_to="int8"` in Python. Rust keeps one scale per column plus a power-of-two scale per row and Python one scale for the whole table, so the int8 embeddings differ between the two; these bars compare speed only.
 
 ## Relation to Python `model2vec`
 
-*   **`model2vec-rs` (This Crate):** High-performance Rust engine for up to 28x faster **Model2Vec inference**.
+*   **`model2vec-rs` (This Crate):** High-performance Rust engine for up to 34x faster **Model2Vec inference**.
 *   **[`model2vec`](https://github.com/MinishLab/model2vec) (Python-based):** Handles model **distillation, training, fine-tuning**, and slower Python-based inference.
 
 ## License
