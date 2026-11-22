@@ -167,8 +167,7 @@ impl Case {
 /// Sum of squares over 16 interleaved lanes, then the tail.
 fn squared_norm(v: &[f32]) -> f32 {
     let mut lanes = [0.0_f32; 16];
-    let chunks = v.chunks_exact(16);
-    let tail = chunks.remainder();
+    let (chunks, tail) = v.as_chunks::<16>();
     for c in chunks {
         for (l, &x) in lanes.iter_mut().zip(c) {
             *l += x * x;

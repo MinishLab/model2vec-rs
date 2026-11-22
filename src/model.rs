@@ -745,15 +745,15 @@ impl StaticModel {
         let denom = cnt.max(1) as f32;
         if normalize {
             let mut lanes = [0.0_f32; 16];
-            let mut chunks = sum.chunks_exact_mut(16);
-            for c in &mut chunks {
+            let (chunks, tail) = sum.as_chunks_mut::<16>();
+            for c in chunks {
                 for (l, x) in lanes.iter_mut().zip(c) {
                     *x /= denom;
                     *l += *x * *x;
                 }
             }
             let mut sq: f32 = lanes.iter().sum();
-            for x in chunks.into_remainder() {
+            for x in tail {
                 *x /= denom;
                 sq += *x * *x;
             }
