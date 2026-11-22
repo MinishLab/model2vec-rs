@@ -44,6 +44,8 @@ model = StaticModel.from_arrays(tokenizer, embeddings, normalize=True)
 
 `embeddings` and `weights` are copied, so later changes to your arrays don't affect the model. To avoid the copy, pass C-contiguous arrays over memory that cannot be written to, such as `np.load("embeddings.npy", mmap_mode="r")` or `np.frombuffer(data, dtype=np.float32).reshape(rows, dim)` with `data` a `bytes` object: these are shared with the model, which keeps them alive. Writable arrays are always copied, because another thread could write to them while `encode` reads them without the GIL. `token_mapping` is always copied.
 
+`model.embeddings` and `model.weights` return the arrays the model reads from as read-only arrays, without copying. Use them instead of your original arrays to keep only one copy in memory; passing them to `from_arrays` again shares them with the new model. They are `None` for models loaded with `from_pretrained`.
+
 ## Performance
 
 We encoded the same 666,808 Wikipedia paragraphs (11M words) with [`blink-8m`](https://huggingface.co/minishlab/blink-8m) using the Rust crate, these bindings, and Python [`model2vec`](https://github.com/MinishLab/model2vec):

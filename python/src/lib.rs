@@ -1,11 +1,13 @@
+use std::any::Any;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use model2vec_rs::model::{DEFAULT_MAX_LENGTH, SharedSlice, StaticModel as RustStaticModel};
-use ndarray::{Array2, Dimension};
+use ndarray::{Array2, ArrayView, Dimension, Ix1, Ix2};
 use numpy::{
-    Element, IntoPyArray, PyReadonlyArray, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArray, PyUntypedArrayMethods,
+    Element, IntoPyArray, PyArray, PyReadonlyArray, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArray,
+    PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::intern;
@@ -30,7 +32,34 @@ impl<T> AsRef<[T]> for NumpySlice<T> {
     }
 }
 
-/// Whether the memory of an array can never be written to: its root buffer is `bytes` or a read-only `mmap`.
+/// Memory owned by a model, kept alive by the read-only NumPy views of it.
+#[pyclass(module = "model2vec_rs", name = "_SharedBuffer", frozen)]
+struct SharedBuffer {
+    _data: Box<dyn Any + Send + Sync>,
+}
+
+/// A read-only NumPy view of `data` with the given shape, which keeps `data` alive.
+fn read_only_view<T: Element + Send + Sync + 'static, D: Dimension>(
+    py: Python<'_>,
+    data: &SharedSlice<T>,
+    shape: D,
+) -> PyResult<Py<PyAny>> {
+    let view = ArrayView::from_shape(shape, (**data).as_ref()).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let owner = Bound::new(
+        py,
+        SharedBuffer {
+            _data: Box::new(Arc::clone(data)),
+        },
+    )?;
+    let array = unsafe { PyArray::borrow_from_array(&view, owner.into_any()) };
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("write", false)?;
+    array.call_method("setflags", (), Some(&kwargs))?;
+    Ok(array.into_any().unbind())
+}
+
+/// Whether the memory of an array can never be written to: its root buffer is `bytes`, a read-only `mmap`,
+/// or memory owned by a model.
 fn is_immutable(array: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = array.py();
     let mut current = array.clone();
@@ -47,7 +76,7 @@ fn is_immutable(array: &Bound<'_, PyAny>) -> PyResult<bool> {
         }
         current = base;
     }
-    if current.is_exact_instance_of::<PyBytes>() {
+    if current.is_exact_instance_of::<PyBytes>() || current.is_instance_of::<SharedBuffer>() {
         return Ok(true);
     }
     let mmap = py.import(intern!(py, "mmap"))?.getattr(intern!(py, "mmap"))?;
@@ -122,6 +151,8 @@ impl MaxLength {
 #[pyclass(module = "model2vec_rs", name = "StaticModel", frozen)]
 struct StaticModel {
     model: RustStaticModel,
+    embeddings: Option<Py<PyAny>>,
+    weights: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -149,14 +180,16 @@ impl StaticModel {
         let max_length = max_length.or(model.max_length());
         Ok(Self {
             model: model.with_max_length(max_length),
+            embeddings: None,
+            weights: None,
         })
     }
 
     /// Build a model from in-memory data.
     ///
     /// `embeddings` and `weights` are copied, unless they are C-contiguous arrays over memory that cannot be
-    /// written to, such as `np.frombuffer(bytes)` or `np.load(..., mmap_mode="r")`: those are shared with the
-    /// model instead.
+    /// written to, such as `np.frombuffer(bytes)`, `np.load(..., mmap_mode="r")`, or the `embeddings` and
+    /// `weights` of another model: those are shared with the model instead.
     ///
     /// Args:
     ///     tokenizer: The tokenizer serialized as a JSON string.
@@ -168,6 +201,7 @@ impl StaticModel {
     #[staticmethod]
     #[pyo3(signature = (tokenizer, embeddings, normalize=false, weights=None, token_mapping=None, max_length=Some(DEFAULT_MAX_LENGTH)))]
     fn from_arrays(
+        py: Python<'_>,
         tokenizer: &str,
         embeddings: EmbeddingArray<'_>,
         normalize: bool,
@@ -220,29 +254,31 @@ impl StaticModel {
             )));
         }
         let weights = weights.map(|w| shared_slice(&w)).transpose()?;
+        let weights_view = weights
+            .as_ref()
+            .map(|w| read_only_view(py, w, Ix1((**w).as_ref().len())))
+            .transpose()?;
         let token_mapping = token_mapping.map(|m| Arc::new(m) as SharedSlice<usize>);
-        let model = match embeddings {
-            EmbeddingArray::F32(array) => RustStaticModel::from_shared(
-                tokenizer,
-                shared_slice(&array)?,
-                rows,
-                cols,
-                normalize,
-                weights,
-                token_mapping,
-            )?,
-            EmbeddingArray::I8(array) => RustStaticModel::from_shared_i8(
-                tokenizer,
-                shared_slice(&array)?,
-                rows,
-                cols,
-                normalize,
-                weights,
-                token_mapping,
-            )?,
+        let (model, embeddings_view) = match embeddings {
+            EmbeddingArray::F32(array) => {
+                let data = shared_slice(&array)?;
+                let view = read_only_view(py, &data, Ix2(rows, cols))?;
+                let model =
+                    RustStaticModel::from_shared(tokenizer, data, rows, cols, normalize, weights, token_mapping)?;
+                (model, view)
+            }
+            EmbeddingArray::I8(array) => {
+                let data = shared_slice(&array)?;
+                let view = read_only_view(py, &data, Ix2(rows, cols))?;
+                let model =
+                    RustStaticModel::from_shared_i8(tokenizer, data, rows, cols, normalize, weights, token_mapping)?;
+                (model, view)
+            }
         };
         Ok(Self {
             model: model.with_max_length(max_length),
+            embeddings: Some(embeddings_view),
+            weights: weights_view,
         })
     }
 
@@ -313,6 +349,20 @@ impl StaticModel {
     #[getter]
     fn max_length(&self) -> Option<usize> {
         self.model.max_length()
+    }
+
+    /// The embedding table of a model built with `from_arrays`, as a read-only array over the model's
+    /// memory, or None for a model loaded with `from_pretrained`.
+    #[getter]
+    fn embeddings(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.embeddings.as_ref().map(|array| array.clone_ref(py))
+    }
+
+    /// The token weights of a model built with `from_arrays`, as a read-only array over the model's
+    /// memory, or None if the model has none or was loaded with `from_pretrained`.
+    #[getter]
+    fn weights(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.weights.as_ref().map(|array| array.clone_ref(py))
     }
 
     fn __repr__(&self) -> String {

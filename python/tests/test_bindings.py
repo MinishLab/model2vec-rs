@@ -345,6 +345,84 @@ def test_from_arrays_copies_non_contiguous_arrays(dtype: type, layout: str, read
     np.testing.assert_array_equal(got, want)
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.int8])
+def test_from_arrays_exposes_read_only_arrays(dtype: type) -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
+    vocab_size = tokenizers_vocab_size(tokenizer)
+    embeddings, weights = random_arrays(dtype, vocab_size)
+    model = StaticModel.from_arrays(tokenizer, embeddings, weights=weights)
+
+    for got, original in [(model.embeddings, embeddings), (model.weights, weights)]:
+        np.testing.assert_array_equal(got, original)
+        assert got.dtype == original.dtype
+        assert got.flags.c_contiguous
+        assert not np.shares_memory(got, original)
+        with pytest.raises(ValueError, match="read-only"):
+            got[0] = 0
+        with pytest.raises(ValueError):
+            got.flags.writeable = True
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.int8])
+def test_from_arrays_shares_arrays_of_another_model(dtype: type) -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
+    vocab_size = tokenizers_vocab_size(tokenizer)
+    embeddings, weights = random_arrays(dtype, vocab_size)
+    first = StaticModel.from_arrays(tokenizer, embeddings, weights=weights)
+    want = first.encode(ARRAY_TEXTS)
+
+    second = StaticModel.from_arrays(tokenizer, first.embeddings, weights=first.weights)
+    assert np.shares_memory(second.embeddings, first.embeddings)
+    assert np.shares_memory(second.weights, first.weights)
+    del first, embeddings, weights
+    gc.collect()
+    garbage = [np.full((vocab_size, 8), 7, dtype=dtype) for _ in range(8)]
+
+    np.testing.assert_array_equal(second.encode(ARRAY_TEXTS), want)
+    del garbage
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.int8])
+@pytest.mark.parametrize("source", ["bytes", "mmap"])
+def test_from_arrays_exposes_shared_arrays(tmp_path: Path, dtype: type, source: str) -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
+    embeddings, weights = random_arrays(dtype, tokenizers_vocab_size(tokenizer))
+    if source == "bytes":
+        shared_embeddings, shared_weights = read_only(embeddings), read_only(weights)
+    else:
+        shared_embeddings = mapped(embeddings, tmp_path / "embeddings.npy")
+        shared_weights = mapped(weights, tmp_path / "weights.npy")
+    model = StaticModel.from_arrays(tokenizer, shared_embeddings, weights=shared_weights)
+
+    assert np.shares_memory(model.embeddings, shared_embeddings)
+    assert np.shares_memory(model.weights, shared_weights)
+    assert not model.embeddings.flags.writeable
+    assert not model.weights.flags.writeable
+
+
+def test_from_arrays_arrays_outlive_model() -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
+    embeddings, weights = random_arrays(np.float32, tokenizers_vocab_size(tokenizer))
+    model = StaticModel.from_arrays(tokenizer, embeddings, weights=weights)
+    got_embeddings, got_weights = model.embeddings, model.weights
+    del model
+    gc.collect()
+
+    np.testing.assert_array_equal(got_embeddings, embeddings)
+    np.testing.assert_array_equal(got_weights, weights)
+
+
+def test_from_arrays_without_weights_has_no_weights() -> None:
+    tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
+    embeddings, _ = random_arrays(np.float32, tokenizers_vocab_size(tokenizer))
+    assert StaticModel.from_arrays(tokenizer, embeddings).weights is None
+
+
+def test_from_pretrained_has_no_arrays(model: StaticModel) -> None:
+    assert model.embeddings is None
+    assert model.weights is None
+
+
 def test_from_arrays_rejects_other_dtypes() -> None:
     tokenizer = (FIXTURES / "test-model-float32" / "tokenizer.json").read_text(encoding="utf-8")
     vocab_size = tokenizers_vocab_size(tokenizer)
