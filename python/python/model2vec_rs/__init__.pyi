@@ -24,7 +24,13 @@ class StaticModel:
         weights: npt.NDArray[np.float32] | None = None,
         token_mapping: npt.NDArray[np.int64] | None = None,
         max_length: int | None = 512,
-    ) -> StaticModel: ...
+    ) -> StaticModel:
+        """Build a model from in-memory data.
+
+        `embeddings` and `weights` are copied, unless they are C-contiguous arrays over memory that cannot be
+        written to, such as `np.frombuffer(bytes)`, `np.load(..., mmap_mode="r")`, or the `embeddings` and
+        `weights` of another model: those are shared with the model instead. `token_mapping` is always copied.
+        """
     @overload
     def encode(
         self,
@@ -47,3 +53,15 @@ class StaticModel:
     def normalize(self) -> bool: ...
     @property
     def max_length(self) -> int | None: ...
+    @property
+    def embeddings(self) -> npt.NDArray[np.float32] | npt.NDArray[np.int8] | None:
+        """The embedding table of a model built with `from_arrays`, as a read-only array over the model's memory.
+
+        None for a model loaded with `from_pretrained`.
+        """
+    @property
+    def weights(self) -> npt.NDArray[np.float32] | None:
+        """The token weights of a model built with `from_arrays`, as a read-only array over the model's memory.
+
+        None if the model has no weights or was loaded with `from_pretrained`.
+        """
