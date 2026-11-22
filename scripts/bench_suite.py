@@ -654,7 +654,11 @@ def main() -> None:
     p.add_argument("--sections", default="ab,int8-ab,libs,accuracy", help="comma-separated: ab, int8-ab, libs, accuracy, data")
     p.add_argument("--corpora", default=",".join(CORPORA), help=f"comma-separated subset of {','.join(CORPORA)}")
     p.add_argument("--accuracy-corpora", default="big,en,ko,zh,ru")
-    p.add_argument("--models", default=",".join(MODELS), help=f"comma-separated subset of {','.join(MODELS)}")
+    p.add_argument(
+        "--models",
+        help=f"comma-separated subset of {','.join(MODELS)} (default: all for `libs` and `accuracy`, "
+        f"{','.join(Path(m).name for m in AB_MODELS)} for `ab`)",
+    )
     p.add_argument("--modes", default="single,batch")
     p.add_argument("--rounds", type=int, default=2, help="process launches per library in `libs`")
     p.add_argument("--revisions", default="WORKTREE", help="model2vec-rs revisions for `libs` and `accuracy`; the last is the reference")
@@ -671,15 +675,17 @@ def main() -> None:
     sections = set(a.sections.split(","))
     a.corpora = a.corpora.split(",")
     a.accuracy_corpora = a.accuracy_corpora.split(",")
-    a.models = a.models.split(",")
+    a.models = a.models.split(",") if a.models else None
     a.modes = a.modes.split(",")
     a.revisions = a.revisions.split(",")
     for c in a.corpora + a.accuracy_corpora:
         if c not in CORPORA:
             sys.exit(f"unknown corpus {c}")
-    for m in a.models:
+    for m in a.models or []:
         if m not in MODELS:
             sys.exit(f"unknown model {m}")
+    ab_models = [MODELS[m]["hf"] for m in a.models] if a.models else AB_MODELS
+    a.models = a.models or list(MODELS)
 
     started = time.time()
     prepare_data()
@@ -700,7 +706,7 @@ def main() -> None:
     report = ["# model2vec-rs benchmark suite", "", f"commit {results['meta']['commit'][:12]}{' (dirty)' if results['meta']['dirty'] else ''}", ""]
 
     if "ab" in sections:
-        results["ab"] = section_ab(a, AB_MODELS, a.corpora, "1", "ab", out_dir)
+        results["ab"] = section_ab(a, ab_models, a.corpora, "1", "ab", out_dir)
         report += fmt_ab(results["ab"], "A/B per corpus (single thread)", a)
     if "int8-ab" in sections:
         results["int8_ab"] = section_ab(a, [str(int8_model_path(m)) for m in INT8_MODELS], ["big"], "1,all", "int8-ab", out_dir)

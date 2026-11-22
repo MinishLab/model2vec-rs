@@ -260,36 +260,6 @@ Benchmark details:
 *   **Output:** for float32, the Rust and Python embeddings differ by at most 3.0e-7 per value (minimum cosine similarity 0.9999998).
 *   **int8:** the model is quantized at load time on both sides, with `quantize_int8` in Rust and `quantize_to="int8"` in Python. Rust keeps one scale per column plus a power-of-two scale per row and Python one scale for the whole table, so the int8 embeddings differ between the two; these bars compare speed only.
 
-### ASCII and non-ASCII text
-
-Most text is not pure ASCII: 62% of the 256-word chunks of English Wikipedia passages in [NanoMIRACL](https://huggingface.co/datasets/hakari-bench/NanoMIRACL) contain at least one non-ASCII char. `model2vec-rs` keeps its ASCII fast path for the ASCII parts of such text, so it is as fast on English as published as on the same passages with every non-ASCII char removed. The chart compares it with two other static embedding libraries, [go-potion](https://github.com/trengrj/go-potion) and [encoders](https://crates.io/crates/encoders), on English and eight other languages:
-
-<div align="center">
-  <img width="95%" alt="Throughput of model2vec-rs, go-potion and encoders on ASCII and non-ASCII text" src="assets/images/ascii_vs_non_ascii.png">
-</div>
-
-| Corpus | model2vec-rs | go-potion | encoders |
-|---|---:|---:|---:|
-| English, ASCII only | 140 MB/s | 131 MB/s | 168 MB/s |
-| English, as published | 144 MB/s | 41 MB/s | 167 MB/s |
-| German | 74 MB/s | 23 MB/s | 71 MB/s |
-| Russian | 69 MB/s | 14 MB/s | 51 MB/s |
-| Arabic | 67 MB/s | 15 MB/s | 56 MB/s |
-| Hindi | 79 MB/s | 24 MB/s | 92 MB/s |
-| Chinese | 90 MB/s | 21 MB/s | 92 MB/s |
-| Japanese | 85 MB/s | 18 MB/s | 69 MB/s |
-| Korean | 50 MB/s | 8 MB/s | 35 MB/s |
-
-All three use `potion-base-8M` in float32 and encode one 256-word chunk per call on one thread (Apple M3 Pro; go-potion `v0.2.1-0.20261112123519-24a66aed39d7`, encoders 3.1.0). Throughput is the best of 3 passes over the first 400,000 words of each corpus, median over 3 process launches. To reproduce:
-
-```sh
-uv run scripts/bench_suite.py --sections libs --models potion-base-8M --modes single \
-    --corpora en_ascii,en,de,ru,ar,hi,zh,ja,ko --rounds 3
-uv run scripts/ascii_chart.py target/bench-suite/results/<timestamp>/results.json
-```
-
-[`scripts/bench_suite.py`](scripts/bench_suite.py) also compares all-core batch throughput, int8 and more models and languages; see [`benches/README.md`](benches/README.md).
-
 ## Relation to Python `model2vec`
 
 *   **`model2vec-rs` (This Crate):** High-performance Rust engine for up to 28x faster **Model2Vec inference**.
