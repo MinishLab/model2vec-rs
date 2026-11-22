@@ -744,8 +744,16 @@ impl StaticModel {
         };
         let denom = cnt.max(1) as f32;
         if normalize {
-            let mut sq = 0.0_f32;
-            for x in sum.iter_mut() {
+            let mut lanes = [0.0_f32; 16];
+            let mut chunks = sum.chunks_exact_mut(16);
+            for c in &mut chunks {
+                for (l, x) in lanes.iter_mut().zip(c) {
+                    *x /= denom;
+                    *l += *x * *x;
+                }
+            }
+            let mut sq: f32 = lanes.iter().sum();
+            for x in chunks.into_remainder() {
                 *x /= denom;
                 sq += *x * *x;
             }
@@ -803,7 +811,7 @@ impl StaticModel {
     {
         let mut pending: [(&[T], f32); BLOCK] = [(&[], 0.0); BLOCK];
         let mut n = 0;
-        let cnt = self.for_each_row(table, ids, |row, scale| {
+        let cnt = self.for_each_row(table, ids, #[inline(always)] |row, scale| {
             pending[n] = (row, scale);
             n += 1;
             if n == BLOCK {
@@ -861,7 +869,7 @@ impl StaticModel {
         let mut n = 0;
         match &self.inner.row_shifts {
             None => {
-                let cnt = self.for_each_row_index(ids, |row| {
+                let cnt = self.for_each_row_index(ids, #[inline(always)] |row| {
                     rows[n] = &table[row * dim..(row + 1) * dim];
                     n += 1;
                     if n == BLOCK {
@@ -878,7 +886,7 @@ impl StaticModel {
             }
             Some(row_shifts) => {
                 let mut shifts = [0_u32; BLOCK];
-                let cnt = self.for_each_row_index(ids, |row| {
+                let cnt = self.for_each_row_index(ids, #[inline(always)] |row| {
                     rows[n] = &table[row * dim..(row + 1) * dim];
                     shifts[n] = u32::from(row_shifts[row]);
                     n += 1;

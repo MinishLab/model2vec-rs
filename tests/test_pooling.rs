@@ -153,7 +153,7 @@ impl Case {
                     *x /= denom;
                 }
                 if self.normalize {
-                    let norm = sum.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
+                    let norm = squared_norm(&sum).sqrt().max(1e-12);
                     for x in &mut sum {
                         *x /= norm;
                     }
@@ -162,6 +162,23 @@ impl Case {
             })
             .collect()
     }
+}
+
+/// Sum of squares over 16 interleaved lanes, then the tail.
+fn squared_norm(v: &[f32]) -> f32 {
+    let mut lanes = [0.0_f32; 16];
+    let chunks = v.chunks_exact(16);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for (l, &x) in lanes.iter_mut().zip(c) {
+            *l += x * x;
+        }
+    }
+    let mut sq: f32 = lanes.iter().sum();
+    for &x in tail {
+        sq += x * x;
+    }
+    sq
 }
 
 /// Token IDs per text after character truncation, tokenization, token
