@@ -1,11 +1,12 @@
-//! Int8 models (from safetensors, `from_owned_i8` or `from_borrowed_i8`) are
-//! pooled from their stored i8 values; the output must be bit-identical to
-//! loading the same values widened to f32.
+//! Int8 models (from safetensors, `from_owned_i8`, `from_borrowed_i8` or
+//! `from_shared_i8`) are pooled from their stored i8 values; the output must be
+//! bit-identical to loading the same values widened to f32.
 
 use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
 
-use model2vec_rs::model::StaticModel;
+use model2vec_rs::model::{SharedSlice, StaticModel};
 use safetensors::tensor::{Dtype, TensorView, serialize};
 use tokenizers::Tokenizer;
 
@@ -157,6 +158,41 @@ impl Case {
         .unwrap_or_else(|e| panic!("failed to build borrowed i8 model for {}: {e}", self.label()))
     }
 
+    fn shared_weights_and_mapping(&self) -> (Option<SharedSlice<f32>>, Option<SharedSlice<usize>>) {
+        (
+            self.weights.clone().map(|w| Arc::new(w) as SharedSlice<f32>),
+            self.mapping_usize().map(|m| Arc::new(m) as SharedSlice<usize>),
+        )
+    }
+
+    fn shared_i8_model(&self) -> StaticModel {
+        let (weights, mapping) = self.shared_weights_and_mapping();
+        StaticModel::from_shared_i8(
+            self.tokenizer(),
+            Arc::new(self.table.clone()),
+            self.table.len() / self.dim,
+            self.dim,
+            self.normalize,
+            weights,
+            mapping,
+        )
+        .unwrap_or_else(|e| panic!("failed to build shared i8 model for {}: {e}", self.label()))
+    }
+
+    fn shared_f32_model(&self) -> StaticModel {
+        let (weights, mapping) = self.shared_weights_and_mapping();
+        StaticModel::from_shared(
+            self.tokenizer(),
+            Arc::new(self.table.iter().map(|&v| f32::from(v)).collect::<Vec<_>>()),
+            self.table.len() / self.dim,
+            self.dim,
+            self.normalize,
+            weights,
+            mapping,
+        )
+        .unwrap_or_else(|e| panic!("failed to build shared f32 model for {}: {e}", self.label()))
+    }
+
     fn f32_model(&self) -> StaticModel {
         StaticModel::from_owned(
             self.tokenizer(),
@@ -210,6 +246,8 @@ fn check(tokenizer_path: &str, dim: usize, (weights, mapping, normalize): (bool,
     for (what, model) in [
         ("from_owned_i8", case.owned_i8_model()),
         ("from_borrowed_i8", case.borrowed_i8_model()),
+        ("from_shared_i8", case.shared_i8_model()),
+        ("from_shared", case.shared_f32_model()),
     ] {
         assert_bit_identical(&format!("{} {what}", case.label()), &model.encode(&texts), &want);
     }

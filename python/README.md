@@ -28,6 +28,22 @@ model.max_length  # int | None, the default max tokens per sentence for encode
 
 As in `model2vec`, the model's `max_length` comes from its config (512 if unset, `null` for no limit). Override it with `StaticModel.from_pretrained(..., max_length=...)`; `from_arrays` defaults to 512.
 
+### Loading from arrays
+
+`from_arrays` builds a model from a tokenizer JSON string and NumPy arrays you have already loaded:
+
+```python
+import numpy as np
+from model2vec_rs import StaticModel
+
+tokenizer = open("tokenizer.json").read()
+embeddings = np.load("embeddings.npy")  # float32 or int8, shape (rows, dim)
+
+model = StaticModel.from_arrays(tokenizer, embeddings, normalize=True)
+```
+
+C-contiguous `embeddings` and `weights` are shared with the model instead of copied, so building a model doesn't duplicate the embedding table in memory. The model keeps the arrays alive, and they must not be modified while the model exists: in-place changes, such as `embeddings /= norms`, change the model's output. Pass a copy (`embeddings.copy()`) if you need to keep modifying the original. Arrays that are not C-contiguous, such as Fortran-ordered or strided arrays, and `token_mapping` are copied.
+
 ## Performance
 
 We encoded the same 666,808 Wikipedia paragraphs (11M words) with [`blink-8m`](https://huggingface.co/minishlab/blink-8m) using the Rust crate, these bindings, and Python [`model2vec`](https://github.com/MinishLab/model2vec):

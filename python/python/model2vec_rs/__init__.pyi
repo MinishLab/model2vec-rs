@@ -24,7 +24,12 @@ class StaticModel:
         weights: npt.NDArray[np.float32] | None = None,
         token_mapping: npt.NDArray[np.int64] | None = None,
         max_length: int | None = 512,
-    ) -> StaticModel: ...
+    ) -> StaticModel:
+        """Build a model from in-memory data.
+
+        C-contiguous `embeddings` and `weights` are shared with the model instead of copied, and must not be
+        modified while the model exists. Other arrays, and `token_mapping`, are copied.
+        """
     @overload
     def encode(
         self,

@@ -1,14 +1,46 @@
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
-use model2vec_rs::model::{DEFAULT_MAX_LENGTH, StaticModel as RustStaticModel};
-use ndarray::Array2;
-use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2};
+use model2vec_rs::model::{DEFAULT_MAX_LENGTH, SharedSlice, StaticModel as RustStaticModel};
+use ndarray::{Array2, Dimension};
+use numpy::{Element, IntoPyArray, PyReadonlyArray, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokenizers::Tokenizer;
 use tokenizers::utils::parallelism;
+
+/// The data of a C-contiguous NumPy array, which it keeps alive. The array must not be written to while
+/// a model uses it.
+struct NumpySlice<T> {
+    _array: Py<PyAny>,
+    data: *const T,
+    len: usize,
+}
+
+unsafe impl<T: Sync> Send for NumpySlice<T> {}
+unsafe impl<T: Sync> Sync for NumpySlice<T> {}
+
+impl<T> AsRef<[T]> for NumpySlice<T> {
+    fn as_ref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.data, self.len) }
+    }
+}
+
+/// Share the data of a C-contiguous array without copying it, or copy any other array.
+fn shared_slice<T: Element + Copy + Sync + Send + 'static, D: Dimension>(
+    array: &PyReadonlyArray<'_, T, D>,
+) -> SharedSlice<T> {
+    match array.as_slice() {
+        Ok(data) if array.is_c_contiguous() => Arc::new(NumpySlice {
+            _array: array.as_any().clone().unbind(),
+            data: data.as_ptr(),
+            len: data.len(),
+        }),
+        _ => Arc::new(array.as_array().iter().copied().collect::<Vec<T>>()),
+    }
+}
 
 #[derive(FromPyObject)]
 enum Sentences {
@@ -89,6 +121,9 @@ impl StaticModel {
 
     /// Build a model from in-memory data.
     ///
+    /// C-contiguous `embeddings` and `weights` are shared with the model instead of copied, and must not be
+    /// modified while the model exists.
+    ///
     /// Args:
     ///     tokenizer: The tokenizer serialized as a JSON string.
     ///     embeddings: A float32 or int8 array of shape (rows, dim).
@@ -150,20 +185,21 @@ impl StaticModel {
                 weights.as_array().len()
             )));
         }
-        let weights = weights.map(|w| w.as_array().to_vec());
+        let weights = weights.map(|w| shared_slice(&w));
+        let token_mapping = token_mapping.map(|m| Arc::new(m) as SharedSlice<usize>);
         let model = match embeddings {
-            EmbeddingArray::F32(array) => RustStaticModel::from_owned(
+            EmbeddingArray::F32(array) => RustStaticModel::from_shared(
                 tokenizer,
-                array.as_array().iter().copied().collect(),
+                shared_slice(&array),
                 rows,
                 cols,
                 normalize,
                 weights,
                 token_mapping,
             )?,
-            EmbeddingArray::I8(array) => RustStaticModel::from_owned_i8(
+            EmbeddingArray::I8(array) => RustStaticModel::from_shared_i8(
                 tokenizer,
-                array.as_array().iter().copied().collect(),
+                shared_slice(&array),
                 rows,
                 cols,
                 normalize,

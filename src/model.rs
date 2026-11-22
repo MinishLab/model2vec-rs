@@ -4,7 +4,6 @@ use half::{f16, slice::HalfFloatSliceExt};
 use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
 use safetensors::{SafeTensors, tensor::Dtype};
 use serde_json::Value;
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::{
     fs,
@@ -48,9 +47,48 @@ struct StaticModelInner {
     col_scales: Option<Vec<f32>>,
     /// Per-row left shift applied in the integer sum; set by `quantize_int8`.
     row_shifts: Option<Vec<u8>>,
-    weights: Option<Cow<'static, [f32]>>,
-    token_mapping: Option<Cow<'static, [usize]>>,
+    weights: Option<Storage<f32>>,
+    token_mapping: Option<Storage<usize>>,
     normalize: bool,
+}
+
+/// Read-only slice storage that keeps its owner alive, such as an array owned
+/// by another runtime. Used by [`StaticModel::from_shared`].
+pub type SharedSlice<T> = Arc<dyn AsRef<[T]> + Send + Sync>;
+
+/// Read-only slice that is owned, static, or kept alive by a shared owner.
+enum Storage<T: 'static> {
+    Owned(Vec<T>),
+    Borrowed(&'static [T]),
+    Shared(SharedSlice<T>),
+}
+
+impl<T> std::ops::Deref for Storage<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match self {
+            Storage::Owned(data) => data,
+            Storage::Borrowed(data) => data,
+            Storage::Shared(data) => (**data).as_ref(),
+        }
+    }
+}
+
+impl<T: Clone> Clone for Storage<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Storage::Owned(data) => Storage::Owned(data.clone()),
+            Storage::Borrowed(data) => Storage::Borrowed(data),
+            Storage::Shared(data) => Storage::Shared(Arc::clone(data)),
+        }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Storage<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -142,8 +180,8 @@ fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
 /// Embedding table in its stored element type, row-major with `dim` columns.
 #[derive(Debug)]
 enum Embeddings {
-    F32(Cow<'static, [f32]>),
-    I8(Cow<'static, [i8]>),
+    F32(Storage<f32>),
+    I8(Storage<i8>),
 }
 
 impl Embeddings {
@@ -332,9 +370,9 @@ impl StaticModel {
         let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2-D")?;
         let raw = tensor.data();
         let embeddings = match tensor.dtype() {
-            Dtype::F32 => Embeddings::F32(Cow::Owned(decode_f32(raw))),
-            Dtype::F16 => Embeddings::F32(Cow::Owned(decode_f16(raw))),
-            Dtype::I8 => Embeddings::I8(Cow::Owned(raw.iter().map(|&b| b as i8).collect())),
+            Dtype::F32 => Embeddings::F32(Storage::Owned(decode_f32(raw))),
+            Dtype::F16 => Embeddings::F32(Storage::Owned(decode_f16(raw))),
+            Dtype::I8 => Embeddings::I8(Storage::Owned(raw.iter().map(|&b| b as i8).collect())),
             other => return Err(anyhow!("unsupported tensor dtype: {other:?}")),
         };
 
@@ -368,8 +406,8 @@ impl StaticModel {
             rows,
             cols,
             normalize,
-            weights.map(Cow::Owned),
-            token_mapping.map(Cow::Owned),
+            weights.map(Storage::Owned),
+            token_mapping.map(Storage::Owned),
         )
         .map(|model| model.with_max_length(max_length))
     }
@@ -415,12 +453,12 @@ impl StaticModel {
     ) -> Result<Self> {
         Self::from_storage(
             LoadedTokenizer::from_tokenizer(tokenizer)?,
-            Embeddings::F32(Cow::Owned(embeddings)),
+            Embeddings::F32(Storage::Owned(embeddings)),
             rows,
             cols,
             normalize,
-            weights.map(Cow::Owned),
-            token_mapping.map(Cow::Owned),
+            weights.map(Storage::Owned),
+            token_mapping.map(Storage::Owned),
         )
     }
 
@@ -445,12 +483,12 @@ impl StaticModel {
     ) -> Result<Self> {
         Self::from_storage(
             LoadedTokenizer::from_tokenizer(tokenizer)?,
-            Embeddings::F32(Cow::Borrowed(embeddings)),
+            Embeddings::F32(Storage::Borrowed(embeddings)),
             rows,
             cols,
             normalize,
-            weights.map(Cow::Borrowed),
-            token_mapping.map(Cow::Borrowed),
+            weights.map(Storage::Borrowed),
+            token_mapping.map(Storage::Borrowed),
         )
     }
 
@@ -476,12 +514,12 @@ impl StaticModel {
     ) -> Result<Self> {
         Self::from_storage(
             LoadedTokenizer::from_tokenizer(tokenizer)?,
-            Embeddings::I8(Cow::Owned(embeddings)),
+            Embeddings::I8(Storage::Owned(embeddings)),
             rows,
             cols,
             normalize,
-            weights.map(Cow::Owned),
-            token_mapping.map(Cow::Owned),
+            weights.map(Storage::Owned),
+            token_mapping.map(Storage::Owned),
         )
     }
 
@@ -507,12 +545,75 @@ impl StaticModel {
     ) -> Result<Self> {
         Self::from_storage(
             LoadedTokenizer::from_tokenizer(tokenizer)?,
-            Embeddings::I8(Cow::Borrowed(embeddings)),
+            Embeddings::I8(Storage::Borrowed(embeddings)),
             rows,
             cols,
             normalize,
-            weights.map(Cow::Borrowed),
-            token_mapping.map(Cow::Borrowed),
+            weights.map(Storage::Borrowed),
+            token_mapping.map(Storage::Borrowed),
+        )
+    }
+
+    /// Construct from shared f32 data without copying it. The model keeps the
+    /// owners alive for as long as it, or any clone of it, exists.
+    ///
+    /// # Arguments
+    /// * `tokenizer` - Pre-deserialized tokenizer
+    /// * `embeddings` - Shared f32 embedding data
+    /// * `rows` - Number of vocabulary entries
+    /// * `cols` - Embedding dimension
+    /// * `normalize` - Whether to L2-normalize output embeddings
+    /// * `weights` - Optional shared per-token weights for quantized models
+    /// * `token_mapping` - Optional shared token ID mapping for quantized models
+    pub fn from_shared(
+        tokenizer: Tokenizer,
+        embeddings: SharedSlice<f32>,
+        rows: usize,
+        cols: usize,
+        normalize: bool,
+        weights: Option<SharedSlice<f32>>,
+        token_mapping: Option<SharedSlice<usize>>,
+    ) -> Result<Self> {
+        Self::from_storage(
+            LoadedTokenizer::from_tokenizer(tokenizer)?,
+            Embeddings::F32(Storage::Shared(embeddings)),
+            rows,
+            cols,
+            normalize,
+            weights.map(Storage::Shared),
+            token_mapping.map(Storage::Shared),
+        )
+    }
+
+    /// Construct from shared int8 data without copying it, as written by
+    /// model2vec's `quantize_to="int8"`. The model keeps the owners alive for
+    /// as long as it, or any clone of it, exists.
+    ///
+    /// # Arguments
+    /// * `tokenizer` - Pre-deserialized tokenizer
+    /// * `embeddings` - Shared int8 embedding data
+    /// * `rows` - Number of vocabulary entries
+    /// * `cols` - Embedding dimension
+    /// * `normalize` - Whether to L2-normalize output embeddings
+    /// * `weights` - Optional shared per-token weights for quantized models
+    /// * `token_mapping` - Optional shared token ID mapping for quantized models
+    pub fn from_shared_i8(
+        tokenizer: Tokenizer,
+        embeddings: SharedSlice<i8>,
+        rows: usize,
+        cols: usize,
+        normalize: bool,
+        weights: Option<SharedSlice<f32>>,
+        token_mapping: Option<SharedSlice<usize>>,
+    ) -> Result<Self> {
+        Self::from_storage(
+            LoadedTokenizer::from_tokenizer(tokenizer)?,
+            Embeddings::I8(Storage::Shared(embeddings)),
+            rows,
+            cols,
+            normalize,
+            weights.map(Storage::Shared),
+            token_mapping.map(Storage::Shared),
         )
     }
 
@@ -522,8 +623,8 @@ impl StaticModel {
         rows: usize,
         cols: usize,
         normalize: bool,
-        weights: Option<Cow<'static, [f32]>>,
-        token_mapping: Option<Cow<'static, [usize]>>,
+        weights: Option<Storage<f32>>,
+        token_mapping: Option<Storage<usize>>,
     ) -> Result<Self> {
         if cols == 0 {
             return Err(anyhow!("embedding dimension must be greater than 0"));
@@ -570,7 +671,7 @@ impl StaticModel {
             let (data, scales) = quantize_rows(table, self.inner.dim);
             (data, scales, None)
         };
-        let embeddings = Embeddings::I8(Cow::Owned(data));
+        let embeddings = Embeddings::I8(Storage::Owned(data));
         let mut inner = match Arc::try_unwrap(self.inner) {
             Ok(mut inner) => {
                 inner.embeddings = embeddings;
@@ -1197,9 +1298,9 @@ fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&s
 
 #[cfg(test)]
 mod tests {
-    use super::{Embeddings, StaticModel, Tokenization, decode_token_mapping};
+    use super::{Embeddings, SharedSlice, StaticModel, Storage, Tokenization, decode_token_mapping};
     use safetensors::tensor::Dtype;
-    use std::borrow::Cow;
+    use std::sync::Arc;
     use tokenizers::{
         PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, pre_tokenizers::whitespace::Whitespace,
     };
@@ -1229,9 +1330,40 @@ mod tests {
     fn int8_models_keep_i8_storage() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
         let int8 = StaticModel::from_pretrained(format!("{dir}/test-model-int8"), None, None, None).unwrap();
-        assert!(matches!(&int8.inner.embeddings, Embeddings::I8(Cow::Owned(t)) if t.len() == 29528 * 2));
+        assert!(matches!(&int8.inner.embeddings, Embeddings::I8(Storage::Owned(t)) if t.len() == 29528 * 2));
         let f32_model = StaticModel::from_pretrained(format!("{dir}/test-model-float32"), None, None, None).unwrap();
         assert!(matches!(&f32_model.inner.embeddings, Embeddings::F32(_)));
+    }
+
+    #[test]
+    fn shared_models_do_not_copy() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-float32/tokenizer.json"
+        );
+        let tokenizer = Tokenizer::from_file(path).unwrap();
+        let rows = tokenizer.get_vocab_size(true);
+        let table: Arc<Vec<f32>> = Arc::new((0..rows * 4).map(|i| i as f32).collect());
+        let weights: Arc<Vec<f32>> = Arc::new(vec![1.0; rows]);
+        let model = StaticModel::from_shared(
+            tokenizer,
+            Arc::clone(&table) as SharedSlice<f32>,
+            rows,
+            4,
+            false,
+            Some(Arc::clone(&weights) as SharedSlice<f32>),
+            None,
+        )
+        .unwrap();
+        let Embeddings::F32(stored) = &model.inner.embeddings else {
+            panic!("expected f32 storage");
+        };
+        assert!(matches!(stored, Storage::Shared(_)));
+        assert_eq!(stored.as_ptr(), table.as_ptr());
+        assert_eq!(model.inner.weights.as_deref().unwrap().as_ptr(), weights.as_ptr());
+        assert_eq!(Arc::strong_count(&table), 2);
+        drop(model);
+        assert_eq!(Arc::strong_count(&table), 1);
     }
 
     fn quantized_case(dim: usize, weights: bool, mapping: bool) -> StaticModel {
@@ -1360,7 +1492,7 @@ mod tests {
             .quantize_int8();
         let inner = &model.inner;
         let rows = inner.embeddings.len() / inner.dim;
-        assert!(matches!(&inner.embeddings, Embeddings::I8(Cow::Owned(_))));
+        assert!(matches!(&inner.embeddings, Embeddings::I8(Storage::Owned(_))));
         assert_eq!(inner.row_scales.as_ref().map(Vec::len), Some(rows));
         assert_eq!(inner.weights.is_none(), inner.token_mapping.is_none());
     }
