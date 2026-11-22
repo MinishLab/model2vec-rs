@@ -45,6 +45,36 @@ For trustworthy numbers:
 4. Only claim a speedup for configurations marked `faster` whose output is
    `identical` (for changes that must not alter embeddings).
 
+## Full suite: corpora, languages and other libraries
+
+```sh
+uv run scripts/bench_suite.py --quick                 # smoke run: big, en, ko
+uv run scripts/bench_suite.py                         # everything
+uv run scripts/bench_suite.py --sections libs --corpora en,ko --modes batch
+```
+
+`scripts/bench_suite.py` rebuilds its inputs from pinned sources under
+`target/bench-suite/data/`, checking each corpus against a SHA-256 digest:
+`big.txt`, NanoMIRACL passages in 18 languages (`hakari-bench/NanoMIRACL`,
+pinned revision), the English passages with non-ASCII chars removed, and
+Python-style int8 copies (one scale for the whole table) of three models.
+It then runs:
+
+- `ab`: `bench_compare.py` on every corpus, `--baseline` vs `--candidate`.
+- `int8-ab`: `bench_compare.py` on the int8 copies.
+- `libs`: MB/s of model2vec-rs (f32, `quantize_int8`, Python int8),
+  [go-potion](https://github.com/trengrj/go-potion) at a pinned version
+  from the Go module proxy (or a local checkout with `--go-potion PATH`), and
+  [encoders](https://crates.io/crates/encoders) (f32 and int8), on 256-word
+  chunks: one chunk per call on one thread, and one batch on all cores.
+- `accuracy`: cosine similarity of every library and precision to the
+  model2vec-rs f32 output.
+
+go-potion and encoders are skipped, with a notice, when they cannot be
+built. encoders runs batches of fewer than 128 texts on one thread; the
+report marks corpora where that applies. Results are written to
+`target/bench-suite/results/<timestamp>/` (`report.md`, `results.json`).
+
 ## Comparing with Python model2vec
 
 ```sh
