@@ -30,18 +30,18 @@ As in `model2vec`, the model's `max_length` comes from its config (512 if unset,
 
 ## Performance
 
-We encoded the same 666,808 Wikipedia paragraphs (11M words) with [`potion-base-8M`](https://huggingface.co/minishlab/potion-base-8M) using the Rust crate, these bindings, and Python [`model2vec`](https://github.com/MinishLab/model2vec):
+We encoded the same 666,808 Wikipedia paragraphs (11M words) with [`blink-8m`](https://huggingface.co/minishlab/blink-8m) using the Rust crate, these bindings, and Python [`model2vec`](https://github.com/MinishLab/model2vec):
 
 <p align="center">
   <img width="85%" alt="Encoding throughput of Rust, the Python bindings and Python model2vec" src="https://raw.githubusercontent.com/MinishLab/model2vec-rs/main/assets/images/bindings_throughput.png">
 </p>
 
-On a single thread the bindings are about as fast as Rust and roughly **16×** faster than `model2vec`; on all cores they are roughly **32×** faster than `model2vec`.
+On a single thread the bindings are about as fast as Rust and roughly **20×** faster than `model2vec`; on all cores they are roughly **34×** faster than `model2vec`.
 
 To reproduce (from the repository root):
 
 ```bash
-uv run --with ./python scripts/python_compare.py --bindings --rust-api flat --no-python-multiprocessing --out bindings.json
+uv run --with ./python scripts/python_compare.py --model minishlab/blink-8m --bindings --rust-api flat --no-python-multiprocessing --out bindings.json
 uv run scripts/bindings_chart.py bindings.json
 ```
 
