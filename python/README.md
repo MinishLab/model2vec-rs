@@ -36,7 +36,7 @@ We encoded the same 666,808 Wikipedia paragraphs (11M words) with [`blink-8m`](h
   <img width="85%" alt="Encoding throughput of Rust, the Python bindings and Python model2vec" src="https://raw.githubusercontent.com/MinishLab/model2vec-rs/main/assets/images/bindings_throughput.png">
 </p>
 
-On a single thread the bindings are about as fast as Rust and roughly **20×** faster than `model2vec`; on all cores they are roughly **34×** faster than `model2vec`.
+On a single thread the bindings are about as fast as Rust and roughly **24×** faster than `model2vec`; on all cores they are roughly **38×** faster than `model2vec`.
 
 To reproduce (from the repository root):
 

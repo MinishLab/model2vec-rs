@@ -68,12 +68,18 @@ def main() -> None:
         for g, (value, note) in enumerate(zip(values, notes)):
             y = g + (i - 0.5) * (height + gap)
             ax.barh(y, value, height=height, color=color, label=name if g == 0 else None)
-            ax.text(value + 0.4, y, f"{value:.1f}×", va="center", fontsize=12, fontweight="bold", color=INK)
-            ax.text(value + 4.0, y, note, va="center", fontsize=10, color=MUTED)
+            label = ax.annotate(
+                f"{value:.1f}×", (value, y), xytext=(6, 0), textcoords="offset points",
+                va="center", fontsize=12, fontweight="bold", color=INK,
+            )
+            ax.annotate(
+                note, (1, 0.5), xycoords=label, xytext=(8, 0), textcoords="offset points",
+                va="center", fontsize=10, color=MUTED,
+            )
     ax.set_yticks(range(len(GROUPS)), GROUPS, fontsize=13, color=INK)
     ax.invert_yaxis()
     top = max(v for *_, values, _ in series for v in values)
-    ax.set_xlim(0, max(40, 5 * -(-(top + 13) // 5)))
+    ax.set_xlim(0, max(40, 5 * -(-(top * 1.3 + 4) // 5)))
     ax.xaxis.set_major_formatter(lambda x, _: f"{x:.0f}×")
     ax.tick_params(axis="x", colors=MUTED, length=0)
     ax.tick_params(axis="y", length=0)
