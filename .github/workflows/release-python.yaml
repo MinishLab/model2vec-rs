@@ -2,11 +2,6 @@ name: Release Python
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to release (e.g. py-v0.4.1)"
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -17,13 +12,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: refs/tags/${{ inputs.tag }}
 
       - name: Check tag matches python/Cargo.toml version
         env:
-          TAG: ${{ inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
         run: |
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "Run this workflow from a py-v* tag, not a branch"
+            exit 1
+          fi
           case "$TAG" in
             py-v*) ;;
             *) echo "Tag must start with py-v, got $TAG"; exit 1 ;;
@@ -54,8 +52,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: refs/tags/${{ inputs.tag }}
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -82,8 +78,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: refs/tags/${{ inputs.tag }}
 
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
