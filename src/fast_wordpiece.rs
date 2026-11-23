@@ -119,6 +119,8 @@ pub(crate) struct FastWordPiece {
     /// First byte of every added token, so the scan skips byte positions
     /// that cannot start a match with one array lookup.
     added_token_first_bytes: [bool; 256],
+    /// One past the largest token ID the tokenizer can produce.
+    id_bound: usize,
 }
 
 impl FastWordPiece {
@@ -249,6 +251,11 @@ impl FastWordPiece {
         fixed_length: Option<usize>,
         added_tokens: Vec<(String, u32)>,
     ) -> FastWordPiece {
+        let id_bound = vocab
+            .values()
+            .chain(added_tokens.iter().map(|(_, id)| id))
+            .max()
+            .map_or(0, |&id| id as usize + 1);
         let mut added_token_first_bytes = [false; 256];
         for (content, _) in &added_tokens {
             added_token_first_bytes[content.as_bytes()[0] as usize] = true;
@@ -309,7 +316,13 @@ impl FastWordPiece {
             fixed_length,
             added_tokens,
             added_token_first_bytes,
+            id_bound,
         }
+    }
+
+    /// One past the largest token ID the tokenizer can produce.
+    pub(crate) fn id_bound(&self) -> usize {
+        self.id_bound
     }
 
     pub(crate) fn unk_id(&self) -> Option<u32> {

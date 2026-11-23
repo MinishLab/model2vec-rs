@@ -107,6 +107,8 @@ struct LoadedTokenizer {
     tokenization: Tokenization,
     median_token_length: usize,
     unk_token_id: Option<usize>,
+    /// One past the largest token ID the tokenizer can produce.
+    id_bound: usize,
 }
 
 impl LoadedTokenizer {
@@ -115,7 +117,7 @@ impl LoadedTokenizer {
             .with_truncation(None)
             .map_err(|e| anyhow!("failed to disable truncation: {e}"))?;
         tokenizer.with_padding(None);
-        let (median_token_length, unk_token_id) = compute_metadata(&tokenizer)?;
+        let (median_token_length, unk_token_id, id_bound) = compute_metadata(&tokenizer)?;
         let tokenization = if let Some(ft) = FastWordPiece::from_tokenizer(&tokenizer) {
             Tokenization::WordPiece(ft)
         } else if let Some(fu) = FastUnigram::from_tokenizer(&tokenizer, unk_token_id) {
@@ -127,6 +129,7 @@ impl LoadedTokenizer {
             tokenization,
             median_token_length,
             unk_token_id,
+            id_bound,
         })
     }
 
@@ -136,6 +139,7 @@ impl LoadedTokenizer {
         if let Some((ft, median_token_length)) = FastWordPiece::from_json(bytes) {
             return Ok(Self {
                 unk_token_id: ft.unk_id().map(|id| id as usize),
+                id_bound: ft.id_bound(),
                 tokenization: Tokenization::WordPiece(ft),
                 median_token_length,
             });
@@ -152,9 +156,15 @@ pub(crate) fn median_token_length<'a>(tokens: impl Iterator<Item = &'a str>) -> 
     lens.get(lens.len() / 2).copied().unwrap_or(1)
 }
 
-/// Compute median token length and unk_token_id from tokenizer.
-fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
-    let median_token_length = median_token_length(tokenizer.get_vocab(false).keys().map(String::as_str));
+/// Compute median token length, unk_token_id and one past the largest token ID from tokenizer.
+fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>, usize)> {
+    let vocab = tokenizer.get_vocab(false);
+    let median_token_length = median_token_length(vocab.keys().map(String::as_str));
+    let id_bound = vocab
+        .values()
+        .chain(tokenizer.get_added_vocabulary().get_added_tokens_decoder().keys())
+        .max()
+        .map_or(0, |&id| id as usize + 1);
 
     let lookup = |tok: &str| {
         tokenizer
@@ -174,7 +184,7 @@ fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
             .map(|id| id as usize),
     };
 
-    Ok((median_token_length, unk_token_id))
+    Ok((median_token_length, unk_token_id, id_bound))
 }
 
 /// Embedding table in its stored element type, row-major with `dim` columns.
@@ -636,6 +646,28 @@ impl StaticModel {
                 rows,
                 cols
             ));
+        }
+        let tokens = tokenizer.id_bound;
+        match token_mapping.as_deref() {
+            Some(mapping) => {
+                if let Some((tok, row)) = mapping.iter().take(tokens).enumerate().find(|&(_, &row)| row >= rows) {
+                    return Err(anyhow!(
+                        "token_mapping maps token {tok} to row {row}, but embeddings has {rows} rows"
+                    ));
+                }
+                if mapping.len() < tokens && tokens > rows {
+                    return Err(anyhow!(
+                        "token_mapping has {} entries and embeddings {rows} rows, but the tokenizer has {tokens} tokens",
+                        mapping.len()
+                    ));
+                }
+            }
+            None if tokens > rows => {
+                return Err(anyhow!(
+                    "embeddings has {rows} rows, but the tokenizer has {tokens} tokens"
+                ));
+            }
+            None => {}
         }
         Ok(Self {
             inner: Arc::new(StaticModelInner {
@@ -1538,5 +1570,39 @@ mod tests {
         );
         let tok = Tokenizer::from_file(path).unwrap();
         assert!(StaticModel::from_owned(tok, Vec::new(), usize::MAX / 2 + 1, 2, false, None, None).is_err());
+    }
+
+    #[test]
+    fn tables_too_small_for_the_tokenizer_are_rejected() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-float32/tokenizer.json"
+        );
+        let tok = Tokenizer::from_file(path).unwrap();
+        let vocab = tok.get_vocab_size(true);
+        let build = |rows: usize, mapping: Option<Vec<usize>>| {
+            StaticModel::from_owned(tok.clone(), vec![0.0; rows * 2], rows, 2, false, None, mapping)
+        };
+        assert!(build(vocab, None).is_ok());
+        assert!(build(vocab - 1, None).is_err());
+        assert!(build(4, Some(vec![3; vocab])).is_ok());
+        assert!(build(4, Some(vec![4; vocab])).is_err());
+        assert!(build(4, Some(vec![0; vocab - 1])).is_err());
+        assert!(build(vocab, Some(vec![0; vocab - 1])).is_ok());
+    }
+
+    #[test]
+    fn added_tokens_outside_the_table_are_rejected() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-model-float32");
+        let read = |name: &str| std::fs::read(format!("{dir}/{name}")).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&read("tokenizer.json")).unwrap();
+        let added = json["added_tokens"].as_array_mut().unwrap();
+        let mut extra = added[0].clone();
+        extra["content"] = "zzqx-not-in-vocab".into();
+        added.push(extra);
+        let tokenizer = json.to_string();
+        assert!(super::FastWordPiece::from_json(tokenizer.as_bytes()).is_some());
+        let err = StaticModel::from_bytes(tokenizer, read("model.safetensors"), read("config.json"), None).unwrap_err();
+        assert!(err.to_string().contains("but the tokenizer has"), "{err}");
     }
 }
